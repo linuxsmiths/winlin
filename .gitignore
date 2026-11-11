@@ -1,0 +1,6 @@
+/build*/
+/results/
+/.winlin-local/
+*.pem
+*.key
+/tests/__pycache__/
