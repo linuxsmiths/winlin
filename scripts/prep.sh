@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Surface native-tool failures even when a tool exits without printing its own diagnostic.
+report_failure() {
+    local status="$1"
+    local line="$2"
+    printf 'winlin prep: FATAL: command failed at line %s (exit %s).\n' "$line" "$status" >&2
+    exit "$status"
+}
+trap 'report_failure "$?" "$LINENO"' ERR
+
 usage() {
     cat <<'EOF'
 Usage: scripts/prep.sh [--check]
@@ -45,8 +54,19 @@ packages=(
     python3
 )
 missing=()
+# dpkg-query status 1 means an absent package; other failures must not look like missing dependencies.
 for package in "${packages[@]}"; do
-    if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" != installed ]]; then
+    if package_status="$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>&1)"; then
+        if [[ "$package_status" != installed ]]; then
+            missing+=("$package")
+        fi
+    else
+        status="$?"
+        if (( status != 1 )); then
+            printf 'winlin prep: FATAL: cannot inspect package %s (exit %s): %s\n' \
+                "$package" "$status" "$package_status" >&2
+            exit "$status"
+        fi
         missing+=("$package")
     fi
 done

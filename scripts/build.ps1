@@ -15,6 +15,7 @@ $cmake = Get-WinlinCMake -VisualStudio $visualStudio
 if (-not $visualStudio -or -not $cmake -or -not (Get-WinlinSdk)) { throw 'Run scripts\prep.ps1 first.' }
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $build = [IO.Path]::GetFullPath($BuildDirectory)
+# Select one native MSVC instance explicitly; do not inherit an incompatible generator or architecture.
 $configure = @('-S', $root, '-B', $build, '-G', 'Visual Studio 17 2022', '-A', 'x64',
     "-DCMAKE_GENERATOR_INSTANCE=$visualStudio", '-DWINLIN_BUILD_CLIENT=OFF',
     '-DWINLIN_BUILD_SERVER=ON', '-DBUILD_TESTING=ON', '-DWINLIN_WINDOWS_HTTPS_TESTS=OFF')

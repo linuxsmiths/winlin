@@ -17,6 +17,7 @@ endif()
 find_package(Threads REQUIRED)
 find_package(nlohmann_json 3.11 QUIET)
 if(NOT nlohmann_json_FOUND)
+  # Pin and verify the fallback dependency rather than changing the code used between runs.
   FetchContent_Declare(json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
     URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
@@ -88,6 +89,7 @@ if(BUILD_TESTING)
     add_executable(winlin-windows-tests tests/windows.cpp)
     target_link_libraries(winlin-windows-tests PRIVATE winlin_windows)
     add_test(NAME windows-platform COMMAND winlin-windows-tests)
+    # Indirect launches from PowerShell 7 inherit incompatible module paths unless reset here.
     add_test(NAME powershell COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath
       powershell.exe -NoProfile -ExecutionPolicy Bypass
       -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts.ps1")

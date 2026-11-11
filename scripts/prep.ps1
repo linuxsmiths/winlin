@@ -21,6 +21,7 @@ if ($Check) {
     return
 }
 
+# Verify the publisher before executing an elevated installer and always remove the downloaded file.
 function Install-WinlinTool {
     param([string]$Uri, [string[]]$Arguments, [string]$Publisher)
     Assert-WinlinAdministrator

@@ -6,6 +6,7 @@ import ssl
 
 
 def tls_context():
+    """Use ephemeral loopback certificates without CA validation; production client pinning is separate."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -15,6 +16,7 @@ def tls_context():
 
 
 def exercise_contract(agent, bootstrap, token, backend, cipher):
+    """Require the same workload semantics even when native parsers format rejected requests differently."""
     assert agent.request("GET", "/v1/capabilities")[0] == 401
     assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401
     assert agent.request("GET", "/v1/object?size=512", "0" * 64)[0] == 401

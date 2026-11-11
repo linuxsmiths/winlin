@@ -29,6 +29,7 @@ $createdCertificate = $false
 $createdBinding = $false
 $createdUrl = $false
 $createdToken = $false
+# Track only resources created here, so rollback never removes an existing endpoint or certificate.
 try {
     if ($CertificateThumbprint) {
         if ($CertificateThumbprint -notmatch '^[0-9A-Fa-f]{40}$') { throw 'Expected a SHA-1 store thumbprint (40 hex digits).' }
@@ -76,9 +77,26 @@ try {
     }
 }
 catch {
-    if ($createdToken) { Remove-Item -LiteralPath $tokenFile }
-    if ($createdUrl) { & netsh.exe http delete urlacl "url=$url" | Out-Null }
-    if ($createdBinding) { & netsh.exe http delete sslcert "ipport=$endpoint" | Out-Null }
-    if ($createdCertificate) { Remove-Item -LiteralPath "Cert:\LocalMachine\My\$($certificate.Thumbprint)" }
+    # Cleanup warnings must not prevent later rollback actions or replace the provisioning error.
+    if ($createdToken) {
+        $null = Invoke-WinlinCleanup -Description 'pairing token' -Action {
+            Remove-Item -LiteralPath $tokenFile
+        }
+    }
+    if ($createdUrl) {
+        $null = Invoke-WinlinCleanup -Description 'URL reservation' -Action {
+            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'urlacl', "url=$url")
+        }
+    }
+    if ($createdBinding) {
+        $null = Invoke-WinlinCleanup -Description 'certificate binding' -Action {
+            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'sslcert', "ipport=$endpoint")
+        }
+    }
+    if ($createdCertificate) {
+        $null = Invoke-WinlinCleanup -Description 'test certificate' -Action {
+            Remove-Item -LiteralPath "Cert:\LocalMachine\My\$($certificate.Thumbprint)"
+        }
+    }
     throw
 }

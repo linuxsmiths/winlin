@@ -41,6 +41,8 @@ def private_file(path, text):
 
 
 class Agent:
+    """Own a loopback Linux server and control connection; always reap it and retain diagnostics."""
+
     def __init__(self, directory, backend="openssl"):
         self.directory = directory
         self.process = subprocess.Popen(
@@ -86,6 +88,7 @@ class Agent:
             raise AssertionError("Server did not stop gracefully")
         if self.process.returncode != 0:
             raise AssertionError(f"Server failed: {stderr}")
+        self.stderr = stderr
 
     def request(self, method, path, token=None, body=None):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -95,6 +98,7 @@ class Agent:
 
 
 def exercise_invalid_request_accounting(agent, token):
+    """A parser rejection after a persistent GET must not inherit successful-workload accounting."""
     status, payload = agent.request("GET", "/v1/telemetry", token)
     assert status == 200
     before = json.loads(payload)
@@ -118,7 +122,26 @@ def exercise_invalid_request_accounting(agent, token):
         response.begin()
         assert response.status == 400
         response.read()
+        # EOF guarantees the server finished its close/accounting path before telemetry is sampled.
         assert raw.recv(1) == b""
+
+    # Unlike an idle disconnect, EOF halfway through a declared PUT body must be diagnosed.
+    with tls_context().wrap_socket(
+        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
+        server_hostname="127.0.0.1",
+    ) as raw:
+        raw.sendall(
+            (f"PUT /v1/object HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
+             f"Authorization: Bearer {token}\r\nContent-Length: 512\r\n\r\n").encode()
+            + b"x" * 256
+        )
+
+    # Header reception is also active work once any bytes have arrived, even before framing completes.
+    with tls_context().wrap_socket(
+        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
+        server_hostname="127.0.0.1",
+    ) as raw:
+        raw.sendall(b"GET /v1/object?size=512 HTTP/1.1\r\n")
     status, payload = agent.request("GET", "/v1/telemetry", token)
     assert status == 200
     after = json.loads(payload)
@@ -129,11 +152,13 @@ def exercise_invalid_request_accounting(agent, token):
 
 
 def run_case(directory, target, name, *options):
+    """Verify a persisted real-client repetition, including operation/latency/byte consistency."""
     output = directory / f"{name}.json"
     configuration = {
         "--connections": "4", "--workers": "2", "--warmup": "0.02",
         "--duration": "1", "--repetitions": "1", "--requests": "100",
     }
+    # Merge overrides rather than repeating CLI flags, which the strict argument parser rejects.
     configuration.update(zip(options[::2], options[1::2]))
     arguments = [item for pair in configuration.items() for item in pair]
     command(
@@ -248,7 +273,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
                               ("--get-percent", "101"), ("--get-size", "65MiB"),
                               ("--method", "invalid"), ("--workers", "0"),
                               ("--rate", "100")):
-            command(CLIENT, "run", "--target", target, option, value, expected=1)
+            rejected = command(CLIENT, "run", "--target", target, option, value, expected=1)
+            assert "FATAL:" in rejected.stderr
         command(
             CLIENT, "run", "--target", target, "--cipher", "TLS_CHACHA20_POLY1305_SHA256",
             expected=1,
@@ -271,14 +297,25 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
     finally:
         agent.stop()
 
+    assert "WARNING: Rejected malformed HTTP header" in agent.stderr
+    assert "WARNING: Peer closed an unfinished TLS request" in agent.stderr
+    assert "WARNING: Peer closed an incomplete HTTP header" in agent.stderr
+    assert bootstrap not in agent.stderr and token not in agent.stderr
+
     agent = Agent(directory)
     try:
+        # A healthy persistent client may disconnect between requests without sending close_notify.
+        assert agent.request("GET", "/v1/capabilities", token)[0] == 200
+        agent.connection.close()
         target_json["port"] = str(agent.port)
         private_file(target, json.dumps(target_json))
         command(CLIENT, "inspect", "--target", target)
         assert agent.request("POST", "/v1/pair", bootstrap)[0] == 409
     finally:
         agent.stop()
+
+    assert "Closing failed TLS session" not in agent.stderr, agent.stderr
+    assert "Peer closed an unfinished TLS request" not in agent.stderr, agent.stderr
 
     agent = Agent(directory, "ktls")
     try:

@@ -30,6 +30,9 @@ if name == "cmake":
 elif name == "dpkg-query":
     if arguments[-2] == "-f=${Version}":
         print("3.11.3")
+    elif os.environ.get("WINLIN_TEST_QUERY_EXIT"):
+        print("simulated package database failure", file=sys.stderr)
+        sys.exit(int(os.environ["WINLIN_TEST_QUERY_EXIT"]))
     elif (arguments[-1] == os.environ.get("WINLIN_TEST_MISSING")
           and not Path(os.environ["WINLIN_TEST_INSTALLED"]).exists()):
         sys.exit(1)
@@ -45,7 +48,10 @@ elif name == "apt-get":
 
 
 class Scripts(unittest.TestCase):
+    """Intercept package/build tools so script failure paths never mutate the shared host."""
+
     def setUp(self):
+        # Retain actual OS/compiler probes while mocking commands that install packages or build code.
         self.temporary = tempfile.TemporaryDirectory(prefix="winlin-scripts-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
@@ -65,6 +71,7 @@ class Scripts(unittest.TestCase):
         )
 
     def run_script(self, script, *arguments, expected=0, **environment):
+        """Run from outside the repository to catch accidental working-directory assumptions."""
         result = subprocess.run(
             ["bash", str(ROOT / "scripts" / script), *arguments],
             cwd=self.directory,
@@ -78,7 +85,12 @@ class Scripts(unittest.TestCase):
 
     def calls(self, program):
         lines = self.log.read_text().splitlines() if self.log.exists() else []
-        return [call[1:] for line in lines if (call := json.loads(line))[0] == program]
+        calls = []
+        for line in lines:
+            call = json.loads(line)
+            if call[0] == program:
+                calls.append(call[1:])
+        return calls
 
     def test_components_and_paths(self):
         for component, client, server in (("client", "ON", "OFF"), ("server", "OFF", "ON"),
@@ -107,7 +119,8 @@ class Scripts(unittest.TestCase):
         self.assertEqual(len(self.calls("cmake")), before)
 
     def test_configure_failure_stops_build(self):
-        self.run_script("build.sh", "server", expected=23, WINLIN_TEST_CMAKE_EXIT="23")
+        result = self.run_script("build.sh", "server", expected=23, WINLIN_TEST_CMAKE_EXIT="23")
+        self.assertIn("FATAL:", result.stderr)
         self.assertEqual(len(self.calls("cmake")), 1)
 
     def test_prep_check_never_installs(self):
@@ -129,11 +142,18 @@ class Scripts(unittest.TestCase):
         self.assertEqual(len(self.calls("apt-get")), 2)
 
     def test_prep_failure_propagates(self):
-        self.run_script(
+        result = self.run_script(
             "prep.sh", expected=42, WINLIN_TEST_MISSING="nlohmann-json3-dev",
             WINLIN_TEST_APT_EXIT="42",
         )
+        self.assertIn("FATAL:", result.stderr)
         self.assertEqual(self.calls("apt-get"), [["update"]])
+
+    def test_prep_query_failure_does_not_install(self):
+        result = self.run_script("prep.sh", expected=42, WINLIN_TEST_QUERY_EXIT="42")
+        self.assertIn("FATAL:", result.stderr)
+        self.assertIn("simulated package database failure", result.stderr)
+        self.assertFalse(self.calls("apt-get"))
 
 
 if __name__ == "__main__":

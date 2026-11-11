@@ -20,6 +20,8 @@ PORT = int(PORT)
 
 
 class Agent:
+    """Own one native process while reusing the provisioned endpoint and persisted pairing state."""
+
     def __init__(self, cipher="TLS_AES_128_GCM_SHA256"):
         self.port = PORT
         self.process = subprocess.Popen(
@@ -95,6 +97,7 @@ try:
         assert agent.request("PUT", "/v1/object", token, b"x" * size) == (200, b"")
 
     def load(index):
+        """Give each concurrent client its own persistent connection and alternate both body paths."""
         connection = http.client.HTTPSConnection("127.0.0.1", PORT, context=tls_context(), timeout=5)
         try:
             for operation in range(8):

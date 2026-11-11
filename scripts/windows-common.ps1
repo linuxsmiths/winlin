@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 
+# Reject platforms without the native TLS 1.3 and x64 APIs used by the server.
 function Assert-WinlinWindows {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw 'This script requires Windows Server 2022 or Windows 11, x86_64.'
@@ -18,6 +19,7 @@ function Assert-WinlinAdministrator {
     }
 }
 
+# PowerShell does not turn native exit codes into exceptions, even with ErrorActionPreference=Stop.
 function Invoke-WinlinNative {
     param([Parameter(Mandatory)][string]$File, [string[]]$Arguments = @())
     & $File @Arguments
@@ -26,6 +28,20 @@ function Invoke-WinlinNative {
     }
 }
 
+# Rollback must attempt every resource and retain the original failure; warn and report each failure.
+function Invoke-WinlinCleanup {
+    param([Parameter(Mandatory)][string]$Description, [Parameter(Mandatory)][scriptblock]$Action)
+    try {
+        & $Action | Out-Host
+        return $true
+    }
+    catch {
+        Write-Warning "Cleanup failed ($Description): $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Discover installed tools without installing anything; callers report missing optional candidates.
 function Get-WinlinVisualStudio {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { return $null }
@@ -36,6 +52,7 @@ function Get-WinlinVisualStudio {
     return $null
 }
 
+# Prefer an existing usable CMake, falling back to Visual Studio's bundled installation.
 function Get-WinlinCMake {
     param([string]$VisualStudio)
     $command = Get-Command cmake.exe -CommandType Application -ErrorAction SilentlyContinue
@@ -55,6 +72,7 @@ function Get-WinlinCMake {
     return $null
 }
 
+# Probe known Python candidates; an absent or unsuitable interpreter is not an installation failure.
 function Get-WinlinPython {
     $command = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
     $candidates = @()
@@ -68,6 +86,7 @@ function Get-WinlinPython {
     return $null
 }
 
+# Both headers and x64 import libraries must exist; a registry entry alone is not a usable SDK.
 function Get-WinlinSdk {
     $roots = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' `
         -ErrorAction SilentlyContinue
@@ -84,6 +103,7 @@ function Get-WinlinSdk {
     return $null
 }
 
+# Apply the credential ACL atomically at creation, using the API available in each PowerShell edition.
 function New-WinlinPrivateFileStream {
     param([Parameter(Mandatory)][string]$Path)
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -107,6 +127,7 @@ function New-WinlinPrivateFileStream {
         4096, [IO.FileOptions]::None, $acl)
 }
 
+# Never repair permissions on an existing shared directory: that could break unrelated workloads.
 function Initialize-WinlinPrivateDirectory {
     param([Parameter(Mandatory)][string]$Path)
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
