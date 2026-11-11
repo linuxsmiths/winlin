@@ -73,7 +73,6 @@ struct Session {
     }
 
     void request(const HttpHead& head) {
-        get = put = false;
         body_remaining = 0;
         const auto reply = server.Agent::request(head,
             {SSL_get_version(socket.ssl.get()), SSL_get_cipher_name(socket.ssl.get()), tx, rx});
@@ -99,6 +98,7 @@ struct Session {
             } else if (state == State::header) {
                 const auto end = input.find("\r\n\r\n");
                 if (end != std::string::npos) {
+                    get = put = false;
                     try {
                         const auto head = parse_head(std::string_view(input).substr(0, end + 4));
                         input.erase(0, end + 4);

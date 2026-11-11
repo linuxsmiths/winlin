@@ -29,5 +29,9 @@ jobs:
       - name: Build native HTTP.sys server
         shell: powershell
         run: .\scripts\build.ps1 server -IntegrationTests
+      - name: Test Windows PowerShell launch from PowerShell 7
+        shell: pwsh
+        run: ctest --test-dir build -C Release -R '^powershell$' --output-on-failure
       - name: Test native HTTP.sys server and shared contract
+        shell: powershell
         run: ctest --test-dir build -C Release --output-on-failure

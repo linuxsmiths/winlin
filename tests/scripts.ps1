@@ -21,6 +21,8 @@ function Test-NativeFailure {
 }
 Test-NativeFailure
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+    $null = Get-Command Set-Acl -CommandType Cmdlet
     $visualStudio = Get-WinlinVisualStudio
     if (-not $visualStudio -or -not (Get-WinlinCMake -VisualStudio $visualStudio) -or -not (Get-WinlinSdk)) {
         throw 'PowerShell toolchain discovery failed.'

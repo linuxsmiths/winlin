@@ -94,6 +94,40 @@ class Agent:
         return response.status, response.read()
 
 
+def exercise_invalid_request_accounting(agent, token):
+    status, payload = agent.request("GET", "/v1/telemetry", token)
+    assert status == 200
+    before = json.loads(payload)
+    with tls_context().wrap_socket(
+        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
+        server_hostname="127.0.0.1",
+    ) as raw:
+        raw.sendall(
+            (f"GET /v1/object?size=512 HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
+             f"Authorization: Bearer {token}\r\n\r\n").encode()
+        )
+        response = http.client.HTTPResponse(raw)
+        response.begin()
+        assert response.status == 200 and len(response.read()) == 512
+        raw.sendall(
+            (f"PUT /v1/object HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
+             f"Authorization: Bearer {token}\r\n"
+             "Content-Length: 1\r\ncontent-length: 2\r\n\r\n").encode()
+        )
+        response = http.client.HTTPResponse(raw)
+        response.begin()
+        assert response.status == 400
+        response.read()
+        assert raw.recv(1) == b""
+    status, payload = agent.request("GET", "/v1/telemetry", token)
+    assert status == 200
+    after = json.loads(payload)
+    assert after["get_completed"] == before["get_completed"] + 1, after
+    assert after["get_bytes"] == before["get_bytes"] + 512, after
+    assert after["put_completed"] == before["put_completed"], after
+    assert after["put_bytes"] == before["put_bytes"], after
+
+
 def run_case(directory, target, name, *options):
     output = directory / f"{name}.json"
     configuration = {
@@ -165,6 +199,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
         target.chmod(0o600)
 
         exercise_contract(agent, bootstrap, token, "openssl", "TLS_AES_128_GCM_SHA256")
+        exercise_invalid_request_accounting(agent, token)
 
         _, result = run_case(directory, target, "get")
         assert result["completed"] == 100

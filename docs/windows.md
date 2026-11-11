@@ -167,6 +167,9 @@ need an **elevated** terminal and Python 3:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+CTest starts Windows PowerShell with a fresh module search path so its built-in
+modules load correctly even when CTest is invoked from PowerShell 7.
+
 These tests provision a temporary certificate/binding/URL reservation on an
 ephemeral loopback port, exercise the same HTTP contract as Linux, test
 concurrent/persistent GET/PUT, TLS/cipher rejection, and pairing across restarts,

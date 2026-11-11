@@ -88,11 +88,13 @@ if(BUILD_TESTING)
     add_executable(winlin-windows-tests tests/windows.cpp)
     target_link_libraries(winlin-windows-tests PRIVATE winlin_windows)
     add_test(NAME windows-platform COMMAND winlin-windows-tests)
-    add_test(NAME powershell COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+    add_test(NAME powershell COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath
+      powershell.exe -NoProfile -ExecutionPolicy Bypass
       -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts.ps1")
     if(WINLIN_WINDOWS_HTTPS_TESTS AND TARGET winlin-server)
       find_package(Python3 COMPONENTS Interpreter REQUIRED)
-      add_test(NAME windows-https COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+      add_test(NAME windows-https COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath
+        powershell.exe -NoProfile -ExecutionPolicy Bypass
         -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/windows_integration.ps1"
         -ServerExe "$<TARGET_FILE:winlin-server>" -PythonExe "${Python3_EXECUTABLE}")
       set_tests_properties(windows-https PROPERTIES TIMEOUT 120)
