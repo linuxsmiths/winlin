@@ -17,6 +17,7 @@ from https_contract import exercise_contract, tls_context
 
 SERVER, PORT, TOKEN_FILE, PIN, STOP_FILE = sys.argv[1:]
 PORT = int(PORT)
+LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-server.ps1"
 
 
 class Agent:
@@ -25,9 +26,9 @@ class Agent:
     def __init__(self, cipher="TLS_AES_128_GCM_SHA256"):
         self.port = PORT
         self.process = subprocess.Popen(
-            [SERVER, "--token-file", TOKEN_FILE, "--port", str(PORT),
-             "--workers", "2", "--max-connections", "128", "--cipher", cipher,
-             "--stop-file", STOP_FILE],
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
+             "-ServerExe", SERVER, "-TokenFile", TOKEN_FILE, "-Port", str(PORT),
+             "-Workers", "2", "-MaxConnections", "128", "-Cipher", cipher, "-StopFile", STOP_FILE],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         lines = queue.Queue()
@@ -54,8 +55,17 @@ class Agent:
         try:
             _, stderr = self.process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.communicate()
+            # The launcher owns a native child. Kill the exact process tree on timeout so a failed
+            # test cannot leave an HTTP.sys server running after only its PowerShell parent exits.
+            cleanup = subprocess.run(
+                ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if cleanup.returncode != 0:
+                print(f"WARNING: server-tree cleanup failed: {cleanup.stdout}{cleanup.stderr}",
+                      file=sys.stderr)
+                self.process.kill()
+            self.process.communicate(timeout=5)
             raise AssertionError("HTTP.sys server did not stop gracefully")
         finally:
             Path(STOP_FILE).unlink(missing_ok=True)

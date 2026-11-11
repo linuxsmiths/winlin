@@ -61,8 +61,20 @@ ctest --test-dir build --output-on-failure
 ```
 
 See [the HTTPS quickstart](docs/https.md) for certificate setup, pairing, workloads,
-results, and current limitations. Run `build/winlin` for the interactive console,
-or `build/winlin --help` for noninteractive commands.
+results, and current limitations. Once certificates and pairing credentials are
+configured, use the foreground launchers:
+
+```sh
+./scripts/run-server.sh           # Linux server; defaults to .winlin-local/ state
+./scripts/run-client.sh           # Interactive Linux client (in another terminal)
+./scripts/run-client.sh inspect --target .winlin-local/local.json
+```
+
+Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
+The server also accepts `--state-dir PATH`. Put launcher options before native
+arguments, optionally separated by `--`. Use `--help` for launcher help or
+`-- --help` for native help. Launchers reuse existing state without building,
+creating credentials, or resetting pairing.
 
 On **Windows Server 2022 or Windows 11, x86_64**, use PowerShell:
 
@@ -77,6 +89,12 @@ Installation requires elevation; building does not. Windows uses native OS
 libraries, not OpenSSL, and the client remains Linux-only. See the
 [Windows server guide](docs/windows.md) for certificate bindings, URL ACLs,
 Linux-client pairing, and optional privileged HTTPS tests.
+
+After provisioning, start the Windows server in the foreground with
+`.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443`. It defaults to
+`build\Release\winlin-server.exe` and `.winlin-local\pairing-token`; use
+`-BuildDirectory`, `-Configuration`, `-StateDirectory`, or `-ServerExe` to
+override discovery. Run with `-Help` for all supported options.
 
 ## Goals
 

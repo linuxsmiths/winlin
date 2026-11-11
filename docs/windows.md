@@ -86,25 +86,36 @@ your host firewall and VNet configuration. Never expose the agent to the interne
 Start the server (the same user can do this without elevation after setup):
 
 ```powershell
-.\build\Release\winlin-server.exe `
-  --bind 10.0.0.4 --port 8443 `
-  --token-file .winlin-local\pairing-token `
-  --workers 8
+.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443 -Workers 8
 ```
+
+The launcher defaults to the repository's `build\Release\winlin-server.exe` and
+`.winlin-local\pairing-token`. Match `-BindAddress` and `-Port` to the provisioned
+endpoint. It never builds, provisions certificates, resets pairing, elevates, or
+changes firewall/Schannel policies.
+
+Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
+for nondefault layouts; supplied relative paths use your current PowerShell
+directory. `-ServerExe PATH` selects a binary directly, including single-config
+CMake builds. `-TokenFile` and `-SessionFile` override individual credential
+paths; unspecified tuning options retain native defaults. `-Help` lists options
+without requiring a build or provisioned endpoint. Direct native executable
+invocations remain supported.
 
 The backend is `httpsys-schannel`. `--backend httpsys` is accepted explicitly;
 OpenSSL/kTLS backend requests fail rather than falling back.
 
 The default cipher is `TLS_AES_128_GCM_SHA256`. To use
-`TLS_AES_256_GCM_SHA384`, select it with `--cipher` on both server and Linux
-client. HTTP.sys reports negotiated protocol/algorithm/key size; mismatches or
+`TLS_AES_256_GCM_SHA384`, select it with `-Cipher` in the launcher (native
+`--cipher`) and `--cipher` on the Linux client. HTTP.sys reports negotiated
+protocol/algorithm/key size; mismatches or
 missing information cause request rejection. The server does not claim that
 `--cipher` rewrites Schannel's handshake policy. The Linux client offers only
 the selected TLS 1.3 suite.
 
-Press Ctrl+C to stop gracefully. For local automation, `--stop-file PATH` also
-requests a graceful stop when that file appears. The file must not already
-exist at startup, and remains the caller's responsibility to remove.
+Press Ctrl+C to stop gracefully. For local automation, `-StopFile PATH` (native
+`--stop-file PATH`) also requests a graceful stop when that file appears. The file
+must not already exist at startup, and remains the caller's responsibility to remove.
 
 ## Pair and run from Linux
 
@@ -113,13 +124,13 @@ Securely transfer the bootstrap file to the Linux client, and verify
 
 ```sh
 chmod 600 /path/to/windows-pairing-token
-build/winlin pair --host 10.0.0.4 --port 8443 \
+./scripts/run-client.sh pair --host 10.0.0.4 --port 8443 \
   --token-file /path/to/windows-pairing-token \
   --fingerprint REPLACE_WITH_CERTIFICATE_SHA256 \
   --target .winlin-local/windows.json
 
-build/winlin inspect --target .winlin-local/windows.json
-build/winlin run --target .winlin-local/windows.json \
+./scripts/run-client.sh inspect --target .winlin-local/windows.json
+./scripts/run-client.sh run --target .winlin-local/windows.json \
   --method mixed --get-percent 50 --get-size 4KiB --put-size 16KiB \
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 ```

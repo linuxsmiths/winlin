@@ -16,11 +16,19 @@ from https_contract import exercise_contract, tls_context
 
 
 SERVER, CLIENT = sys.argv[1:3]
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 
 def command(*args, expected=0, input_text=None, env=None):
+    # Keep the existing end-to-end cases while exercising the launcher's stdin/argv/exit forwarding.
+    arguments = [str(arg) for arg in args]
+    if arguments[0] == CLIENT:
+        arguments = [
+            str(SCRIPTS / "run-client.sh"), "--build-dir", str(Path(CLIENT).parent),
+            "--", *arguments[1:],
+        ]
     result = subprocess.run(
-        [str(arg) for arg in args],
+        arguments,
         capture_output=True,
         text=True,
         input=input_text,
@@ -47,7 +55,8 @@ class Agent:
         self.directory = directory
         self.process = subprocess.Popen(
             [
-                SERVER,
+                str(SCRIPTS / "run-server.sh"),
+                "--build-dir", str(Path(SERVER).parent), "--",
                 "--cert", str(directory / "cert.pem"),
                 "--key", str(directory / "private.key"),
                 "--token-file", str(directory / "pairing"),

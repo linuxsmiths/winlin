@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,9 @@ elif name == "apt-get":
         sys.exit(code)
     if arguments[0] == "install":
         Path(os.environ["WINLIN_TEST_INSTALLED"]).touch()
+elif name in ("winlin", "winlin-server"):
+    print(json.dumps({"arguments": arguments, "cwd": str(Path.cwd()), "pid": os.getpid()}))
+    sys.exit(int(os.environ.get("WINLIN_TEST_NATIVE_EXIT", "0")))
 """
 
 
@@ -69,11 +73,25 @@ class Scripts(unittest.TestCase):
             WINLIN_TEST_INSTALLED=str(self.directory / "installed"),
             CMAKE_BUILD_PARALLEL_LEVEL="2",
         )
+        # A separate checkout exercises repository-relative defaults without starting real binaries.
+        self.checkout = self.directory / "checkout with spaces"
+        (self.checkout / "scripts").mkdir(parents=True)
+        (self.checkout / "build").mkdir()
+        (self.checkout / ".winlin-local").mkdir()
+        for script in ("run-client.sh", "run-server.sh"):
+            shutil.copy2(ROOT / "scripts" / script, self.checkout / "scripts" / script)
+        for name in ("winlin", "winlin-server"):
+            executable = self.checkout / "build" / name
+            executable.write_text(f"#!{sys.executable}\n" + MOCK)
+            executable.chmod(0o755)
+        for name in ("server.pem", "server.key", "pairing-token"):
+            (self.checkout / ".winlin-local" / name).write_text("launcher fixture, not a credential")
 
     def run_script(self, script, *arguments, expected=0, **environment):
         """Run from outside the repository to catch accidental working-directory assumptions."""
+        root = self.checkout if script in ("run-client.sh", "run-server.sh") else ROOT
         result = subprocess.run(
-            ["bash", str(ROOT / "scripts" / script), *arguments],
+            ["bash", str(root / "scripts" / script), *arguments],
             cwd=self.directory,
             env=dict(self.env, **environment),
             text=True,
@@ -154,6 +172,88 @@ class Scripts(unittest.TestCase):
         self.assertIn("FATAL:", result.stderr)
         self.assertIn("simulated package database failure", result.stderr)
         self.assertFalse(self.calls("apt-get"))
+
+    def test_client_launcher_defaults_and_argument_boundaries(self):
+        """Forward menu startup and opaque client arguments without changing the caller's directory."""
+        interactive = self.run_script("run-client.sh")
+        self.assertEqual(json.loads(interactive.stdout)["arguments"], [])
+        result = self.run_script(
+            "run-client.sh", "--", "run", "--target", "target with spaces.json", "--output", "",
+        )
+        invocation = json.loads(result.stdout)
+        self.assertEqual(
+            invocation["arguments"],
+            ["run", "--target", "target with spaces.json", "--output", ""],
+        )
+        self.assertEqual(invocation["cwd"], str(self.directory))
+
+    def test_server_launcher_defaults_and_overrides(self):
+        """Reuse state files and allow individual overrides without duplicating native options."""
+        result = self.run_script("run-server.sh", "--bind", "10.0.0.4")
+        arguments = json.loads(result.stdout)["arguments"]
+        state = self.checkout / ".winlin-local"
+        self.assertEqual(arguments, [
+            "--cert", str(state / "server.pem"), "--key", str(state / "server.key"),
+            "--token-file", str(state / "pairing-token"), "--bind", "10.0.0.4",
+        ])
+        custom = self.directory / "private state"
+        shutil.copytree(state, custom)
+        result = self.run_script(
+            "run-server.sh", "--state-dir", "private state", "--cert", str(custom / "server.pem"),
+        )
+        self.assertEqual(json.loads(result.stdout)["arguments"], [
+            "--key", "private state/server.key", "--token-file", "private state/pairing-token",
+            "--cert", str(custom / "server.pem"),
+        ])
+        result = self.run_script(
+            "run-server.sh", "--state-dir", "private state", "--",
+            "--cert", str(custom / "server.pem"), "--key", str(custom / "server.key"),
+            "--token-file", str(custom / "pairing-token"), "--backend", "ktls",
+        )
+        arguments = json.loads(result.stdout)["arguments"]
+        for option in ("--cert", "--key", "--token-file"):
+            self.assertEqual(arguments.count(option), 1)
+        self.assertEqual(arguments[-2:], ["--backend", "ktls"])
+
+    def test_launcher_custom_build_paths_and_native_exit_codes(self):
+        """Locate caller-relative builds with spaces and preserve application failure statuses."""
+        custom = self.directory / "custom build"
+        shutil.copytree(self.checkout / "build", custom)
+        for script in ("run-client.sh", "run-server.sh"):
+            with self.subTest(script=script):
+                result = self.run_script(
+                    script, "--build-dir", "custom build",
+                    expected=23, WINLIN_TEST_NATIVE_EXIT="23",
+                )
+                self.assertIn("arguments", json.loads(result.stdout))
+
+    def test_launcher_preflight_errors_and_help(self):
+        """Reject incomplete launch settings before execution while keeping help available."""
+        before = len(self.calls("winlin-server"))
+        for script in ("run-client.sh", "run-server.sh"):
+            with self.subTest(script=script):
+                self.run_script(script, "--build-dir", expected=2)
+                self.run_script(script, "--build-dir", "missing build", expected=1)
+                self.assertIn("Usage:", self.run_script(script, "--help").stdout)
+        self.run_script("run-server.sh", "--state-dir", "missing state", expected=1)
+        self.run_script("run-server.sh", "--workers", expected=2)
+        self.assertEqual(len(self.calls("winlin-server")), before)
+        # Native help must not require a certificate or pairing state.
+        result = self.run_script("run-server.sh", "--state-dir", "missing state", "--", "--help")
+        self.assertEqual(json.loads(result.stdout)["arguments"], ["--help"])
+
+    def test_launchers_replace_shell_process(self):
+        """Keep the caller-visible PID so signals reach the real foreground application."""
+        for script in ("run-client.sh", "run-server.sh"):
+            with self.subTest(script=script):
+                process = subprocess.Popen(
+                    ["bash", str(self.checkout / "scripts" / script)],
+                    cwd=self.directory, env=self.env, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(json.loads(stdout)["pid"], process.pid)
 
 
 if __name__ == "__main__":

@@ -41,11 +41,23 @@ openssl rand -hex 32 > .winlin-local/pairing-token
 In one terminal, start the server:
 
 ```sh
-build/winlin-server \
-  --cert .winlin-local/server.pem \
-  --key .winlin-local/server.key \
-  --token-file .winlin-local/pairing-token
+./scripts/run-server.sh
 ```
+
+The launcher uses `build/winlin-server` and the three files created above in the
+repository's `.winlin-local/` directory. Override directories with
+`--build-dir PATH` and `--state-dir PATH` before native server options.
+Individual `--cert`, `--key`, and `--token-file` options override those defaults.
+For example:
+
+```sh
+./scripts/run-server.sh --build-dir build-server --state-dir /private/winlin \
+  --bind 10.0.0.4 --workers 8
+```
+
+Default directories are repository-relative; supplied relative paths use your
+current directory. No launcher creates certificates, resets pairing, builds, or
+changes host settings. Direct executable invocations remain supported.
 
 The default listener is `127.0.0.1:8443`. For a separate client machine, explicitly
 select the server's test-network IPv4 address with `--bind`. Restrict access using
@@ -60,13 +72,13 @@ openssl x509 -in .winlin-local/server.pem -outform DER | openssl dgst -sha256
 On the client, pair using those 64 hexadecimal digits:
 
 ```sh
-build/winlin pair \
+./scripts/run-client.sh pair \
   --host 127.0.0.1 \
   --token-file .winlin-local/pairing-token \
   --fingerprint REPLACE_WITH_CERTIFICATE_SHA256 \
   --target .winlin-local/local.json
 
-build/winlin inspect --target .winlin-local/local.json
+./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
 For remote testing, transfer the pairing credential through a trusted channel
@@ -89,25 +101,30 @@ To deliberately reset pairing, stop the server, remove its specific session
 credential file and the corresponding client target file, generate a fresh
 bootstrap credential, and restart. Do not delete these files during a run.
 
-Alternatively, run `build/winlin` and select **Add server**. It prompts for the
-IP address, port, cipher, certificate confirmation, and pairing-token file.
+Alternatively, run `./scripts/run-client.sh` and select **Add server**. It prompts
+for the IP address, port, cipher, certificate confirmation, and pairing-token file.
 Interactive targets are saved under `$XDG_STATE_HOME/winlin`, or
 `~/.local/state/winlin` when that variable is unset. Targets registered with an
 explicit `--target` path are usable through the CLI; the interactive menu lists
 targets in the state directory.
 
+The client launcher forwards arguments and interactive input unchanged. To use
+a separate client build, run `./scripts/run-client.sh --build-dir build-client`
+followed by any client command. `--help` shows launcher help; `-- --help` shows
+the executable's own help. These help conventions also apply to the Linux server.
+
 ## Running workloads
 
 ```sh
-build/winlin run --target .winlin-local/local.json \
+./scripts/run-client.sh run --target .winlin-local/local.json \
   --method get --get-size 4KiB \
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 
-build/winlin run --target .winlin-local/local.json \
+./scripts/run-client.sh run --target .winlin-local/local.json \
   --method put --put-size 64KiB \
   --connections 256 --duration 30
 
-build/winlin run --target .winlin-local/local.json \
+./scripts/run-client.sh run --target .winlin-local/local.json \
   --method mixed --get-percent 70 --get-size 4KiB --put-size 16KiB \
   --connections 256 --requests 100000 --duration 30 \
   --output results/mixed.json
