@@ -10,6 +10,10 @@
 #include <thread>
 
 namespace winlin {
+// Both native servers reserve this loopback TCP port for their entire lifetime, independently of
+// the HTTPS endpoint. It carries no traffic and permits only one Winlin server per machine.
+constexpr std::uint16_t server_guard_port = 8444;
+
 // Describe platform capabilities without mixing transport APIs into the common agent. Native
 // adapters must explicitly mark counters and CPU attribution they cannot collect accurately.
 struct AgentConfig {

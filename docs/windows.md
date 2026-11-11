@@ -102,6 +102,16 @@ paths; unspecified tuning options retain native defaults. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 
+Only one Winlin server may run per machine, including on different HTTPS ports.
+Like Linux, the native server reserves `127.0.0.1:8444` for its lifetime; Winsock
+`SO_EXCLUSIVEADDRUSE` prevents sharing. This loopback-only guard carries no
+communication, needs no HTTP.sys provisioning or firewall rule, and is released
+on exit or crash. An occupied guard port prevents startup. Stop any existing
+server before running integration tests.
+
+The Linux launchers' 512K file-descriptor limit does not apply to HTTP.sys/Winsock;
+there is no corresponding Windows `RLIMIT_NOFILE` setting to raise.
+
 The backend is `httpsys-schannel`. `--backend httpsys` is accepted explicitly;
 OpenSSL/kTLS backend requests fail rather than falling back.
 

@@ -19,6 +19,8 @@ Examples:
 
 Create the certificate and private token as described in docs/https.md first.
 This script never creates credentials, resets pairing, builds, or tunes the host.
+Runtime launches require a soft file-descriptor limit of at least 524288.
+The launcher raises only its own soft limit; the hard limit must allow this.
 EOF
 }
 
@@ -118,6 +120,18 @@ if ! "$has_private_key"; then
 fi
 if ! "$has_token_file"; then
     defaults+=(--token-file "$token_file")
+fi
+
+# Change only the launched process's soft limit, preserving higher limits and the hard ceiling.
+# Abort before readiness rather than starting a benchmark with an unexpectedly small allowance.
+minimum_fd_limit=524288
+soft_fd_limit="$(ulimit -Sn)"
+if [[ "$soft_fd_limit" != unlimited ]] && (( soft_fd_limit < minimum_fd_limit )); then
+    if ! ulimit -Sn "$minimum_fd_limit"; then
+        printf 'winlin server launcher: FATAL: need at least %s file descriptors; soft=%s, hard=%s.\nRaise the hard nofile limit for this login/service, then retry.\n' \
+            "$minimum_fd_limit" "$soft_fd_limit" "$(ulimit -Hn)" >&2
+        exit 1
+    fi
 fi
 
 # Keep native stdout (including the readiness JSON), signals, and exit codes unchanged.

@@ -7,12 +7,13 @@ import os
 from pathlib import Path
 import secrets
 import select
+import signal
 import socket
 import ssl
 import subprocess
 import sys
 import tempfile
-from https_contract import exercise_contract, tls_context
+from https_contract import exercise_contract, exercise_single_instance, tls_context
 
 
 SERVER, CLIENT = sys.argv[1:3]
@@ -204,8 +205,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
     private_file(directory / "pairing", bootstrap + "\n")
     certificate = ssl.PEM_cert_to_DER_cert((directory / "cert.pem").read_text())
     fingerprint = hashlib.sha256(certificate).hexdigest()
+    server_arguments = [
+        SERVER, "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
+        "--token-file", str(directory / "pairing"),
+    ]
     agent = Agent(directory)
     try:
+        exercise_single_instance(server_arguments, agent.port)
         assert agent.request("GET", "/v1/capabilities")[0] == 401
         assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401
         target = directory / "target.json"
@@ -326,6 +332,17 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
     assert "Closing failed TLS session" not in agent.stderr, agent.stderr
     assert "Peer closed an unfinished TLS request" not in agent.stderr, agent.stderr
 
+    # A forced process exit must release the guard without deleting state or cleaning a PID file.
+    agent = Agent(directory)
+    try:
+        agent.connection.close()
+        agent.process.kill()
+        _, stderr = agent.process.communicate(timeout=5)
+        assert agent.process.returncode == -signal.SIGKILL, stderr
+    finally:
+        if agent.process.poll() is None:
+            agent.stop()
+
     agent = Agent(directory, "ktls")
     try:
         ktls_target = directory / "ktls-target.json"
@@ -347,5 +364,11 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
                 assert "refusing userspace fallback" in result.stderr
     finally:
         agent.stop()
+
+    # A non-Winlin listener occupying the reservation must also cause a clear startup failure.
+    with socket.socket() as guard_owner:
+        guard_owner.bind(("127.0.0.1", 8444))
+        guard_owner.listen(1)
+        exercise_single_instance(server_arguments, 8443)
 
 print("HTTPS integration tests passed")

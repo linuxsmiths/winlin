@@ -17,6 +17,8 @@ Examples:
   scripts/run-client.sh --build-dir build-client run --target target.json
 
 This script does not build, pair targets, or change credentials.
+Runtime launches require a soft file-descriptor limit of at least 524288.
+The launcher raises only its own soft limit; the hard limit must allow this.
 EOF
 }
 
@@ -58,6 +60,22 @@ if [[ ! -f "$executable" || ! -x "$executable" ]]; then
     printf 'winlin client launcher: FATAL: executable not found: %s\nRun scripts/build.sh client first.\n' \
         "$executable" >&2
     exit 1
+fi
+
+if (( $# == 1 )) && [[ "$1" == --help ]]; then
+    exec "$executable" --help
+fi
+
+# High-connection-count runs must not inherit a small interactive-shell limit. Do not lower larger
+# limits or change the hard ceiling; only this process and the application it execs are affected.
+minimum_fd_limit=524288
+soft_fd_limit="$(ulimit -Sn)"
+if [[ "$soft_fd_limit" != unlimited ]] && (( soft_fd_limit < minimum_fd_limit )); then
+    if ! ulimit -Sn "$minimum_fd_limit"; then
+        printf 'winlin client launcher: FATAL: need at least %s file descriptors; soft=%s, hard=%s.\nRaise the hard nofile limit for this login/service, then retry.\n' \
+            "$minimum_fd_limit" "$soft_fd_limit" "$(ulimit -Hn)" >&2
+        exit 1
+    fi
 fi
 
 # Replace the wrapper so stdin, signals, and the application's exit status are not intercepted.

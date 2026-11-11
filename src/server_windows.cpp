@@ -56,6 +56,61 @@ struct Winsock {
     }
 };
 
+// Reserve the same loopback guard as Linux without involving HTTP.sys or processing any traffic.
+// Main keeps this alive until Runtime has drained and closed, and Winsock must outlive the socket.
+struct ServerGuard {
+    SOCKET value{INVALID_SOCKET};
+
+    // Acquire exclusive ownership before constructing the HTTPS runtime; undo partial setup on
+    // error.
+    ServerGuard() {
+        value = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (value == INVALID_SOCKET) {
+            throw windows_error("Create server guard socket", WSAGetLastError());
+        }
+        try {
+            const BOOL exclusive = TRUE;
+            if (setsockopt(value, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                           reinterpret_cast<const char*>(&exclusive), sizeof(exclusive))) {
+                throw windows_error("SO_EXCLUSIVEADDRUSE for server guard", WSAGetLastError());
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(server_guard_port);
+            if (bind(value, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+                listen(value, 1)) {
+                const auto error = WSAGetLastError();
+                throw windows_error(
+                    "Cannot reserve exclusive server guard on 127.0.0.1:" +
+                        std::to_string(server_guard_port) +
+                        "; another Winlin server or application may already own this port",
+                    error);
+            }
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+
+    // Release the reservation only after the native HTTPS runtime has finished shutting down.
+    ~ServerGuard() {
+        release();
+    }
+
+    ServerGuard(const ServerGuard&) = delete;
+    ServerGuard& operator=(const ServerGuard&) = delete;
+
+private:
+    // Preserve the original startup failure if closing a partially configured socket also fails.
+    void release() {
+        if (value != INVALID_SOCKET && closesocket(value) != 0) {
+            log_warning(windows_error("Close server guard socket", WSAGetLastError()).what());
+        }
+        value = INVALID_SOCKET;
+    }
+};
+
 // Own the HTTP.sys request queue; Runtime must drain all outstanding operations before closing it.
 struct Queue {
     HANDLE value{};
@@ -652,6 +707,7 @@ int wmain(int argc, wchar_t** argv) {
         Args args(argc, arguments.data());
         args.allow({"--token-file", "--bind", "--port", "--workers", "--backend", "--cipher",
                     "--max-connections", "--session-file", "--stop-file"});
+        ServerGuard instance_guard;
         Runtime server(args);
         server.run();
         return 0;

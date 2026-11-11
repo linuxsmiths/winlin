@@ -59,6 +59,18 @@ Default directories are repository-relative; supplied relative paths use your
 current directory. No launcher creates certificates, resets pairing, builds, or
 changes host settings. Direct executable invocations remain supported.
 
+Both Linux launchers raise their process's soft file-descriptor limit to at least
+524,288 (512K), leaving higher limits and the hard limit unchanged. A lower hard
+limit causes a fatal startup error: raise the login/service's hard `nofile` limit
+and start a new session or restart the service before retrying. Native executable
+invocations bypass this launcher check; descriptor exhaustion remains fatal.
+
+Only one Winlin server may run per machine, regardless of HTTPS bind address or
+port. Both OS implementations hold an exclusive listener on `127.0.0.1:8444`
+without accepting connections. This guard is released automatically on exit,
+including crashes; an occupied guard port prevents startup with a clear error.
+Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
+
 The default listener is `127.0.0.1:8443`. For a separate client machine, explicitly
 select the server's test-network IPv4 address with `--bind`. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.

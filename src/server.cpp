@@ -203,6 +203,26 @@ struct Session {
     }
 };
 
+// Claim machine-wide server ownership before constructing workers. Unlike HTTPS listeners, this
+// socket must never enable either reuse option; closing it also releases ownership after a crash.
+Fd server_guard() {
+    Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (fd.value < 0) {
+        throw system_error("Create server guard socket");
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(server_guard_port);
+    if (bind(fd.value, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+        listen(fd.value, 1)) {
+        throw system_error("Cannot reserve exclusive server guard on 127.0.0.1:" +
+                           std::to_string(server_guard_port) +
+                           "; another Winlin server or application may already own this port");
+    }
+    return fd;
+}
+
 // Bind one reuse-port listener per worker; the first ephemeral port is reused by later workers.
 Fd listener(const std::string& bind_address, unsigned& port) {
     Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
@@ -329,6 +349,7 @@ int main(int argc, char** argv) {
         Args args(argc, argv);
         args.allow({"--cert", "--key", "--token-file", "--bind", "--port", "--workers", "--backend",
                     "--cipher", "--max-connections", "--session-file"});
+        const auto instance_guard = server_guard();
         Server server(args);
         auto port = static_cast<unsigned>(number(args.get("--port", "8443"), 65535));
         const auto workers = server.config.workers;

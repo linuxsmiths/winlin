@@ -76,6 +76,11 @@ arguments, optionally separated by `--`. Use `--help` for launcher help or
 `-- --help` for native help. Launchers reuse existing state without building,
 creating credentials, or resetting pairing.
 
+Linux runtime launches ensure a soft file-descriptor limit of at least **524,288**,
+preserving higher limits. If the inherited hard limit is too low, startup fails
+with instructions to raise it for the login/service. Only the launched process
+is affected; no system-wide settings or hard limits are changed.
+
 On **Windows Server 2022 or Windows 11, x86_64**, use PowerShell:
 
 ```powershell
@@ -95,6 +100,11 @@ After provisioning, start the Windows server in the foreground with
 `build\Release\winlin-server.exe` and `.winlin-local\pairing-token`; use
 `-BuildDirectory`, `-Configuration`, `-StateDirectory`, or `-ServerExe` to
 override discovery. Run with `-Help` for all supported options.
+
+Only **one server per machine** is supported, even on different HTTPS ports.
+Both native servers reserve `127.0.0.1:8444` exclusively until shutdown; this port
+is not used for communication. Stop any existing server before starting another
+or running server integration tests. Windows does not need the Linux FD-limit setting.
 
 ## Goals
 

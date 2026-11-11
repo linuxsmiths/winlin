@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 
-from https_contract import exercise_contract, tls_context
+from https_contract import exercise_contract, exercise_single_instance, tls_context
 
 
 SERVER, PORT, TOKEN_FILE, PIN, STOP_FILE = sys.argv[1:]
@@ -81,6 +81,7 @@ class Agent:
 bootstrap = Path(TOKEN_FILE).read_text().strip()
 agent = Agent()
 try:
+    exercise_single_instance([SERVER, "--token-file", TOKEN_FILE], PORT)
     agent.connection.connect()
     assert hashlib.sha256(agent.connection.sock.getpeercert(binary_form=True)).hexdigest() == PIN
     cipher = agent.connection.sock.cipher()[0]
@@ -150,5 +151,11 @@ try:
     assert status == 400 and b"cipher" in payload, payload
 finally:
     agent.stop()
+
+with socket.socket() as guard_owner:
+    guard_owner.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    guard_owner.bind(("127.0.0.1", 8444))
+    guard_owner.listen(1)
+    exercise_single_instance([SERVER, "--token-file", TOKEN_FILE], PORT)
 
 print(f"Windows HTTP.sys shared contract, persistent/concurrent GET/PUT, restart and TLS checks passed ({cipher}).")

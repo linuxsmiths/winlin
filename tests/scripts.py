@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ MOCK = r"""
 import json
 import os
 from pathlib import Path
+import resource
 import sys
 
 name = Path(sys.argv[0]).name
@@ -46,7 +48,11 @@ elif name == "apt-get":
     if arguments[0] == "install":
         Path(os.environ["WINLIN_TEST_INSTALLED"]).touch()
 elif name in ("winlin", "winlin-server"):
-    print(json.dumps({"arguments": arguments, "cwd": str(Path.cwd()), "pid": os.getpid()}))
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(json.dumps({
+        "arguments": arguments, "cwd": str(Path.cwd()), "pid": os.getpid(),
+        "soft_fd_limit": soft, "hard_fd_limit": hard,
+    }))
     sys.exit(int(os.environ.get("WINLIN_TEST_NATIVE_EXIT", "0")))
 """
 
@@ -87,7 +93,7 @@ class Scripts(unittest.TestCase):
         for name in ("server.pem", "server.key", "pairing-token"):
             (self.checkout / ".winlin-local" / name).write_text("launcher fixture, not a credential")
 
-    def run_script(self, script, *arguments, expected=0, **environment):
+    def run_script(self, script, *arguments, expected=0, fd_limits=None, **environment):
         """Run from outside the repository to catch accidental working-directory assumptions."""
         root = self.checkout if script in ("run-client.sh", "run-server.sh") else ROOT
         result = subprocess.run(
@@ -97,6 +103,9 @@ class Scripts(unittest.TestCase):
             text=True,
             capture_output=True,
             timeout=10,
+            # Limit only this single-threaded test's child, never the test runner or shared host.
+            preexec_fn=(lambda: resource.setrlimit(resource.RLIMIT_NOFILE, fd_limits))
+            if fd_limits else None,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
@@ -254,6 +263,32 @@ class Scripts(unittest.TestCase):
                 stdout, stderr = process.communicate(timeout=10)
                 self.assertEqual(process.returncode, 0, stderr)
                 self.assertEqual(json.loads(stdout)["pid"], process.pid)
+
+    def test_launchers_raise_soft_fd_limit_without_lowering_hard_limit(self):
+        """Verify the actual limits inherited by each application, not just a shell command string."""
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        for script in ("run-client.sh", "run-server.sh"):
+            with self.subTest(script=script):
+                result = self.run_script(script, fd_limits=(1024, hard))
+                invocation = json.loads(result.stdout)
+                self.assertEqual(invocation["soft_fd_limit"], 524288)
+                self.assertEqual(invocation["hard_fd_limit"], hard)
+                if hard == resource.RLIM_INFINITY or hard > 524288:
+                    result = self.run_script(script, fd_limits=(524289, hard))
+                    self.assertEqual(json.loads(result.stdout)["soft_fd_limit"], 524289)
+
+    def test_launchers_reject_insufficient_hard_fd_limit(self):
+        """Fail before execution when the process cannot reach 512K; help remains accessible."""
+        for script, binary in (("run-client.sh", "winlin"), ("run-server.sh", "winlin-server")):
+            with self.subTest(script=script):
+                before = len(self.calls(binary))
+                result = self.run_script(script, fd_limits=(1024, 4096), expected=1)
+                self.assertIn("FATAL:", result.stderr)
+                self.assertIn("524288", result.stderr)
+                self.assertIn("hard=4096", result.stderr)
+                self.assertIn("Raise the hard nofile limit", result.stderr)
+                self.assertEqual(len(self.calls(binary)), before)
+                self.run_script(script, "--", "--help", fd_limits=(1024, 4096))
 
 
 if __name__ == "__main__":
