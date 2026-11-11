@@ -211,7 +211,15 @@ void pair_target(const std::string& host, const std::string& port, const std::st
         throw std::invalid_argument("Port must be positive");
     }
     Target target{host, port, checked_pin(pin), token_file(token_path), cipher};
+    if (target.pin == benchmark_certificate_sha256) {
+        log_warning(
+            "Using the public benchmark certificate; this does not authenticate server identity");
+    }
     auto ctx = context(false, cipher);
+    // CLI onboarding should work on a fresh client without a manual target-directory setup step.
+    if (!output.parent_path().empty()) {
+        fs::create_directories(output.parent_path());
+    }
     write_private(output, Json::object(), true);
     try {
         const auto response = exchange(ctx.get(), target, "POST", "/v1/pair");
@@ -825,10 +833,14 @@ void interactive() {
                 auto ctx = context(false, cipher);
                 auto socket = connect_tls(ctx.get(), host, port, {});
                 const auto pin = fingerprint(socket->ssl.get());
-                std::cout << "Server certificate SHA-256: " << pin
-                          << "\nVerify this fingerprint through a trusted channel.\n";
-                if (prompt("Trust this certificate? Type yes", "no") != "yes") {
-                    continue;
+                std::cout << "Server certificate SHA-256: " << pin << '\n';
+                // Only the bundled public fixture is accepted automatically; custom identities
+                // retain the explicit confirmation step and the saved exact-certificate pin.
+                if (pin != benchmark_certificate_sha256) {
+                    std::cout << "Verify this fingerprint through a trusted channel.\n";
+                    if (prompt("Trust this certificate? Type yes", "no") != "yes") {
+                        continue;
+                    }
                 }
                 const auto token = prompt("Path to private pairing-token file");
                 pair_target(host, port, token, pin,
@@ -884,8 +896,11 @@ int main(int argc, char** argv) {
         if (command == "--help" || command == "help") {
             std::cout
                 << "winlin                         Interactive console\n"
-                   "winlin pair --host IP --token-file FILE --fingerprint SHA256 --target FILE\n"
+                   "winlin pair --host IP --token-file FILE --target FILE [--fingerprint SHA256]\n"
                    "            [--port 8443] [--cipher TLS_AES_128_GCM_SHA256]\n"
+                   "            Default: bundled PUBLIC benchmark certificate (no trusted "
+                   "identity).\n"
+                   "            Custom certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
@@ -900,7 +915,8 @@ int main(int argc, char** argv) {
             args.allow(
                 {"--host", "--port", "--token-file", "--fingerprint", "--target", "--cipher"});
             pair_target(args.require("--host"), args.get("--port", "8443"),
-                        args.require("--token-file"), args.require("--fingerprint"),
+                        args.require("--token-file"),
+                        args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
                         args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));
             return 0;
         }

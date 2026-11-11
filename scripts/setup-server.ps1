@@ -37,11 +37,27 @@ try {
         if (-not $certificate.HasPrivateKey) { throw 'Certificate must have a private key in LocalMachine\My.' }
     }
     else {
-        $certificate = New-SelfSignedCertificate -Type SSLServerAuthentication -Subject 'CN=winlin-test' `
-            -TextExtension @("2.5.29.17={text}IPAddress=$BindAddress") -CertStoreLocation 'Cert:\LocalMachine\My' `
-            -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable `
-            -NotAfter (Get-Date).AddDays(30)
-        $createdCertificate = $true
+        # Reuse the repository's deliberately public identity, never a real credential. Loading the
+        # public DER first avoids importing/replacing a certificate already used by another binding.
+        $fixtures = Join-Path $PSScriptRoot '../certs/benchmark'
+        $publicCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [IO.Path]::GetFullPath((Join-Path $fixtures 'server.der')))
+        try { $fixtureThumbprint = $publicCertificate.Thumbprint }
+        finally { $publicCertificate.Dispose() }
+        $storePath = "Cert:\LocalMachine\My\$fixtureThumbprint"
+        if (Test-Path -LiteralPath $storePath) {
+            $certificate = Get-Item -LiteralPath $storePath
+            if (-not $certificate.HasPrivateKey) {
+                throw 'The benchmark certificate already exists without its private key; resolve the store entry before retrying.'
+            }
+        }
+        else {
+            $password = ConvertTo-SecureString 'winlin-public-benchmark' -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath (Join-Path $fixtures 'server.pfx') `
+                -CertStoreLocation 'Cert:\LocalMachine\My' -Password $password
+            $createdCertificate = $true
+        }
+        Write-Warning 'Using the PUBLIC benchmark certificate/key; this provides no trustworthy server identity.'
     }
     $thumbprint = $certificate.Thumbprint
     Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'sslcert', "ipport=$endpoint",

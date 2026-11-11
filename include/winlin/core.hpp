@@ -25,6 +25,9 @@ using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_object_size = 64 * 1024 * 1024;
 constexpr std::size_t max_header_size = 16384;
+// This pin identifies the deliberately public test fixture, not an authenticated server identity.
+// CMake derives it from certs/benchmark/server.der so native binaries need no runtime fixture path.
+constexpr std::string_view benchmark_certificate_sha256 = WINLIN_BENCHMARK_CERTIFICATE_SHA256;
 constexpr std::array<std::size_t, 10> size_presets{256,   512,   1024,   4096,    8192,
                                                    16384, 65536, 262144, 1048576, 4194304};
 

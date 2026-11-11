@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Document safe local defaults; provisioning remains an explicit, separate operation.
+# Document the public benchmark identity and keep real pairing credentials local.
 usage() {
     cat <<'EOF'
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
-Default state files: server.pem, server.key, pairing-token.
+Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
+An existing server.pem/server.key in the state directory takes precedence.
+The private pairing-token is generated locally on first use and then reused.
 Native --cert, --key, and --token-file arguments override individual defaults.
 Place launcher options first. Relative overrides use the caller's working directory.
 Use -- --help for the native server's help, without requiring state files.
@@ -17,8 +19,8 @@ Examples:
   scripts/run-server.sh --bind 10.0.0.4 --workers 8
   scripts/run-server.sh --state-dir /private/endpoint --backend ktls
 
-Create the certificate and private token as described in docs/https.md first.
-This script never creates credentials, resets pairing, builds, or tunes the host.
+The bundled identity provides no trustworthy server authentication.
+This script never resets pairing, overwrites existing credentials, or builds.
 Runtime launches require a soft file-descriptor limit of at least 524288.
 The launcher raises only its own soft limit; the hard limit must allow this.
 EOF
@@ -76,8 +78,15 @@ if (( $# % 2 )); then
     exit 2
 fi
 
-certificate="$state_dir/server.pem"
-private_key="$state_dir/server.key"
+certificate="$repo_root/certs/benchmark/server.pem"
+private_key="$repo_root/certs/benchmark/server.key"
+# Preserve existing installations, including partial custom state: missing custom files are errors,
+# not a reason to silently replace a configured identity with the public test fixture.
+if [[ -e "$state_dir/server.pem" || -L "$state_dir/server.pem" ||
+      -e "$state_dir/server.key" || -L "$state_dir/server.key" ]]; then
+    certificate="$state_dir/server.pem"
+    private_key="$state_dir/server.key"
+fi
 token_file="$state_dir/pairing-token"
 has_certificate=false
 has_private_key=false
@@ -103,7 +112,7 @@ for (( index = 0; index < ${#server_arguments[@]}; index += 2 )); do
     esac
 done
 
-for path in "$certificate" "$private_key" "$token_file"; do
+for path in "$certificate" "$private_key"; do
     if [[ ! -f "$path" || ! -r "$path" ]]; then
         printf 'winlin server launcher: FATAL: state file is missing or unreadable: %s\nSee docs/https.md for setup.\n' \
             "$path" >&2
@@ -132,6 +141,31 @@ if [[ "$soft_fd_limit" != unlimited ]] && (( soft_fd_limit < minimum_fd_limit ))
             "$minimum_fd_limit" "$soft_fd_limit" "$(ulimit -Hn)" >&2
         exit 1
     fi
+fi
+
+# Bootstrap only an absent default token. Explicit paths, existing files and symlinks are never
+# overwritten; exclusive creation also prevents concurrent launchers from replacing credentials.
+if ! "$has_token_file" && [[ ! -e "$token_file" && ! -L "$token_file" ]]; then
+    if ! (umask 077; mkdir -p -- "$state_dir"); then
+        echo 'winlin server launcher: FATAL: cannot create local state directory.' >&2
+        exit 1
+    fi
+    if ! token="$(openssl rand -hex 32)"; then
+        echo 'winlin server launcher: FATAL: cannot generate private pairing token; check OpenSSL installation.' >&2
+        exit 1
+    fi
+    if ! (umask 077; set -o noclobber; printf '%s\n' "$token" > "$token_file"); then
+        echo 'winlin server launcher: FATAL: cannot create pairing token; existing credentials were not overwritten.' >&2
+        exit 1
+    fi
+    unset token
+fi
+if [[ ! -f "$token_file" || ! -r "$token_file" ]]; then
+    printf 'winlin server launcher: FATAL: state file is missing or unreadable: %s\n' "$token_file" >&2
+    exit 1
+fi
+if [[ "$certificate" == "$repo_root/certs/benchmark/server.pem" ]]; then
+    echo 'winlin server launcher: WARNING: using the PUBLIC benchmark certificate/key; no trustworthy server identity.' >&2
 fi
 
 # Keep native stdout (including the readiness JSON), signals, and exit codes unchanged.

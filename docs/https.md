@@ -27,25 +27,21 @@ Both implementations still need tuning and validation on large machines.
 
 Build the project using the commands in the [README](../README.md).
 
-Create a test certificate and a private pairing credential:
-
-```sh
-umask 077
-mkdir -p .winlin-local
-openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-  -subj '/CN=winlin-test' -addext 'subjectAltName=IP:127.0.0.1' \
-  -keyout .winlin-local/server.key -out .winlin-local/server.pem
-openssl rand -hex 32 > .winlin-local/pairing-token
-```
-
-In one terminal, start the server:
+No manual certificate setup is needed. In one terminal, start the server:
 
 ```sh
 ./scripts/run-server.sh
 ```
 
-The launcher uses `build/winlin-server` and the three files created above in the
-repository's `.winlin-local/` directory. Override directories with
+The launcher uses `build/winlin-server`, the **deliberately public** certificate/key
+in `certs/benchmark/`, and a private pairing token created automatically under
+`.winlin-local/` on first use. Later launches reuse the token and session state.
+The bundled identity provides **no trustworthy server authentication**: anyone
+can impersonate it. Use only on isolated synthetic benchmark networks.
+
+Existing `server.pem`/`server.key` files in the state directory retain precedence;
+a partial custom pair is an error, not a reason to fall back to the public pair.
+Override directories with
 `--build-dir PATH` and `--state-dir PATH` before native server options.
 Individual `--cert`, `--key`, and `--token-file` options override those defaults.
 For example:
@@ -56,8 +52,9 @@ For example:
 ```
 
 Default directories are repository-relative; supplied relative paths use your
-current directory. No launcher creates certificates, resets pairing, builds, or
-changes host settings. Direct executable invocations remain supported.
+current directory. No launcher resets pairing, overwrites existing credentials,
+builds, or changes system-wide host settings. An explicit missing `--token-file`
+remains an error. Direct executable invocations remain supported.
 
 Both Linux launchers raise their process's soft file-descriptor limit to at least
 524,288 (512K), leaving higher limits and the hard limit unchanged. A lower hard
@@ -75,28 +72,24 @@ The default listener is `127.0.0.1:8443`. For a separate client machine, explici
 select the server's test-network IPv4 address with `--bind`. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.
 
-The server certificate's SHA-256 fingerprint is:
-
-```sh
-openssl x509 -in .winlin-local/server.pem -outform DER | openssl dgst -sha256
-```
-
-On the client, pair using those 64 hexadecimal digits:
+The client already knows the bundled certificate, so no fingerprint entry is needed:
 
 ```sh
 ./scripts/run-client.sh pair \
   --host 127.0.0.1 \
   --token-file .winlin-local/pairing-token \
-  --fingerprint REPLACE_WITH_CERTIFICATE_SHA256 \
   --target .winlin-local/local.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
-For remote testing, transfer the pairing credential through a trusted channel
-and obtain the fingerprint independently. The client checks the certificate pin
-**before sending credentials**. This implementation uses certificate pinning,
-not CA-chain or certificate-expiry validation; a changed certificate is rejected.
+For remote testing, transfer the pairing credential to the client through a
+trusted channel. The client checks the certificate pin **before sending
+credentials**, but the bundled public key provides no protection against server
+impersonation. Custom identities require `--fingerprint SHA256`; their fingerprint
+must be verified independently. This implementation uses exact certificate
+pinning, not CA-chain or certificate-expiry validation; a different certificate
+is rejected, even when no `--fingerprint` was provided.
 
 Pairing consumes the bootstrap credential for that server state and exchanges it
 for a persistent access credential. The server saves this in
@@ -114,7 +107,9 @@ credential file and the corresponding client target file, generate a fresh
 bootstrap credential, and restart. Do not delete these files during a run.
 
 Alternatively, run `./scripts/run-client.sh` and select **Add server**. It prompts
-for the IP address, port, cipher, certificate confirmation, and pairing-token file.
+for the IP address, port, cipher, and pairing-token file. The bundled certificate
+is accepted automatically with a warning; custom certificates still require
+fingerprint confirmation.
 Interactive targets are saved under `$XDG_STATE_HOME/winlin`, or
 `~/.local/state/winlin` when that variable is unset. Targets registered with an
 explicit `--target` path are usable through the CLI; the interactive menu lists
@@ -124,6 +119,24 @@ The client launcher forwards arguments and interactive input unchanged. To use
 a separate client build, run `./scripts/run-client.sh --build-dir build-client`
 followed by any client command. `--help` shows launcher help; `-- --help` shows
 the executable's own help. These help conventions also apply to the Linux server.
+
+### Custom certificates
+
+For a non-public identity, create your own certificate/key outside the fixtures:
+
+```sh
+umask 077
+mkdir -p .winlin-local
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -subj '/CN=winlin-test' -addext 'subjectAltName=IP:127.0.0.1' \
+  -keyout .winlin-local/server.key -out .winlin-local/server.pem
+```
+
+The launcher prefers this pair on subsequent starts. Obtain its fingerprint with
+`openssl x509 -in .winlin-local/server.pem -outform DER | openssl dgst -sha256`
+and pass the 64 hexadecimal digits as `--fingerprint SHA256` when pairing.
+Do not replace an existing endpoint identity unintentionally: saved client pins
+will correctly reject a different certificate.
 
 ## Running workloads
 

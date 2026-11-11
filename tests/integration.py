@@ -52,20 +52,20 @@ def private_file(path, text):
 class Agent:
     """Own a loopback Linux server and control connection; always reap it and retain diagnostics."""
 
-    def __init__(self, directory, backend="openssl"):
+    def __init__(self, directory, backend="openssl", bundled=False):
         self.directory = directory
-        self.process = subprocess.Popen(
-            [
-                str(SCRIPTS / "run-server.sh"),
-                "--build-dir", str(Path(SERVER).parent), "--",
-                "--cert", str(directory / "cert.pem"),
-                "--key", str(directory / "private.key"),
+        arguments = [
+            str(SCRIPTS / "run-server.sh"), "--build-dir", str(Path(SERVER).parent),
+            "--state-dir", str(directory), "--", "--session-file", str(directory / f"{backend}.session"),
+            "--port", "0", "--workers", "2", "--backend", backend,
+        ]
+        if not bundled:
+            arguments += [
+                "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
                 "--token-file", str(directory / "pairing"),
-                "--session-file", str(directory / f"{backend}.session"),
-                "--port", "0",
-                "--workers", "2",
-                "--backend", backend,
-            ],
+            ]
+        self.process = subprocess.Popen(
+            arguments,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -222,6 +222,16 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
         result = command(*pairing, "--fingerprint", "0" * 64, expected=1)
         assert "certificate changed" in result.stderr
         assert not target.exists()
+        # Omitting a custom pin must not mean trust-any-certificate or consume its bootstrap token.
+        result = command(*pairing, expected=1)
+        assert "certificate changed" in result.stderr
+        assert not target.exists()
+        custom_menu = command(
+            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\nno\n0\n",
+            env=dict(os.environ, XDG_STATE_HOME=str(directory / "custom-menu-state")),
+        )
+        assert "Trust this certificate?" in custom_menu.stdout
+        assert "Paired target saved" not in custom_menu.stdout
         paired = command(*pairing, "--fingerprint", fingerprint)
         target_json = json.loads(target.read_text())
         token = target_json["access_token"]
@@ -370,5 +380,48 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
         guard_owner.bind(("127.0.0.1", 8444))
         guard_owner.listen(1)
         exercise_single_instance(server_arguments, 8443)
+
+    # Default launch/pair needs neither user-created certificates nor fingerprint entry.
+    bundled = directory / "bundled-cli"
+    agent = Agent(bundled, bundled=True)
+    try:
+        target = bundled / "new-client-state/target.json"
+        paired = command(
+            CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
+            "--token-file", bundled / "pairing-token", "--target", target,
+        )
+        assert "public benchmark certificate" in paired.stderr
+        fixture = SCRIPTS.parent / "certs/benchmark"
+        certificate = ssl.PEM_cert_to_DER_cert((fixture / "server.pem").read_text())
+        assert certificate == (fixture / "server.der").read_bytes()
+        assert json.loads(target.read_text())["certificate_sha256"] == hashlib.sha256(certificate).hexdigest()
+        bootstrap = (bundled / "pairing-token").read_text()
+        command(CLIENT, "inspect", "--target", target)
+    finally:
+        agent.stop()
+    agent = Agent(bundled, bundled=True)
+    try:
+        assert (bundled / "pairing-token").read_text() == bootstrap
+        saved = json.loads(target.read_text())
+        saved["port"] = str(agent.port)
+        private_file(target, json.dumps(saved))
+        command(CLIENT, "inspect", "--target", target)
+    finally:
+        agent.stop()
+
+    # Interactive onboarding recognizes only the bundled certificate without a trust prompt.
+    bundled = directory / "bundled-menu"
+    agent = Agent(bundled, bundled=True)
+    try:
+        state = bundled / "client-state"
+        menu = command(
+            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\n{bundled / 'pairing-token'}\n0\n",
+            env=dict(os.environ, XDG_STATE_HOME=str(state)),
+        )
+        assert "Paired target saved" in menu.stdout, menu.stdout + menu.stderr
+        assert "Trust this certificate?" not in menu.stdout
+        assert "public benchmark certificate" in menu.stderr
+    finally:
+        agent.stop()
 
 print("HTTPS integration tests passed")

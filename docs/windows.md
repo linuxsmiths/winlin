@@ -61,16 +61,24 @@ $setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 -Port 8443
 $setup | Format-List
 ```
 
-This creates a 30-day, non-exportable RSA test certificate in `LocalMachine\My`,
-an HTTP.sys SSL binding, a URL reservation for the current user, and a private
+This imports the bundled **deliberately public** RSA test certificate/key into
+`LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
+SSL binding, a URL reservation for the current user, and a private
 bootstrap credential in `.winlin-local\pairing-token`. Only the owner, SYSTEM and
 Administrators may access credential files. The current user owns the state;
 run the server as that same account. Service-account provisioning is not automated.
 
+The PFX import password is intentionally public and is supplied automatically.
+This fixture provides **no trustworthy server identity**; anyone can impersonate
+it. Do not install it as a trusted root or use it for sensitive traffic. One-time
+elevated HTTP.sys provisioning is still required, but no certificate generation,
+export, password entry, or client fingerprint copying is needed.
+
 Use `-CertificateThumbprint THUMBPRINT` to select an existing certificate with a
 private key in `LocalMachine\My`. This option takes the **40-digit SHA-1 store
 identifier**, not the client's SHA-256 certificate pin. `CertificateSha256` in the
-script's output is the pin used by the Linux client.
+script's output is the pin used by the Linux client. The client already recognizes
+the bundled fixture; custom certificates require this SHA-256 pin explicitly.
 
 Use `-StateDirectory PATH` for a fresh independent endpoint state. Existing
 bindings, URL reservations, and pairing-token files are not silently replaced.
@@ -130,13 +138,13 @@ must not already exist at startup, and remains the caller's responsibility to re
 ## Pair and run from Linux
 
 Securely transfer the bootstrap file to the Linux client, and verify
-`CertificateSha256` through an independent trusted channel:
+the certificate fingerprint through an independent trusted channel if using a
+custom certificate. The bundled public certificate needs no fingerprint entry:
 
 ```sh
 chmod 600 /path/to/windows-pairing-token
 ./scripts/run-client.sh pair --host 10.0.0.4 --port 8443 \
   --token-file /path/to/windows-pairing-token \
-  --fingerprint REPLACE_WITH_CERTIFICATE_SHA256 \
   --target .winlin-local/windows.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json

@@ -3,4 +3,6 @@
 /.winlin-local/
 *.pem
 *.key
+!/certs/benchmark/server.pem
+!/certs/benchmark/server.key
 /tests/__pycache__/

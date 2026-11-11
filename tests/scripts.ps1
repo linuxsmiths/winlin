@@ -10,6 +10,22 @@ foreach ($directory in @('scripts', 'tests')) {
     }
 }
 . (Join-Path $root 'scripts/windows-common.ps1')
+# The Windows import container must carry the same public identity pinned by the Linux client.
+$publicCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    (Join-Path $root 'certs/benchmark/server.der'))
+$bundle = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    (Join-Path $root 'certs/benchmark/server.pfx'), 'winlin-public-benchmark',
+    [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+try {
+    if (-not $bundle.HasPrivateKey -or $bundle.Thumbprint -ne $publicCertificate.Thumbprint) {
+        throw 'Public benchmark PFX does not contain the matching certificate/key.'
+    }
+}
+finally {
+    $bundle.Dispose()
+    $publicCertificate.Dispose()
+}
+
 $launcherHelp = & (Join-Path $root 'scripts/run-server.ps1') -Help
 if (($launcherHelp -join "`n") -notmatch 'Usage:.*run-server.ps1') {
     throw 'Windows launcher help is unavailable.'

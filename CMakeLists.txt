@@ -26,10 +26,14 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 add_library(winlin_core INTERFACE)
+set(benchmark_certificate "${CMAKE_CURRENT_SOURCE_DIR}/certs/benchmark/server.der")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${benchmark_certificate}")
+file(SHA256 "${benchmark_certificate}" benchmark_certificate_sha256)
 target_include_directories(winlin_core INTERFACE include)
 target_compile_features(winlin_core INTERFACE cxx_std_23)
 target_compile_definitions(winlin_core INTERFACE
-  WINLIN_VERSION="${PROJECT_VERSION}" WINLIN_BUILD_TYPE="$<CONFIG>")
+  WINLIN_VERSION="${PROJECT_VERSION}" WINLIN_BUILD_TYPE="$<CONFIG>"
+  WINLIN_BENCHMARK_CERTIFICATE_SHA256="${benchmark_certificate_sha256}")
 target_link_libraries(winlin_core INTERFACE nlohmann_json::nlohmann_json)
 if(MSVC)
   target_compile_options(winlin_core INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus)

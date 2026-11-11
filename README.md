@@ -61,8 +61,9 @@ ctest --test-dir build --output-on-failure
 ```
 
 See [the HTTPS quickstart](docs/https.md) for certificate setup, pairing, workloads,
-results, and current limitations. Once certificates and pairing credentials are
-configured, use the foreground launchers:
+results, and current limitations. A deliberately public certificate/key is
+included for convenience; no manual certificate setup is needed for Linux.
+Use the foreground launchers:
 
 ```sh
 ./scripts/run-server.sh           # Linux server; defaults to .winlin-local/ state
@@ -73,8 +74,14 @@ configured, use the foreground launchers:
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
-`-- --help` for native help. Launchers reuse existing state without building,
-creating credentials, or resetting pairing.
+`-- --help` for native help. The server creates a private local pairing token on
+first use and preserves existing credentials/pairing. Launchers never build.
+
+**The bundled TLS identity is public and provides no trustworthy server
+authentication.** It is for isolated synthetic benchmarks only. The client
+recognizes it automatically; custom certificates/pins remain supported. See
+[the fixture documentation](certs/benchmark/README.md). Actual pairing tokens
+and saved controller credentials are not bundled or checked into Git.
 
 Linux runtime launches ensure a soft file-descriptor limit of at least **524,288**,
 preserving higher limits. If the inherited hard limit is too low, startup fails

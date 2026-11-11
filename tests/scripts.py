@@ -86,6 +86,7 @@ class Scripts(unittest.TestCase):
         (self.checkout / ".winlin-local").mkdir()
         for script in ("run-client.sh", "run-server.sh"):
             shutil.copy2(ROOT / "scripts" / script, self.checkout / "scripts" / script)
+        shutil.copytree(ROOT / "certs", self.checkout / "certs")
         for name in ("winlin", "winlin-server"):
             executable = self.checkout / "build" / name
             executable.write_text(f"#!{sys.executable}\n" + MOCK)
@@ -244,7 +245,9 @@ class Scripts(unittest.TestCase):
                 self.run_script(script, "--build-dir", expected=2)
                 self.run_script(script, "--build-dir", "missing build", expected=1)
                 self.assertIn("Usage:", self.run_script(script, "--help").stdout)
-        self.run_script("run-server.sh", "--state-dir", "missing state", expected=1)
+        self.run_script(
+            "run-server.sh", "--state-dir", "missing state", "--cert", "missing.pem", expected=1,
+        )
         self.run_script("run-server.sh", "--workers", expected=2)
         self.assertEqual(len(self.calls("winlin-server")), before)
         # Native help must not require a certificate or pairing state.
@@ -276,6 +279,37 @@ class Scripts(unittest.TestCase):
                 if hard == resource.RLIM_INFINITY or hard > 524288:
                     result = self.run_script(script, fd_limits=(524289, hard))
                     self.assertEqual(json.loads(result.stdout)["soft_fd_limit"], 524289)
+
+    def test_server_launcher_public_identity_and_private_bootstrap(self):
+        """A fresh checkout needs no manual TLS setup, but real pairing tokens stay local/private."""
+        state = self.directory / "fresh state"
+        result = self.run_script("run-server.sh", "--state-dir", str(state))
+        arguments = json.loads(result.stdout)["arguments"]
+        self.assertEqual(arguments[:4], [
+            "--cert", str(self.checkout / "certs/benchmark/server.pem"),
+            "--key", str(self.checkout / "certs/benchmark/server.key"),
+        ])
+        self.assertIn("PUBLIC benchmark certificate", result.stderr)
+        token = state / "pairing-token"
+        original = token.read_text()
+        self.assertRegex(original, r"^[0-9a-f]{64}\n$")
+        self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(original.strip(), result.stdout + result.stderr)
+        self.run_script("run-server.sh", "--state-dir", str(state))
+        self.assertEqual(token.read_text(), original)
+        missing = state / "explicitly missing token"
+        self.run_script(
+            "run-server.sh", "--state-dir", str(state), "--token-file", str(missing), expected=1,
+        )
+        self.assertFalse(missing.exists())
+
+    def test_server_launcher_does_not_replace_partial_custom_identity(self):
+        """A missing custom key must fail instead of switching an existing endpoint to public TLS."""
+        key = self.checkout / ".winlin-local/server.key"
+        key.unlink()
+        result = self.run_script("run-server.sh", expected=1)
+        self.assertIn(str(key), result.stderr)
+        self.assertFalse(self.calls("winlin-server"))
 
     def test_launchers_reject_insufficient_hard_fd_limit(self):
         """Fail before execution when the process cannot reach 512K; help remains accessible."""
