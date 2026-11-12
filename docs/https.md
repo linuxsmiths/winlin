@@ -70,11 +70,17 @@ without accepting connections. This guard is released automatically on exit,
 including crashes; an occupied guard port prevents startup with a clear error.
 Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
 
-The Linux HTTPS listener defaults to `0.0.0.0:8443` (all IPv4 interfaces), so a
+The Linux HTTPS listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
 separate client machine can connect without an extra server argument. Use
 `--bind 127.0.0.1` for loopback-only testing, or specify an individual test-network
 IPv4 address. The instance guard remains loopback-only. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.
+
+After upgrading from the old port 8443, rebuild and restart both programs and
+register the server at port 38443. Saved targets retain their previous port;
+existing Windows HTTP.sys bindings must be provisioned for the new port as well.
+Update firewall/VNet rules accordingly. A less common port may reduce unsolicited
+probes, but does not prevent scanning or replace network isolation.
 
 The client already knows the bundled certificate, so no fingerprint entry is needed:
 
@@ -230,7 +236,10 @@ activation is **not** evidence of NIC cryptographic offload.
 
 ## Results and limitations
 
-The console shows throughput, p50/p99 latency, errors, and measurement warnings.
+The console shows throughput, p50/p99 latency, errors, and run-specific warnings,
+such as load-generator CPU saturation or failed requests. General methodology
+caveats and backend measurement limitations appear once in the JSON report's
+top-level `notes` array, not in the console or each repetition's `warnings`.
 JSON output defaults to a uniquely named file under `results/`; `--output`
 selects another path. Existing output files are not overwritten on startup.
 Completed repetitions are saved as the run progresses, and a caught run failure
@@ -258,7 +267,7 @@ Important limitations:
   out.
 - Windows process CPU excludes HTTP.sys/Schannel work charged to System. It is
   not total OS CPU cost and must not be used as an apples-to-apples TLS efficiency
-  comparison. Results include this scope and a warning. Windows context-switch
+  comparison. Results include this scope and a report-level note. Windows context-switch
   and raw connection/handshake counters are currently unavailable and remain
   `null`, rather than zero.
 - NUMA placement, affinity, NIC/VM information, network counters, hardware cycles,

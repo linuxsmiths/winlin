@@ -71,7 +71,7 @@ Use the foreground launchers:
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
-The Linux HTTPS server listens on `0.0.0.0:8443` by default, accepting remote IPv4
+The Linux HTTPS server listens on `0.0.0.0:38443` by default, accepting remote IPv4
 clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
 
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
@@ -108,7 +108,7 @@ libraries, not OpenSSL, and the client remains Linux-only. See the
 Linux-client pairing, and optional privileged HTTPS tests.
 
 After provisioning, start the Windows server in the foreground with
-`.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443`. It defaults to
+`.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 38443`. It defaults to
 `build\Release\winlin-server.exe`, without authentication; use
 `-BuildDirectory`, `-Configuration`, `-StateDirectory`, or `-ServerExe` to
 override discovery. Run with `-Help` for all supported options.

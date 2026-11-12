@@ -1,4 +1,4 @@
-"""Exercise client onboarding and errors without using the native server's fixed guard port."""
+"""Exercise onboarding, benchmark reports and errors without the native server's guard port."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
 
 
 class RegistrationHandler(BaseHTTPRequestHandler):
-    """Provide the no-auth control contract over real TLS for client onboarding regressions."""
+    """Provide control and tiny workload responses over TLS without the native guard port."""
 
     protocol_version = "HTTP/1.1"
 
@@ -52,15 +52,30 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        self.respond({"authentication": "none"})
+        if self.path.startswith("/v1/object?size="):
+            self.respond(b"x" * int(self.path.split("=")[1]),
+                         status=503 if self.server.fail_workload else None)
+        elif self.path == "/v1/telemetry":
+            self.respond({
+                "process": {
+                    "user_cpu_seconds": 0, "system_cpu_seconds": 0, "peak_rss_bytes": 0,
+                    "voluntary_context_switches": None, "involuntary_context_switches": None,
+                },
+            })
+        else:
+            self.respond({
+                "authentication": "none", "backend": "test", "max_connections": 16,
+                "process_cpu_scope": "application process only; excludes work charged to System",
+                "unavailable_metrics": ["voluntary_context_switches"],
+            })
 
     def do_POST(self):
         self.respond({"access_token": ""})
 
-    def respond(self, payload):
+    def respond(self, payload, status=None):
         self.server.authorizations.append(self.headers.get("Authorization"))
-        body = json.dumps(payload).encode()
-        self.send_response(self.server.response_status)
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.send_response(self.server.response_status if status is None else status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -72,6 +87,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     server = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     server.authorizations = []
     server.response_status = 200
+    server.fail_workload = False
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
@@ -101,6 +117,46 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "pairing-token" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
 
+        benchmark = [
+            client, "run", "--target", str(target), "--get-size", "256",
+            "--connections", "1", "--workers", "1", "--warmup", "0",
+            "--duration", "1", "--requests", "2", "--repetitions", "2",
+        ]
+        output = directory / "benchmark.json"
+        result = subprocess.run(
+            [*benchmark, "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(output.read_text())
+        assert len(report["results"]) == 2
+        notes = report["notes"]
+        assert notes and len(notes) == len(set(notes))
+        assert any("Closed-loop" in note for note in notes)
+        assert any("System" in note for note in notes)
+        assert any("null is not zero" in note for note in notes)
+        for note in notes:
+            assert note not in result.stdout + result.stderr
+            assert all(note not in repetition["warnings"] for repetition in report["results"])
+
+        server.fail_workload = True
+        output = directory / "failed-benchmark.json"
+        result = subprocess.run(
+            [*benchmark, "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        report = json.loads(output.read_text())
+        assert report["status"] == "completed_with_errors"
+        for repetition in report["results"]:
+            assert repetition["errors"] > 0
+            assert repetition["warnings"], repetition
+            for warning in repetition["warnings"]:
+                assert warning in result.stderr
+        for note in report["notes"]:
+            assert note not in result.stdout + result.stderr
+        server.fail_workload = False
+
         token = directory / "optional-token"
         token.write_text("00" * 32 + "\n")
         token.chmod(0o600)
@@ -127,4 +183,4 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         worker.join(timeout=5)
         server.server_close()
 
-print("CLI and interactive automatic registration and connection-error diagnostics passed.")
+print("Client registration, benchmark notes, run-specific warnings and error diagnostics passed.")

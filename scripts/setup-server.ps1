@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$BindAddress = '127.0.0.1',
-    [ValidateRange(1, 65535)][int]$Port = 8443,
+    [ValidateRange(1, 65535)][int]$Port = 38443,
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
     [string]$CertificateThumbprint = '',
     [switch]$RequireAuthentication

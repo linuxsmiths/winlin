@@ -176,12 +176,15 @@ def run_case(directory, target, name, *options):
     # Merge overrides rather than repeating CLI flags, which the strict argument parser rejects.
     configuration.update(zip(options[::2], options[1::2]))
     arguments = [item for pair in configuration.items() for item in pair]
-    command(
+    invocation = command(
         CLIENT, "run", "--target", target,
         "--output", output, *arguments,
     )
     report = json.loads(output.read_text())
     assert report["status"] == "completed", report
+    for note in report["notes"]:
+        assert note not in invocation.stdout + invocation.stderr
+        assert all(note not in item["warnings"] for item in report["results"])
     result = report["results"][0]
     assert result["errors"] == 0
     assert result["completed"] == result["issued"]
@@ -408,7 +411,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
     with socket.socket() as guard_owner:
         guard_owner.bind(("127.0.0.1", 8444))
         guard_owner.listen(1)
-        exercise_single_instance(server_arguments, 8443)
+        exercise_single_instance(server_arguments, 38443)
 
     # Default launch/pair needs no certificates, fingerprint entry, or token files.
     bundled = directory / "bundled-cli"

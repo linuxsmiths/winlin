@@ -639,13 +639,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
-    std::vector<std::string> warnings{
-        "Closed-loop workload: percentiles exclude arrival-rate queueing and do not establish an "
-        "SLA.",
-        "Server telemetry is process-wide; concurrent users invalidate attribution.",
-        "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
-        "load interval.",
-        "In-flight requests are drained after the duration limit; elapsed time includes draining."};
+    std::vector<std::string> warnings;
     if (client_usage.at("cpu_core_equivalents").get<double>() >= config.workers * .85) {
         warnings.emplace_back(
             "Load-generator workers may be CPU saturated; do not assume a server limit.");
@@ -656,14 +650,6 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     }
     if (!combined.completed) {
         warnings.emplace_back("No requests completed successfully.");
-    }
-    if (server_before.at("process").at("voluntary_context_switches").is_null()) {
-        warnings.emplace_back("Server context-switch counters are unavailable; null is not zero.");
-    }
-    if (server_before.value("process_cpu_scope", "").find("System") != std::string::npos) {
-        warnings.emplace_back(
-            "Server process CPU excludes HTTP.sys/Schannel work charged to System; "
-            "CPU/request is not total OS CPU cost.");
     }
     const double server_cpu = server_usage.at("user_cpu_seconds").get<double>() +
                               server_usage.at("system_cpu_seconds").get<double>();
@@ -734,9 +720,27 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     if (RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
         throw tls_error("RAND_bytes");
     }
+    // Keep interpretation notes once per report, separate from detected per-repetition problems.
+    std::vector<std::string> notes{
+        "Closed-loop workload: percentiles exclude arrival-rate queueing and do not establish an "
+        "SLA.",
+        "Server telemetry is process-wide; concurrent users invalidate attribution.",
+        "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
+        "load interval.",
+        "In-flight requests are drained after the duration limit; elapsed time includes draining."};
+    const auto unavailable = capabilities.value("unavailable_metrics", std::vector<std::string>{});
+    if (std::find(unavailable.begin(), unavailable.end(), "voluntary_context_switches") !=
+        unavailable.end()) {
+        notes.emplace_back("Server context-switch counters are unavailable; null is not zero.");
+    }
+    if (capabilities.value("process_cpu_scope", "").find("System") != std::string::npos) {
+        notes.emplace_back("Server process CPU excludes HTTP.sys/Schannel work charged to System; "
+                           "CPU/request is not total OS CPU cost.");
+    }
     Json report = {
         {"schema_version", 1},
         {"benchmark", "https"},
+        {"notes", notes},
         {"status", "running"},
         {"target",
          {{"host", target.host}, {"port", target.port}, {"certificate_sha256", target.pin}}},
@@ -842,7 +846,7 @@ void interactive() {
             if (action == "1") {
                 const auto host = prompt("Server IPv4 address");
                 check_host(host);
-                const auto port = prompt("Agent port", "8443");
+                const auto port = prompt("Agent port", "38443");
                 const auto cipher = prompt("TLS 1.3 cipher", "TLS_AES_128_GCM_SHA256");
                 auto ctx = context(false, cipher);
                 auto socket = connect_tls(ctx.get(), host, port, {});
@@ -911,7 +915,7 @@ int main(int argc, char** argv) {
                 << "winlin                         Interactive console\n"
                    "winlin pair --host IP --target FILE [--token-file FILE] [--fingerprint "
                    "SHA256]\n"
-                   "            [--port 8443] [--cipher TLS_AES_128_GCM_SHA256]\n"
+                   "            [--port 38443] [--cipher TLS_AES_128_GCM_SHA256]\n"
                    "            Default: bundled PUBLIC benchmark certificate (no trusted "
                    "identity).\n"
                    "            Custom certificates require --fingerprint.\n"
@@ -928,7 +932,7 @@ int main(int argc, char** argv) {
         if (command == "pair") {
             args.allow(
                 {"--host", "--port", "--token-file", "--fingerprint", "--target", "--cipher"});
-            pair_target(args.require("--host"), args.get("--port", "8443"),
+            pair_target(args.require("--host"), args.get("--port", "38443"),
                         args.get("--token-file"),
                         args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
                         args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));

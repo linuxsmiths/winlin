@@ -57,7 +57,7 @@ From an **elevated** PowerShell terminal, configure a specific local test-networ
 IPv4 address (use `127.0.0.1` for loopback only):
 
 ```powershell
-$setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 -Port 8443
+$setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 -Port 38443
 $setup | Format-List
 ```
 
@@ -96,7 +96,7 @@ your host firewall and VNet configuration. Never expose the agent to the interne
 Start the server (the same user can do this without elevation after setup):
 
 ```powershell
-.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443 -Workers 8
+.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 38443 -Workers 8
 ```
 
 The launcher defaults to the repository's `build\Release\winlin-server.exe` with
@@ -145,7 +145,7 @@ fingerprint through an independent trusted channel if using a custom certificate
 The bundled public certificate needs no fingerprint entry:
 
 ```sh
-./scripts/run-client.sh pair --host 10.0.0.4 --port 8443 \
+./scripts/run-client.sh pair --host 10.0.0.4 --port 38443 \
   --target .winlin-local/windows.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
@@ -212,8 +212,8 @@ For intentional manual endpoint removal, stop the server first and delete only
 its configured URL reservation and binding:
 
 ```powershell
-netsh http delete urlacl url=https://10.0.0.4:8443/
-netsh http delete sslcert ipport=10.0.0.4:8443
+netsh http delete urlacl url=https://10.0.0.4:38443/
+netsh http delete sslcert ipport=10.0.0.4:38443
 ```
 
 Remove the specific test certificate from `LocalMachine\My` only if you created

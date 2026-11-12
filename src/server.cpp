@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout
             << "winlin-server --cert certificate.pem --key private.key\n"
-               "  [--bind 0.0.0.0] [--port 8443] [--workers 8] [--backend openssl|ktls]\n"
+               "  [--bind 0.0.0.0] [--port 38443] [--workers 8] [--backend openssl|ktls]\n"
                "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n"
                "  [--token-file path] (optional authentication; default: none)\n"
                "  [--session-file path] (requires --token-file; default: TOKEN-FILE.session)\n";
@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
         const auto instance_guard = server_guard();
         Server server(args);
         const auto bind_address = args.get("--bind", "0.0.0.0");
-        auto port = static_cast<unsigned>(number(args.get("--port", "8443"), 65535));
+        auto port = static_cast<unsigned>(number(args.get("--port", "38443"), 65535));
         const auto workers = server.config.workers;
         std::vector<Fd> listeners;
         for (unsigned i = 0; i < workers; ++i) {

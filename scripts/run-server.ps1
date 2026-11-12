@@ -5,7 +5,7 @@ param(
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
     [string]$ServerExe = '',
     [string]$BindAddress = '127.0.0.1',
-    [ValidateRange(1, 65535)][int]$Port = 8443,
+    [ValidateRange(1, 65535)][int]$Port = 38443,
     [ValidateRange(1, 256)][int]$Workers,
     [ValidateRange(1, 65536)][int]$MaxConnections,
     [string]$Cipher,
@@ -23,7 +23,7 @@ Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-TokenFile PATH]
     [-SessionFile PATH] [-StopFile PATH]
 
-Defaults: build\Release\winlin-server.exe, no authentication, 127.0.0.1:8443.
+Defaults: build\Release\winlin-server.exe, no authentication, 127.0.0.1:38443.
 An explicit -TokenFile enables authentication. Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary
 discovery. Unspecified workload settings retain the native server defaults.

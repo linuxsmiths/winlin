@@ -136,6 +136,11 @@ exit 0
     if ($result.ExitCode -ne 0 -or ($result.Output -join "`n") -match '--token-file') {
         throw "Default launch must need no credential files: $($result.Output)"
     }
+    $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
+    $expected = @('--bind', '127.0.0.1', '--port', '38443')
+    if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
+        throw "Default launcher endpoint or authentication changed unexpectedly: $arguments"
+    }
 
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-TokenFile', $token, '-Cipher', 'FAIL_TEST'
