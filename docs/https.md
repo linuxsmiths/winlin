@@ -9,7 +9,7 @@ For Windows server provisioning, see the [Windows guide](windows.md).
 - Windows HTTP.sys/Schannel with the same control and workload API.
 - HTTP/1.1 over TLS 1.3, with one explicitly selected TLS cipher suite.
 - Plain HTTP workloads on both platforms, selected per run without changing control security.
-- Client-controlled server worker count, TLS/kTLS mode, cipher and connection limit.
+- Client-controlled server worker count, TLS/kTLS mode, and cipher.
 - Persistent GET, PUT, or mixed workloads with configurable object sizes,
   connections, worker threads, warmup, duration, request limit, and repetitions.
 - Interactive target selection and benchmark configuration, or noninteractive
@@ -88,7 +88,7 @@ requests receive HTTP 409. The client stops the workload after completion or a
 caught failure; an abandoned workload expires after its bounded lease. Run IDs
 are managed automatically and omitted from results. Plain HTTP
 provides no data confidentiality; use synthetic traffic on an isolated network.
-Server startup `--workers`, `--max-connections`, and `--cipher` configure control
+Server startup `--workers` and `--cipher` configure control
 only; the client controls the workload's values separately.
 
 After upgrading from the old port 8443, rebuild and restart both programs and
@@ -171,7 +171,7 @@ will correctly reject a different certificate.
 
 # Change server tuning and disable workload TLS without restarting the server:
 ./scripts/run-client.sh run --target .winlin-local/local.json \
-  --tls off --server-workers 32 --server-max-connections 32768 \
+  --tls off --server-workers 32 \
   --workers 16 --connections 1024 --method get --get-size 4KiB
 ```
 
@@ -179,7 +179,11 @@ Workload TLS defaults to `--tls on` (Linux userspace OpenSSL or Windows Schannel
 `--tls off` selects plain HTTP; `--tls ktls` requests Linux kTLS. These are run
 settings sent over HTTPS control, not client connection options. Unsupported modes
 are rejected, never silently substituted. Server workers default to 8, configurable
-from 1 to 256; the workload connection limit defaults to 32768, up to 65536.
+from 1 to 256. The server implementation has a fixed ceiling of 65,536 connections
+per endpoint, advertised in `limits.max_connections`; it is not a run setting.
+Client `--connections` still selects offered load concurrency (up to 16,384).
+OS resources may impose a lower practical capacity; the ceiling is not a throughput
+or resource-availability guarantee.
 The interactive benchmark menu exposes these same settings.
 
 `--get-percent` specifies the GET share by **issued request count**, not bytes.
@@ -234,8 +238,8 @@ client offers exactly its selected suite; setup never rewrites machine-wide
 Schannel cipher policy.
 
 Select client `run --tls ktls` or the interactive menu to request kTLS without a
-server restart. Server capabilities
-report actual transmit and receive activation on the discovery connection, and
+server restart. Discovery advertises kTLS as conditional on kernel/OpenSSL support.
+The workload's `run` block reports actual transmit and receive activation, and
 the server verifies the relevant direction on each workload connection. GET
 requires active kTLS TX; PUT requires active kTLS RX. Missing activation causes
 explicit rejection, not a userspace run mislabeled as kTLS.
@@ -247,24 +251,54 @@ activation is **not** evidence of NIC cryptographic offload.
 
 ## Results and limitations
 
-The console shows throughput, p50/p99 latency, errors, and run-specific warnings,
+The console shows a compact per-run table of throughput, p50/p99 latency, errors,
+and estimated reference cycles per I/O (`Ref CPIO`). Decimal table values use two decimal places;
+JSON retains measurement precision. The console also shows run-specific warnings,
 such as load-generator CPU saturation or failed requests. General methodology
 caveats and backend measurement limitations appear once in the JSON report's
 top-level `notes` array, not in the console or each repetition's `warnings`.
-The final console summary includes the applied server settings and capabilities,
-client/server process telemetry, server CPU utilization, CPU seconds per completed
-I/O, cycles per completed I/O, and raw server counters. Report schema version 2
-also saves the control capabilities and the selected workload endpoint.
+Detailed client/server telemetry, CPU utilization percentages, and raw server
+counters stay in the JSON file, not the terminal. Report schema version 4
+saves supported choices in `server_capabilities`, verified effective settings in
+`server_run`, and the selected workload endpoint. It does not expose control-channel
+configuration as benchmark capabilities.
 
-CPU utilization uses **100% per CPU core**. CPU time per I/O and cycles per I/O
-use completed requests as the denominator; failed runs retain explicit warnings.
-Linux attempts an inherited `perf_event_open` hardware-cycle counter before
-creating worker threads; kernel permissions, VM support, or multiplexing can make
-it unavailable. Windows uses `QueryProcessCycleTime`, which excludes work charged
-to System. Counter sources and unavailability reasons accompany samples.
-There is **no CPU-frequency-based cycle estimate**. Unavailable cycles/CPIO remain
-`null` and are labelled unavailable in the summary. Cache misses, instructions,
-memory bandwidth and CPU profiling are not collected yet.
+CPU utilization uses **100% per logical CPU**, so multi-core utilization can exceed
+100%. Each repetition's `server_host` contains OS-visible whole-server busy CPU time
+and utilization, separately from application-only `server_process` telemetry.
+Linux sums aggregate `/proc/stat` user, nice, system, IRQ and softirq time, excluding
+idle, I/O wait and stolen VM time; guest time is not counted twice. Windows uses
+`GetSystemTimes`, subtracting idle and covering **every processor group**, including
+HTTP.sys/Schannel work charged to System.
+
+On x86_64, a shared implementation calibrates an invariant TSC against
+`std::chrono::steady_clock` once before serving requests. RDTSCP reads are fenced;
+migrated calibration samples are discarded and at least three samples must agree
+within 1% of the median. Calibration frequency, source, sample count and duration
+are recorded in `reference_clock`. No frequency files or perf permissions are needed
+for this clock calibration.
+
+`server_reference_cycles_per_io` is whole-server busy CPU seconds multiplied by
+calibrated TSC frequency, divided by successful completed I/Os. It is an **estimate
+in fixed reference-clock units, not measured core-clock cycles**; turbo/throttling
+do not change that fixed unit. Different TSC reference rates change the scale, so
+compare frequencies alongside CPIO across hosts. A VM clock change requires
+restarting the server to recalibrate.
+
+This attributes **all server CPU work** to the benchmark. Use an otherwise idle
+server: an exclusive Winlin lease does not exclude other applications. CPU accounting
+granularity and sample/control overhead can dominate very short trials; use sustained
+runs. Failed requests retain explicit warnings and are not included in the denominator.
+Unsupported/unstable TSCs or unavailable CPU accounting leave reference CPIO `null`
+in JSON and `N/A` in the table, with a reason printed once. ARM reference clocks
+are not implemented yet; host CPU utilization remains available.
+
+Optional raw process-cycle samples remain separate detailed telemetry:
+Linux attempts inherited `perf_event_open` hardware cycles; Windows uses
+`QueryProcessCycleTime`, excluding work charged to System. Permission/PMU failures
+or multiplexing can leave these raw samples unavailable **without preventing
+reference CPIO**. Winlin does not change host security policy automatically.
+Cache misses, instructions, memory bandwidth and CPU profiling are not collected yet.
 JSON output defaults to a uniquely named file under `results/`; `--output`
 selects another path. Existing output files are not overwritten on startup.
 Completed repetitions are saved as the run progresses, and a caught run failure
@@ -272,8 +306,25 @@ is recorded with `status: failed`. Abrupt termination may leave `status: running
 Target files contain server addresses and certificate pins; results omit run IDs.
 
 Server details put `environment` first, with OS, kernel, architecture and CPU
-count before library/build metadata, followed by backend and effective workload
-settings. JSON output preserves this order rather than sorting keys alphabetically.
+count, OS-visible total RAM, machine information, and effective process FD limits
+before library/build metadata. Linux FD limits include soft/hard values (`"unlimited"`
+when applicable); Windows reports these as not applicable.
+
+Machine information uses SMBIOS manufacturer/model evidence, with an explicit
+best-effort detection source. Missing or unrecognized firmware is `unknown`, not
+assumed bare metal. AWS instance types are taken from firmware when exposed.
+Microsoft virtual machines attempt a bounded, proxy-free lookup of only Azure's
+link-local IMDS `vmSize` field, cached before measurement; other instance metadata
+is never requested. If the SKU cannot be obtained, it remains `null` with a reason.
+Other providers' SKUs are currently unavailable unless exposed in supported firmware.
+
+Discovery then lists supported backends (mapped to transport/TLS mode), transports,
+TLS versions, cipher choices, HTTP versions, methods, load modes, server worker
+range, and immutable limits. kTLS support is conditional, never proof of activation.
+Cipher choices describe implementation support; platform/provider policy can still
+prevent negotiation, which is checked for each run. Current TLS/cipher/worker/offload
+values appear only in the workload's `run` block and benchmark results, not inspection.
+JSON output preserves this order rather than sorting keys alphabetically.
 
 Results contain the effective workload and cipher, client/server environment and
 build details, backend/offload capabilities, process telemetry snapshots and

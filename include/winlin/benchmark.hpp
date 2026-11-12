@@ -12,7 +12,7 @@ namespace winlin {
 // Describe only per-run tuning. Bind addresses, ports, certificates and OS permissions stay local.
 struct BenchmarkOptions {
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
-    unsigned workers{8}, max_connections{32768}, lease_seconds{300};
+    unsigned workers{8}, lease_seconds{300};
 
     // Reject unknown or out-of-range settings rather than silently changing the requested run.
     static BenchmarkOptions parse(const Json& value) {
@@ -20,8 +20,7 @@ struct BenchmarkOptions {
             throw std::invalid_argument("Benchmark settings must be a JSON object");
         }
         for (const auto& [key, ignored] : value.items()) {
-            if (key != "tls" && key != "cipher" && key != "workers" && key != "max_connections" &&
-                key != "lease_seconds") {
+            if (key != "tls" && key != "cipher" && key != "workers" && key != "lease_seconds") {
                 throw std::invalid_argument("Unknown benchmark setting: " + key);
             }
         }
@@ -39,7 +38,6 @@ struct BenchmarkOptions {
             return static_cast<unsigned>(number);
         };
         result.workers = bounded("workers", result.workers, 256);
-        result.max_connections = bounded("max_connections", result.max_connections, 65536);
         result.lease_seconds = bounded("lease_seconds", result.lease_seconds, 604800);
         if (result.tls != "on" && result.tls != "off" && result.tls != "ktls") {
             throw std::invalid_argument("TLS mode must be on, off, or ktls");
@@ -54,8 +52,7 @@ struct BenchmarkOptions {
     Json json() const {
         return {{"tls", tls},
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
-                {"workers", workers},
-                {"max_connections", max_connections}};
+                {"workers", workers}};
     }
 };
 

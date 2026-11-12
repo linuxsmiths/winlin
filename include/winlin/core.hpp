@@ -26,6 +26,7 @@ using Json = nlohmann::ordered_json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_object_size = 64 * 1024 * 1024;
 constexpr std::size_t max_header_size = 16384;
+constexpr unsigned server_connection_limit = 65536;
 // This pin identifies the deliberately public test fixture, not an authenticated server identity.
 // CMake derives it from certs/benchmark/server.der so native binaries need no runtime fixture path.
 constexpr std::string_view benchmark_certificate_sha256 = WINLIN_BENCHMARK_CERTIFICATE_SHA256;
@@ -185,7 +186,7 @@ inline HttpHead parse_head(std::string_view text) {
 // Call validate() before allocating workers or sockets; workers must not outnumber connections.
 struct RunConfig {
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
-    unsigned server_workers{8}, server_max_connections{32768};
+    unsigned server_workers{8};
     std::string method{"get"};
     std::size_t get_size{4096};
     std::size_t put_size{4096};
@@ -200,8 +201,7 @@ struct RunConfig {
 
     void validate() const {
         if ((tls != "on" && tls != "off" && tls != "ktls") || !server_workers ||
-            server_workers > 256 || !server_max_connections || server_max_connections > 65536 ||
-            connections > server_max_connections) {
+            server_workers > 256) {
             throw std::invalid_argument("Server benchmark settings are outside supported limits");
         }
         if (method != "get" && method != "put" && method != "mixed") {
@@ -220,7 +220,6 @@ struct RunConfig {
         return {{"tls", tls},
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
                 {"server_workers", server_workers},
-                {"server_max_connections", server_max_connections},
                 {"method", method},
                 {"get_size_bytes", get_size},
                 {"put_size_bytes", put_size},
@@ -272,7 +271,6 @@ inline Json usage_delta(const Json& before, const Json& after, double elapsed) {
     }
     return {{"user_cpu_seconds", user},
             {"system_cpu_seconds", system},
-            {"cpu_core_equivalents", (user + system) / elapsed},
             {"cpu_utilization_percent", 100 * (user + system) / elapsed},
             {"cpu_cycles", cycles},
             {"cpu_cycles_source", after.value("cpu_cycles_source", Json(nullptr))},

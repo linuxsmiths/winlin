@@ -44,7 +44,7 @@ if(WIN32)
   target_compile_definitions(winlin_core INTERFACE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
   add_library(winlin_windows INTERFACE)
   target_link_libraries(winlin_windows INTERFACE
-    winlin_core Threads::Threads httpapi bcrypt advapi32 psapi ws2_32)
+    winlin_core Threads::Threads httpapi bcrypt advapi32 psapi ws2_32 winhttp)
   if(WINLIN_BUILD_SERVER)
     add_executable(winlin-server src/server_windows.cpp)
     target_link_libraries(winlin-server PRIVATE winlin_windows)

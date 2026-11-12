@@ -162,6 +162,9 @@ AgentConfig windows_config(const Args& args) {
     auto config = AgentConfig::from_args(args, "httpsys-schannel");
     config.role = AgentConfig::Role::control;
     config.benchmark_tls_modes = {"on", "off"};
+    config.supported_backends = {
+        {{"name", "httpsys"}, {"transport", "http"}, {"tls_mode", "off"}},
+        {{"name", "httpsys-schannel"}, {"transport", "https"}, {"tls_mode", "on"}}};
     if (config.cipher != "TLS_AES_128_GCM_SHA256" && config.cipher != "TLS_AES_256_GCM_SHA384") {
         throw std::invalid_argument(
             "Schannel backend supports TLS_AES_128_GCM_SHA256 or TLS_AES_256_GCM_SHA384");
@@ -197,7 +200,6 @@ AgentConfig workload_config(const AgentConfig& host, const BenchmarkOptions& opt
     config.backend = config.tls ? "httpsys-schannel" : "httpsys";
     config.cipher = options.cipher;
     config.workers = options.workers;
-    config.connection_limit = options.max_connections;
     return config;
 }
 
@@ -363,7 +365,7 @@ struct Runtime {
     unsigned port{};
 
     explicit Runtime(const Args& args)
-        : agent(windows_config(args), usage), stop_file(args.get("--stop-file")),
+        : agent(windows_config(args), usage, {}, host_usage), stop_file(args.get("--stop-file")),
           address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "38443"), 65535))) {
         initialize();
@@ -372,7 +374,7 @@ struct Runtime {
     // Workloads use an in-memory run ID and share the control runtime's native engine.
     Runtime(AgentConfig config, const std::string& run_id, std::string bind_address,
             unsigned bind_port)
-        : agent(std::move(config), usage, run_id), payload(max_object_size),
+        : agent(std::move(config), usage, run_id, host_usage), payload(max_object_size),
           address(std::move(bind_address)), port(bind_port) {
         initialize();
     }
@@ -860,8 +862,8 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
                      "  [--workers 8] [--backend httpsys] [--cipher TLS_AES_128_GCM_SHA256]\n"
-                     "  [--max-connections 32768] [--stop-file path]\n"
-                     "Per-run workload TLS/cipher/workers/limits are controlled remotely.\n"
+                     "  [--stop-file path]\n"
+                     "Per-run workload TLS/cipher/workers are controlled remotely.\n"
                      "Configure the HTTP.sys certificate bindings and URL ACLs using "
                      "scripts/setup-server.ps1 first.\n";
         return 0;
@@ -877,8 +879,8 @@ int wmain(int argc, wchar_t** argv) {
             arguments.push_back(value.data());
         }
         Args args(argc, arguments.data());
-        args.allow({"--bind", "--port", "--workers", "--backend", "--cipher", "--max-connections",
-                    "--stop-file", "--http-port", "--https-port"});
+        args.allow({"--bind", "--port", "--workers", "--backend", "--cipher", "--stop-file",
+                    "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port =
             static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));
@@ -890,6 +892,7 @@ int wmain(int argc, wchar_t** argv) {
                 "Control, HTTP and HTTPS ports must be nonzero and distinct");
         }
         ServerGuard instance_guard;
+        reference_clock();
         const auto host_config = windows_config(args);
         const auto address = args.get("--bind", "127.0.0.1");
         BenchmarkController controller(

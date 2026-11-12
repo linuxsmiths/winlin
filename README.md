@@ -17,9 +17,11 @@ Both servers share agent routing, run leases, capabilities, and workload
 semantics. The kTLS backend verifies activation per direction and refuses
 userspace fallback.
 An always-HTTPS controller configures one exclusive run at a time: clients select
-workload TLS on/off, kTLS, cipher, server workers, and connection limits without
-restarting the server. Final summaries include server CPU usage, CPU time per I/O,
-and measured cycles per I/O when OS counters are available.
+workload TLS on/off, kTLS, cipher, and server workers without
+restarting the server. Compact terminal tables include reference cycles per I/O,
+estimated from whole-server busy CPU time and calibrated invariant-TSC frequency
+on x86_64 without perf permissions. This assumes an otherwise idle server.
+Detailed telemetry and server CPU utilization percentages stay in the JSON report.
 
 **Paced load, handshake benchmarks, and hardware profiling are not implemented
 yet.** The broader architecture and benchmark areas below describe
@@ -79,6 +81,9 @@ The Linux HTTPS controller listens on `0.0.0.0:38443` by default, accepting remo
 clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
 It advertises a separate per-run data endpoint: port 38444 for HTTP or 38445 for
 HTTPS/kTLS. Allow these ports from the client through firewall/VNet rules.
+Inspection shows supported workload choices and implementation limits, not the
+fixed control connection's settings. The connection ceiling is 65,536 per endpoint;
+users choose load concurrency with **Connections**, not a server-limit setting.
 Choose server tuning in the client benchmark menu, or for example:
 
 ```sh

@@ -117,12 +117,23 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert controller.ready["bind"] == "0.0.0.0"
         assert controller.request("GET", "/v1/capabilities", host="127.0.0.2")[0] == 200
         status, capabilities = controller.request("GET", "/v1/capabilities")
-        assert status == 200 and capabilities["benchmark_control"]
+        assert status == 200
         assert "authentication" not in capabilities
         assert next(iter(capabilities)) == "environment"
         assert list(capabilities["environment"])[:2] == ["os", "kernel"]
         assert controller.request("POST", "/v1/pair")[0] == 404
-        assert capabilities["benchmark_tls_modes"] == ["on", "off", "ktls"]
+        assert capabilities["supported_tls_modes"] == ["on", "off", "ktls"]
+        assert capabilities["supported_transports"] == ["http", "https"]
+        assert [backend["name"] for backend in capabilities["supported_backends"]] == [
+            "http", "openssl", "openssl-ktls"]
+        for key in ("backend", "transport", "cipher", "tls_version", "workers",
+                    "max_connections", "ktls_tx", "ktls_rx", "benchmark_control", "run"):
+            assert key not in capabilities, key
+        host = capabilities["environment"]
+        assert host["system_ram_bytes"] == os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        assert host["fd_limit"]["soft"] == "unlimited" or host["fd_limit"]["soft"] >= 524288
+        assert host["machine"]["type"] in ("unknown", "bare_metal", "virtual_machine")
+        assert capabilities["limits"]["max_connections"] == 65536
         assert controller.request("GET", "/v1/object?size=512")[0] == 404
         exercise_single_instance([SERVER], controller.port)
 
@@ -139,7 +150,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             "--target", bad_target, "--fingerprint", "00" * 32, expected=1,
         )
         assert "certificate changed" in refused.stderr and not bad_target.exists()
-        for invalid in ({"workers": 0}, {"workers": 1.5}, {"tls": "invalid"}, {"unknown": 1}):
+        for invalid in ({"workers": 0}, {"workers": 1.5}, {"tls": "invalid"}, {"unknown": 1},
+                        {"max_connections": 32}):
             assert controller.request("POST", "/v1/benchmark/start", json.dumps(invalid))[0] == 400
         body = json.dumps({"tls": "off", "workers": 1})
         fragmented = http.client.HTTPSConnection(
@@ -165,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         finally:
             fragmented.close()
 
-        lease = controller.start(tls="off", workers=3, max_connections=32)
+        lease = controller.start(tls="off", workers=3)
         assert lease["transport"] == "http"
         assert controller.request("POST", "/v1/benchmark/start", "{}")[0] == 409
         assert controller.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
@@ -173,9 +185,11 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         try:
             status, payload = data.request("GET", "/v1/capabilities")
             metadata = json.loads(payload)
-            assert status == 200 and metadata["transport"] == "http"
-            assert metadata["tls_version"] is None and metadata["cipher"] is None
-            assert metadata["workers"] == 3 and metadata["max_connections"] == 32
+            actual = metadata["run"]
+            assert status == 200 and actual["transport"] == "http"
+            assert actual["tls_version"] is None and actual["cipher"] is None
+            assert actual["workers"] == 3
+            assert metadata["limits"]["max_connections"] == 65536
             assert "authentication" not in metadata
             assert data.request("GET", "/v1/object?size=256", include_run=False)[0] == 409
             for size in (0, 256, 4096, 65536, 4194304):
@@ -214,7 +228,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             output = directory / f"{mode}-{workers}.json"
             invocation = command(
                 CLIENT, "run", "--target", target, "--tls", mode, "--server-workers", workers,
-                "--server-max-connections", "32", "--method", "mixed",
+                "--method", "mixed",
                 "--get-size", "512", "--put-size", "256", "--connections", "4", "--workers", "2",
                 "--warmup", "0.02", "--duration", "1", "--requests", "100", "--repetitions", "2",
                 "--output", output,
@@ -222,11 +236,11 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             report = json.loads(output.read_text())
             assert report["status"] == "completed" and len(report["results"]) == 2
             assert report["server_configuration"]["workers"] == workers
-            assert report["server_capabilities"]["transport"] == ("http" if mode == "off" else "https")
+            assert report["server_run"]["transport"] == ("http" if mode == "off" else "https")
+            assert "control_capabilities" not in report
             assert report["benchmark"] == ("http" if mode == "off" else "https")
-            assert "Final telemetry summary" in invocation.stdout
-            assert '"server_cpu_percent"' in invocation.stdout
-            assert '"server_cycles_per_io"' in invocation.stdout
+            assert "Ref CPIO" in invocation.stdout
+            assert "{" not in invocation.stdout
             assert "run_id" not in output.read_text() and "access_token" not in output.read_text()
             assert "authentication" not in invocation.stdout + output.read_text()
             assert next(iter(report["server_capabilities"])) == "environment"
@@ -236,12 +250,26 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert repetition["errors"] == 0
                 assert repetition["latency"]["samples"] == 100
                 assert repetition["get_completed"] == repetition["put_completed"] == 50
-                cpu = repetition["server_process"]
-                if cpu["cpu_cycles"] is None:
-                    assert repetition["server_cycles_per_request"] is None
-                    assert cpu["cpu_cycles_unavailable_reason"]
+                cpu = repetition["server_host"]
+                if cpu["reference_cycles"] is None:
+                    assert repetition["server_reference_cycles_per_io"] is None
+                    assert cpu["reference_cycles_unavailable_reason"]
+                    assert ("Reference CPIO unavailable: " +
+                            cpu["reference_cycles_unavailable_reason"]
+                            in invocation.stderr)
                 else:
-                    assert repetition["server_cycles_per_request"] == cpu["cpu_cycles"] / 100
+                    before, after = (repetition[key]["host"]
+                                     for key in ("server_before", "server_after"))
+                    clock = cpu["reference_clock"]
+                    assert clock["calibration_samples"] >= 3
+                    assert clock["frequency_hz"] > 0
+                    assert cpu["busy_cpu_seconds"] == (
+                        after["busy_cpu_seconds"] - before["busy_cpu_seconds"])
+                    assert cpu["reference_cycles"] == (
+                        cpu["busy_cpu_seconds"] * clock["frequency_hz"])
+                    assert repetition["server_reference_cycles_per_io"] == (
+                        cpu["reference_cycles"] / 100)
+                    assert cpu["cpu_utilization_percent"] >= 0
                 for note in report["notes"]:
                     assert note not in invocation.stdout + invocation.stderr
                     assert note not in repetition["warnings"]
@@ -259,8 +287,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         )
         report = json.loads(output.read_text())
         if ktls.returncode == 0:
-            assert report["server_capabilities"]["backend"] == "openssl-ktls"
-            assert report["server_capabilities"]["ktls_tx"]
+            assert report["server_run"]["backend"] == "openssl-ktls"
+            assert report["server_run"]["ktls_tx"]
         else:
             assert report["status"] == "failed"
             assert "kTLS" in ktls.stderr or "kTLS" in report["failure"]
@@ -283,11 +311,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n\n2\n1\n"
-                           f"3\n1\noff\n2\n32\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
+                           f"3\n1\noff\n2\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout
         assert "authentication" not in menu.stdout and "Trust this certificate?" not in menu.stdout
+        assert "Server connection limit" not in menu.stdout
         menu_report = json.loads(menu_output.read_text())
         assert menu_report["benchmark"] == "http"
         assert menu_report["server_configuration"]["workers"] == 2

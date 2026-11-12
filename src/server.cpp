@@ -23,6 +23,16 @@ AgentConfig linux_config(const Args& args) {
     }
     auto config = AgentConfig::from_args(args, "openssl");
     config.benchmark_tls_modes = {"on", "off", "ktls"};
+    config.supported_ciphers = supported_tls_ciphers();
+    config.supported_backends = {
+        {{"name", "http"}, {"transport", "http"}, {"tls_mode", "off"}},
+        {{"name", "openssl"}, {"transport", "https"}, {"tls_mode", "on"}},
+        {{"name", "openssl-ktls"},
+         {"transport", "https"},
+         {"tls_mode", "ktls"},
+         {"availability", "conditional"},
+         {"requirement",
+          "Kernel/OpenSSL support and verified activation for the requested direction"}}};
     config.environment = environment();
     return config;
 }
@@ -37,7 +47,6 @@ AgentConfig workload_config(const Args& args, const BenchmarkOptions& options) {
                                              : "openssl";
     config.cipher = options.cipher;
     config.workers = options.workers;
-    config.connection_limit = options.max_connections;
     return config;
 }
 
@@ -51,7 +60,8 @@ struct Server : Agent {
 
     Server(const Args& args, const BenchmarkOptions* options = nullptr,
            const std::string& run_id = {})
-        : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id),
+        : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id,
+                host_usage),
           tls(options && options->tls == "off"
                   ? Context(nullptr, SSL_CTX_free)
                   : context(true,
@@ -470,7 +480,7 @@ int main(int argc, char** argv) {
                      "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
                      "  Benchmark workers/TLS/kTLS are selected by the client per run.\n"
-                     "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n";
+                     "  [--cipher TLS_AES_128_GCM_SHA256]\n";
         return 0;
     }
     try {
@@ -479,7 +489,7 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
         args.allow({"--cert", "--key", "--bind", "--port", "--workers", "--backend", "--cipher",
-                    "--max-connections", "--http-port", "--https-port"});
+                    "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port = number(args.get("--http-port", "38444"), 65535);
         const auto https_port = number(args.get("--https-port", "38445"), 65535);
@@ -488,6 +498,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("Control, HTTP and HTTPS workload ports must be distinct");
         }
         const auto instance_guard = server_guard();
+        reference_clock();
         process_cycles = std::make_unique<ProcessCycles>();
         BenchmarkController controller(
             [] {

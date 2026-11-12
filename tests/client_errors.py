@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import ssl
 import subprocess
@@ -53,26 +54,53 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.respond(b"x" * int(self.path.split("=")[1]),
                          status=503 if self.server.fail_workload else None)
         elif self.path.startswith("/v1/benchmark/telemetry?run_id="):
+            self.server.telemetry_samples += 1
             self.respond({
                 "process": {
-                    "user_cpu_seconds": 0, "system_cpu_seconds": 0, "peak_rss_bytes": 0,
+                    "user_cpu_seconds": self.server.telemetry_samples * 0.000123456789,
+                    "system_cpu_seconds": 0, "peak_rss_bytes": 0,
                     "voluntary_context_switches": None, "involuntary_context_switches": None,
+                    "cpu_cycles": (self.server.telemetry_samples * 10001
+                                   if self.server.cycles_available else None),
+                    "cpu_cycles_source": "fixture hardware counter",
+                    "cpu_cycles_unavailable_reason": (None if self.server.cycles_available
+                                                     else "fixture counter access denied"),
+                },
+                "host": {
+                    "busy_cpu_seconds": self.server.telemetry_samples * 0.5,
+                    "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
+                    "reference_clock": {
+                        "frequency_hz": 20002 if self.server.reference_available else None,
+                        "source": "fixture invariant TSC",
+                        "unavailable_reason": (None if self.server.reference_available
+                                               else "fixture invariant TSC unavailable"),
+                    },
                 },
             })
         else:
-            self.respond({
-                "backend": "test", "benchmark_control": True,
-                "benchmark_tls_modes": ["on", "off"],
-                "transport": "https" if self.server.encrypted else "http",
-                "workers": self.server.settings.get("workers", 8),
-                "max_connections": self.server.settings.get("max_connections", 32768),
-                "process_cpu_scope": "application process only; excludes work charged to System",
-                "unavailable_metrics": ["voluntary_context_switches"],
-            })
+            payload = {
+                "supported_tls_modes": ["on", "off"],
+                "supported_ciphers": ["TLS_AES_128_GCM_SHA256"],
+                "server_workers": {"min": 1, "max": 256},
+                "limits": {"max_connections": 65536},
+                "telemetry": {
+                    "process_cpu_scope": "application process only; excludes work charged to System",
+                    "unavailable_metrics": ["voluntary_context_switches"],
+                },
+            }
+            if self.headers.get("X-Winlin-Run"):
+                payload["run"] = {
+                    "backend": "test", "transport": "https" if self.server.encrypted else "http",
+                    "tls_version": "TLSv1.3" if self.server.encrypted else None,
+                    "cipher": self.server.settings["cipher"] if self.server.encrypted else None,
+                    "workers": self.server.settings["workers"],
+                }
+            self.respond(payload)
 
     def do_POST(self):
         if self.path == "/v1/benchmark/start":
             settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert "max_connections" not in settings
             self.server.settings = settings
             self.server.peer.settings = settings
             data = self.server.peer if settings["tls"] == "off" else self.server
@@ -109,6 +137,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.fail_workload = False
         endpoint.settings = {}
         endpoint.encrypted = encrypted
+        endpoint.telemetry_samples = 0
+        endpoint.cycles_available = False
+        endpoint.reference_available = False
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
@@ -160,10 +191,27 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         )
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(output.read_text())
-        assert "Final telemetry summary" in result.stdout
-        assert '"server_cpu_percent"' in result.stdout
-        assert '"server_cycles_per_io": null' in result.stdout
+        table_row = re.compile(
+            r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
+            r"(\d+\.\d{2})\s+(\d+)\s+(N/A|\d+\.\d{2})\s*$", re.MULTILINE,
+        )
+        assert "Ref CPIO" in result.stdout
+        assert "{" not in result.stdout, result.stdout
+        rows = table_row.findall(result.stdout)
+        assert [(row[0], row[-1]) for row in rows] == [("1", "N/A"), ("2", "N/A")]
+        assert result.stderr.count(
+            "Reference CPIO unavailable: fixture invariant TSC unavailable") == 1
+        assert report["schema_version"] == 4
         assert len(report["results"]) == 2
+        for repetition in report["results"]:
+            assert repetition["server_reference_cycles_per_io"] is None
+            assert repetition["server_host"]["cpu_utilization_percent"] == 200
+            assert "server_cpu_seconds_per_request" not in repetition
+            for process in ("server_process", "client_process"):
+                assert "cpu_utilization_percent" in repetition[process]
+                assert "cpu_core_equivalents" not in repetition[process]
+            assert 0 < repetition["server_process"]["user_cpu_seconds"] < 0.001
+            assert "server_before" in repetition and "server_after" in repetition
         notes = report["notes"]
         assert notes and len(notes) == len(set(notes))
         assert any("Closed-loop" in note for note in notes)
@@ -173,6 +221,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert note not in result.stdout + result.stderr
             assert all(note not in repetition["warnings"] for repetition in report["results"])
 
+        # Reference CPIO must work even when hardware counters remain denied.
+        server.reference_available = True
         output = directory / "plain-benchmark.json"
         result = subprocess.run(
             [*benchmark, "--tls", "off", "--server-workers", "3", "--output", str(output)],
@@ -180,10 +230,19 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         )
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(output.read_text())
+        rows = table_row.findall(result.stdout)
+        assert [(row[0], row[-1]) for row in rows] == [("1", "5000.50"), ("2", "5000.50")]
+        assert "CPIO unavailable" not in result.stderr, result.stderr
+        assert "{" not in result.stdout, result.stdout
+        assert all(repetition["server_reference_cycles_per_io"] == 5000.5
+                   for repetition in report["results"])
+        assert all(repetition["server_process"]["cpu_cycles"] is None
+                   for repetition in report["results"])
         assert report["benchmark"] == "http"
         assert report["workload_endpoint"]["transport"] == "http"
         assert report["configuration"]["tls_version"] is None
-        assert report["server_capabilities"]["workers"] == 3
+        assert report["server_run"]["workers"] == 3
+        assert "control_capabilities" not in report
         assert plain.run_ids and all(value == "aa" * 32 for value in plain.run_ids)
         assert all(value is None for value in plain.authorizations)
 
@@ -198,9 +257,11 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert report["status"] == "completed_with_errors"
         for repetition in report["results"]:
             assert repetition["errors"] > 0
+            assert repetition["server_reference_cycles_per_io"] is None
             assert repetition["warnings"], repetition
             for warning in repetition["warnings"]:
                 assert warning in result.stderr
+        assert [row[-1] for row in table_row.findall(result.stdout)] == ["N/A", "N/A"]
         for note in report["notes"]:
             assert note not in result.stdout + result.stderr
         server.fail_workload = False

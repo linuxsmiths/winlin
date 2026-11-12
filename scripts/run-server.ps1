@@ -9,7 +9,6 @@ param(
     [ValidateRange(1, 65535)][int]$HttpPort = 38444,
     [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [ValidateRange(1, 256)][int]$Workers,
-    [ValidateRange(1, 65536)][int]$MaxConnections,
     [string]$Cipher,
     [string]$StopFile,
     [switch]$Help
@@ -21,14 +20,14 @@ if ($Help) {
 Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-StateDirectory PATH] [-ServerExe PATH] [-BindAddress IP] [-Port N]
     [-HttpPort N] [-HttpsPort N]
-    [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-StopFile PATH]
+    [-Workers N] [-Cipher SUITE] [-StopFile PATH]
 
 Defaults: build\Release\winlin-server.exe, HTTPS control 127.0.0.1:38443,
 HTTP workload port 38444 and HTTPS workload port 38445.
 Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary
-discovery. Clients select per-run workload TLS/cipher/workers/limits remotely.
-The startup Workers, MaxConnections and Cipher options affect control only.
+discovery. Clients select per-run workload TLS/cipher/workers remotely.
+The startup Workers and Cipher options affect control only.
 
 Provision the matching HTTP.sys endpoint with scripts\setup-server.ps1 first.
 Run as the same account that owns its URL reservation.
@@ -62,7 +61,6 @@ try {
     # Do not duplicate native default policy here; forward optional settings only when supplied.
     $optionalOptions = [ordered]@{
         Workers = '--workers'
-        MaxConnections = '--max-connections'
         Cipher = '--cipher'
         StopFile = '--stop-file'
     }

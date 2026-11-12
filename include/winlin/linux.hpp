@@ -1,6 +1,7 @@
 #pragma once
 
-#include "winlin/core.hpp"
+#include "winlin/host.hpp"
+#include "winlin/cpu.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -78,6 +80,28 @@ private:
 };
 
 using Context = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>;
+
+// Enumerate TLS 1.3 suites usable by this OpenSSL build/provider, not the control cipher.
+inline std::vector<std::string> supported_tls_ciphers() {
+    Context ctx(SSL_CTX_new(TLS_method()), SSL_CTX_free);
+    std::unique_ptr<SSL, decltype(&SSL_free)> ssl(ctx ? SSL_new(ctx.get()) : nullptr, SSL_free);
+    if (!ssl) {
+        throw tls_error("Cannot enumerate supported TLS ciphers");
+    }
+    auto* ciphers = SSL_get1_supported_ciphers(ssl.get());
+    if (!ciphers) {
+        throw tls_error("Cannot enumerate supported TLS ciphers");
+    }
+    std::vector<std::string> result;
+    for (int index = 0; index < sk_SSL_CIPHER_num(ciphers); ++index) {
+        const auto* cipher = sk_SSL_CIPHER_value(ciphers, index);
+        if (std::string_view(SSL_CIPHER_get_version(cipher)) == "TLSv1.3") {
+            result.emplace_back(SSL_CIPHER_get_name(cipher));
+        }
+    }
+    sk_SSL_CIPHER_free(ciphers);
+    return result;
+}
 
 // Pin the protocol and one cipher suite for reproducibility. Enabling kTLS is only a request;
 // native server sessions must inspect the negotiated BIO state before accepting a workload.
@@ -382,8 +406,16 @@ public:
         event_ = Fd(static_cast<int>(
             syscall(SYS_perf_event_open, &settings, 0, -1, -1, PERF_FLAG_FD_CLOEXEC)));
         if (event_.value < 0) {
+            const auto error = errno;
             unavailable_ =
-                "perf_event_open hardware cycles unavailable: " + std::string(std::strerror(errno));
+                "perf_event_open hardware cycles unavailable: " + std::string(std::strerror(error));
+            if (error == EPERM || error == EACCES) {
+                unavailable_ +=
+                    "; allow the server hardware-counter access using CAP_PERFMON or an "
+                    "administrator-approved perf policy";
+            } else if (error == ENOENT || error == ENODEV || error == EOPNOTSUPP) {
+                unavailable_ += "; the host/VM must expose a hardware CPU-cycle PMU";
+            }
         }
     }
 
@@ -429,15 +461,130 @@ inline Json usage() {
     return result;
 }
 
+// Sum executed CPU time, not idle/I/O wait or stolen VM time. Linux user/nice already include
+// guest/guest_nice, so adding those fields again would double count guest execution.
+inline Json host_usage() {
+    return sample_host_cpu("/proc/stat aggregate user+nice+system+irq+softirq", [] {
+        const auto ticks_per_second = sysconf(_SC_CLK_TCK);
+        if (ticks_per_second <= 0) {
+            throw std::runtime_error("Cannot determine Linux CPU accounting tick frequency");
+        }
+        std::ifstream input("/proc/stat");
+        std::string line, label;
+        if (!std::getline(input, line)) {
+            throw std::runtime_error("Cannot read aggregate CPU counters from /proc/stat");
+        }
+        std::istringstream fields(line);
+        std::array<std::uint64_t, 7> ticks{};
+        if (!(fields >> label) || label != "cpu") {
+            throw std::runtime_error("Missing aggregate CPU counters in /proc/stat");
+        }
+        for (auto& value : ticks) {
+            if (!(fields >> value)) {
+                throw std::runtime_error("Incomplete aggregate CPU counters in /proc/stat");
+            }
+        }
+        const double busy =
+            static_cast<double>(ticks[0]) + ticks[1] + ticks[2] + ticks[5] + ticks[6];
+        return busy / ticks_per_second;
+    });
+}
+
+// Query only Azure's SKU leaf over link-local TCP, without proxies, redirects or credentials.
+// A single short deadline bounds all I/O; failures become metadata unavailability, not guesses.
+inline std::string azure_vm_sku() {
+    const auto deadline = Clock::now() + std::chrono::seconds(1);
+    auto socket = connect_stream(nullptr, "169.254.169.254", "80", "", 0.5);
+    const std::string request =
+        "GET /metadata/instance/compute/vmSize?api-version=2021-02-01&format=text HTTP/1.1\r\n"
+        "Host: 169.254.169.254\r\nMetadata: true\r\nConnection: close\r\n\r\n";
+    std::size_t sent{};
+    while (sent < request.size()) {
+        const auto count = socket->write(request.data() + sent, request.size() - sent);
+        sent += count;
+        if (!count) {
+            wait_socket(*socket, deadline);
+        }
+    }
+    std::string response;
+    std::array<char, 1024> buffer{};
+    for (;;) {
+        const auto boundary = response.find("\r\n\r\n");
+        if (boundary != std::string::npos) {
+            const auto head = parse_head(std::string_view(response).substr(0, boundary + 4));
+            if (!head.first.starts_with("HTTP/1.1 200 ") ||
+                !head.fields.contains("content-length") || head.length > 128) {
+                throw std::runtime_error("Azure metadata SKU request was rejected or malformed");
+            }
+            if (response.size() >= boundary + 4 + head.length) {
+                return response.substr(boundary + 4, head.length);
+            }
+        }
+        if (response.size() > max_header_size + 128) {
+            throw std::runtime_error("Azure metadata response exceeded size limit");
+        }
+        const auto count = socket->read(buffer.data(), buffer.size());
+        if (count) {
+            response.append(buffer.data(), count);
+        } else {
+            wait_socket(*socket, deadline);
+        }
+    }
+}
+
+// Cache immutable machine metadata once, outside measurements; inaccessible firmware stays unknown.
+inline Json machine_environment() {
+    static const Json machine = [] {
+        auto firmware = [](const char* path) {
+            std::ifstream input(path);
+            std::string value;
+            if (!std::getline(input, value) || value.empty() || value.size() > 256) {
+                throw std::runtime_error(
+                    "SMBIOS manufacturer/model files are missing or unreadable");
+            }
+            return value;
+        };
+        auto result = describe_machine("", "");
+        try {
+            const auto manufacturer = firmware("/sys/class/dmi/id/sys_vendor");
+            const auto model = firmware("/sys/class/dmi/id/product_name");
+            result = describe_machine(manufacturer, model);
+            if (manufacturer == "Microsoft Corporation" && result.at("type") == "virtual_machine") {
+                apply_azure_sku(result, azure_vm_sku());
+            }
+        } catch (const std::exception& error) {
+            result["unavailable_reason"] = error.what();
+        }
+        return result;
+    }();
+    return machine;
+}
+
+// Report OS-visible capacity and this process's effective descriptor limits, not launcher defaults.
 inline Json environment() {
     utsname data{};
     if (uname(&data) != 0) {
         throw system_error("uname");
     }
+    rlimit descriptors{};
+    const auto pages = sysconf(_SC_PHYS_PAGES);
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    if (getrlimit(RLIMIT_NOFILE, &descriptors) != 0 || pages < 0 || page_size < 0) {
+        throw system_error("Cannot collect host RAM/file-descriptor limits");
+    }
+    auto limit = [](rlim_t value) -> Json {
+        return value == RLIM_INFINITY ? Json("unlimited") : Json(value);
+    };
     return {{"os", data.sysname},
             {"kernel", data.release},
             {"architecture", data.machine},
             {"logical_cpus", sysconf(_SC_NPROCESSORS_ONLN)},
+            {"system_ram_bytes", static_cast<std::uint64_t>(pages) * page_size},
+            {"machine", machine_environment()},
+            {"fd_limit",
+             {{"soft", limit(descriptors.rlim_cur)},
+              {"hard", limit(descriptors.rlim_max)},
+              {"unavailable_reason", nullptr}}},
             {"openssl", OpenSSL_version(OPENSSL_VERSION)},
             {"winlin_version", WINLIN_VERSION},
             {"build_type", WINLIN_BUILD_TYPE},

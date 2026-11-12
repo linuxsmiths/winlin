@@ -29,7 +29,7 @@ class Agent:
         arguments = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
             "-ServerExe", SERVER, "-Port", str(PORT), "-HttpPort", str(HTTP_PORT),
-            "-HttpsPort", str(HTTPS_PORT), "-Workers", "2", "-MaxConnections", "128",
+            "-HttpsPort", str(HTTPS_PORT), "-Workers", "2",
             "-Cipher", cipher, "-StopFile", STOP_FILE,
         ]
         self.process = subprocess.Popen(
@@ -104,9 +104,7 @@ def data_connection(mode):
 
 def exercise_run(agent, cipher, mode, workers):
     """Switch transport/workers without restarting control; exercise actual leased data I/O."""
-    connection_limit = 64 if workers == 1 else 256
-    settings = {"tls": mode, "cipher": cipher, "workers": workers,
-                "max_connections": connection_limit}
+    settings = {"tls": mode, "cipher": cipher, "workers": workers}
     run = agent.start(settings)
     run_id = run["run_id"]
     assert len(run_id) == 64
@@ -114,7 +112,6 @@ def exercise_run(agent, cipher, mode, workers):
     assert run["transport"] == ("https" if mode == "on" else "http")
     assert run["backend"] == ("httpsys-schannel" if mode == "on" else "httpsys")
     assert run["settings"]["workers"] == workers
-    assert run["settings"]["max_connections"] == connection_limit
     assert run["settings"]["cipher"] == (cipher if mode == "on" else None)
     assert agent.request("POST", "/v1/benchmark/start", json.dumps(settings))[0] == 409
     assert agent.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
@@ -127,13 +124,14 @@ def exercise_run(agent, cipher, mode, workers):
         assert request(connection, "GET", "/v1/object?size=512", "0" * 64)[0] == 409
         status, payload = request(connection, "GET", "/v1/capabilities", run_id)
         capabilities = json.loads(payload)
-        assert status == 200 and capabilities["workers"] == workers
+        actual = capabilities["run"]
+        assert status == 200 and actual["workers"] == workers
         assert "authentication" not in capabilities
         assert next(iter(capabilities)) == "environment"
         assert list(capabilities["environment"])[:2] == ["os", "kernel"]
-        assert capabilities["max_connections"] == connection_limit
-        assert capabilities["cipher"] == (cipher if mode == "on" else None)
-        assert capabilities["tls_version"] == ("TLSv1.3" if mode == "on" else None)
+        assert capabilities["limits"]["max_connections"] == 65536
+        assert actual["cipher"] == (cipher if mode == "on" else None)
+        assert actual["tls_version"] == ("TLSv1.3" if mode == "on" else None)
         assert request(connection, "GET", "/v1/telemetry", run_id)[0] == 404
         assert request(connection, "POST", "/v1/pair", run_id)[0] == 404
         for size in (0, 256, 512, 4096, 16384, 65536, 1048576, 4194304):
@@ -190,6 +188,10 @@ def exercise_run(agent, cipher, mode, workers):
     assert telemetry["active_connections"] is None and telemetry["tls_handshakes"] is None
     assert telemetry["process"]["voluntary_context_switches"] is None
     assert "System" in telemetry["process_cpu_scope"]
+    assert telemetry["host"]["busy_cpu_seconds"] >= 0
+    assert telemetry["host"]["processor_groups_sampled"] >= 1
+    clock = telemetry["host"]["reference_clock"]
+    assert clock["frequency_hz"] is not None or clock["unavailable_reason"]
     process = telemetry["process"]
     if process["cpu_cycles"] is None:
         assert process["cpu_cycles_unavailable_reason"]
@@ -215,13 +217,18 @@ try:
     assert agent.request("POST", "/v1/pair")[0] == 404
     status, payload = agent.request("GET", "/v1/capabilities")
     capabilities = json.loads(payload)
-    assert status == 200 and capabilities["benchmark_control"]
+    assert status == 200
     assert "authentication" not in capabilities
-    assert capabilities["benchmark_tls_modes"] == ["on", "off"]
+    assert capabilities["supported_tls_modes"] == ["on", "off"]
+    assert capabilities["environment"]["system_ram_bytes"] > 0
+    assert capabilities["environment"]["fd_limit"]["soft"] is None
+    for key in ("backend", "transport", "tls_version", "cipher", "workers", "run"):
+        assert key not in capabilities
     status, payload = agent.request("POST", "/v1/benchmark/start", '{"tls":"ktls"}')
     assert status == 501 and b"kTLS" in payload, payload
     assert agent.request("POST", "/v1/benchmark/start", '{"tls":"on","cipher":"bad"}')[0] == 400
     assert agent.request("POST", "/v1/benchmark/start", " " * 65537)[0] == 400
+    assert agent.request("POST", "/v1/benchmark/start", '{"max_connections":32}')[0] == 400
 
     # Split JSON across receives: no workload may start from a partial control body.
     body = json.dumps({"tls": "off", "workers": 1})

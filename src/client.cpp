@@ -612,8 +612,10 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
+    auto server_host = host_usage_delta(server_before.value("host", Json::object()),
+                                        server_after.value("host", Json::object()));
     std::vector<std::string> warnings;
-    if (client_usage.at("cpu_core_equivalents").get<double>() >= config.workers * .85) {
+    if (client_usage.at("cpu_utilization_percent").get<double>() >= config.workers * 85.0) {
         warnings.emplace_back(
             "Load-generator workers may be CPU saturated; do not assume a server limit.");
     }
@@ -624,8 +626,6 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     if (!combined.completed) {
         warnings.emplace_back("No requests completed successfully.");
     }
-    const double server_cpu = server_usage.at("user_cpu_seconds").get<double>() +
-                              server_usage.at("system_cpu_seconds").get<double>();
     return {{"repetition", repetition},
             {"elapsed_seconds", elapsed},
             {"issued", issued.load()},
@@ -638,17 +638,16 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
             {"sent_object_bytes", combined.sent},
             {"requests_per_second", combined.completed / elapsed},
             {"object_goodput_bytes_per_second", (combined.received + combined.sent) / elapsed},
-            {"server_cpu_seconds_per_request",
-             combined.completed ? Json(server_cpu / combined.completed) : Json(nullptr)},
-            {"server_cycles_per_request",
-             combined.completed && !server_usage.at("cpu_cycles").is_null()
-                 ? Json(server_usage.at("cpu_cycles").get<double>() / combined.completed)
+            {"server_reference_cycles_per_io",
+             combined.completed && !server_host.at("reference_cycles").is_null()
+                 ? Json(server_host.at("reference_cycles").get<double>() / combined.completed)
                  : Json(nullptr)},
             {"latency", combined.latency.json()},
             {"client_process", client_usage},
             {"latency_by_method",
              {{"get", combined.get_latency.json()}, {"put", combined.put_latency.json()}}},
             {"server_process", server_usage},
+            {"server_host", server_host},
             {"server_before", server_before},
             {"server_after", server_after},
             {"warnings", warnings}};
@@ -659,7 +658,6 @@ RunConfig configuration(const Args& args) {
     config.tls = args.get("--tls", "on");
     config.cipher = args.get("--cipher", config.cipher);
     config.server_workers = number(args.get("--server-workers", "8"), 256);
-    config.server_max_connections = number(args.get("--server-max-connections", "32768"), 65536);
     config.method = lower(args.get("--method", "get"));
     config.get_size = object_size(args.get("--get-size", "4KiB"));
     config.put_size = object_size(args.get("--put-size", "4KiB"));
@@ -685,12 +683,25 @@ RunConfig configuration(const Args& args) {
 int run(Target target, const RunConfig& config, const fs::path& output) {
     auto ctx = context(false, target.cipher);
     auto capabilities = control(ctx.get(), target, "/v1/capabilities");
-    if (!capabilities.value("benchmark_control", false)) {
-        throw std::runtime_error("Server lacks benchmark control; update and restart the server");
+    if (!capabilities.contains("supported_tls_modes") || !capabilities.contains("limits")) {
+        throw std::runtime_error("Server capabilities are outdated; update and restart the server");
     }
-    const auto modes = capabilities.at("benchmark_tls_modes").get<std::vector<std::string>>();
+    const auto modes = capabilities.at("supported_tls_modes").get<std::vector<std::string>>();
     if (std::find(modes.begin(), modes.end(), config.tls) == modes.end()) {
         throw std::invalid_argument("Server does not support requested TLS mode: " + config.tls);
+    }
+    if (config.connections > capabilities.at("limits").at("max_connections").get<unsigned>()) {
+        throw std::invalid_argument("Requested connections exceed the server implementation limit");
+    }
+    const auto worker_range = capabilities.at("server_workers");
+    if (config.server_workers < worker_range.at("min").get<unsigned>() ||
+        config.server_workers > worker_range.at("max").get<unsigned>()) {
+        throw std::invalid_argument("Requested server workers exceed the supported range");
+    }
+    const auto ciphers = capabilities.at("supported_ciphers").get<std::vector<std::string>>();
+    if (config.tls != "off" &&
+        std::find(ciphers.begin(), ciphers.end(), config.cipher) == ciphers.end()) {
+        throw std::invalid_argument("Server does not support requested workload cipher");
     }
     std::vector<char> payload(std::max<std::size_t>(1, config.put_size));
     if (RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
@@ -703,18 +714,23 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         "Server process telemetry includes the HTTPS controller; one benchmark lease is active.",
         "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
         "load interval.",
+        "Reference CPIO attributes all OS-visible server CPU work to the benchmark, including "
+        "unrelated workloads; use an otherwise idle server. It is not measured core-clock cycles.",
+        "Reference cycles use a fixed calibrated invariant-TSC frequency, not turbo frequency. "
+        "CPU accounting granularity and sampling overhead can dominate very short runs.",
         "In-flight requests are drained after the duration limit; elapsed time includes draining."};
-    const auto unavailable = capabilities.value("unavailable_metrics", std::vector<std::string>{});
+    const auto telemetry = capabilities.at("telemetry");
+    const auto unavailable = telemetry.value("unavailable_metrics", std::vector<std::string>{});
     if (std::find(unavailable.begin(), unavailable.end(), "voluntary_context_switches") !=
         unavailable.end()) {
         notes.emplace_back("Server context-switch counters are unavailable; null is not zero.");
     }
-    if (capabilities.value("process_cpu_scope", "").find("System") != std::string::npos) {
+    if (telemetry.value("process_cpu_scope", "").find("System") != std::string::npos) {
         notes.emplace_back("Server process CPU excludes HTTP.sys/Schannel work charged to System; "
-                           "CPU/request is not total OS CPU cost.");
+                           "whole-server reference CPIO includes that work.");
     }
     Json report = {
-        {"schema_version", 2},
+        {"schema_version", 4},
         {"benchmark", config.tls == "off" ? "http" : "https"},
         {"notes", notes},
         {"status", "running"},
@@ -747,7 +763,6 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
             {"tls", config.tls},
             {"cipher", config.cipher},
             {"workers", config.server_workers},
-            {"max_connections", config.server_max_connections},
             {"lease_seconds", static_cast<unsigned>(std::ceil(config.warmup + config.duration +
                                                               3 * config.timeout + 60))}};
         const auto started = command("/v1/benchmark/start", settings.dump());
@@ -758,26 +773,27 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         auto workload_ctx =
             workload.tls ? context(false, config.cipher) : Context(nullptr, SSL_CTX_free);
         auto workload_capabilities = control(workload_ctx.get(), workload, "/v1/capabilities");
-        if (workload_capabilities.at("transport") != (workload.tls ? "https" : "http") ||
-            workload_capabilities.at("workers") != config.server_workers ||
-            workload_capabilities.at("max_connections") != config.server_max_connections) {
+        const auto applied = workload_capabilities.at("run");
+        if (applied.at("transport") != (workload.tls ? "https" : "http") ||
+            applied.at("workers") != config.server_workers ||
+            (workload.tls &&
+             (applied.at("tls_version") != "TLSv1.3" || applied.at("cipher") != config.cipher))) {
             throw std::runtime_error("Server did not apply the requested benchmark settings");
         }
         if (config.tls == "ktls" &&
             (((config.method == "get" || (config.method == "mixed" && config.get_percent)) &&
-              !workload_capabilities.at("ktls_tx").get<bool>()) ||
+              !applied.at("ktls_tx").get<bool>()) ||
              ((config.method == "put" || (config.method == "mixed" && config.get_percent < 100)) &&
-              !workload_capabilities.at("ktls_rx").get<bool>()))) {
+              !applied.at("ktls_rx").get<bool>()))) {
             throw std::runtime_error(
                 "Requested kTLS direction is unavailable; refusing userspace fallback");
         }
-        report["control_capabilities"] = capabilities;
-        report["server_capabilities"] = workload_capabilities;
+        report["server_run"] = applied;
         report["server_configuration"] = started.at("settings");
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
         write_private(output, report, false);
-        std::cout << "Run  requests/s     p50(us)     p99(us)   errors\n";
+        std::cout << "Run  requests/s     p50(us)     p99(us)   errors       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
             auto result = trial(workload_ctx.get(), workload, config, payload, index, ctx.get(),
                                 target, run_id);
@@ -787,7 +803,14 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                       << std::setw(12) << result.at("requests_per_second").get<double>()
                       << std::setw(12) << result.at("latency").at("p50_us").get<double>()
                       << std::setw(12) << result.at("latency").at("p99_us").get<double>()
-                      << std::setw(9) << result.at("errors").get<std::uint64_t>() << '\n';
+                      << std::setw(9) << result.at("errors").get<std::uint64_t>() << ' ';
+            const auto& cpio = result.at("server_reference_cycles_per_io");
+            if (cpio.is_null()) {
+                std::cout << std::setw(14) << "N/A";
+            } else {
+                std::cout << std::setw(14) << cpio.get<double>();
+            }
+            std::cout << '\n';
             for (const auto& warning : result.at("warnings")) {
                 log_warning(warning.get<std::string>());
             }
@@ -812,28 +835,19 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         write_private(output, report, false);
         throw;
     }
-    Json summaries = Json::array();
+    // Keep details in the report; explain unavailable reference CPIO only once per reason.
+    std::vector<std::string> cycle_reasons;
     for (const auto& result : report["results"]) {
-        summaries.push_back(
-            {{"repetition", result.at("repetition")},
-             {"requests_per_second", result.at("requests_per_second")},
-             {"errors", result.at("errors")},
-             {"server_cpu_percent", result.at("server_process").at("cpu_utilization_percent")},
-             {"server_cpu_seconds_per_io", result.at("server_cpu_seconds_per_request")},
-             {"server_cycles_per_io", result.at("server_cycles_per_request")},
-             {"client_process", result.at("client_process")},
-             {"server_process", result.at("server_process")},
-             {"server_telemetry", result.at("server_after")},
-             {"profiling",
-              {{"cache_miss_rate", nullptr},
-               {"unavailable_reason", "Hardware profiling is not collected yet"}}}});
+        const auto& host = result.at("server_host");
+        if (host.at("reference_cycles").is_null()) {
+            const auto reason = host.at("reference_cycles_unavailable_reason").get<std::string>();
+            if (std::find(cycle_reasons.begin(), cycle_reasons.end(), reason) ==
+                cycle_reasons.end()) {
+                cycle_reasons.push_back(reason);
+                log_warning("Reference CPIO unavailable: " + reason);
+            }
+        }
     }
-    std::cout << "\nFinal telemetry summary (CPU percent: 100% = one core; null = unavailable)\n"
-              << Json{{"server_configuration", report.at("server_configuration")},
-                      {"server_capabilities", report.at("server_capabilities")},
-                      {"repetitions", summaries}}
-                     .dump(2)
-              << '\n';
     std::cout << "Results saved to " << output.string() << '\n';
     if (errors) {
         log_warning(
@@ -927,8 +941,6 @@ void interactive() {
                     config.cipher = prompt("Benchmark TLS 1.3 cipher", config.cipher);
                 }
                 config.server_workers = number(prompt("Server workers (1-256)", "8"), 256);
-                config.server_max_connections =
-                    number(prompt("Server connection limit (1-65536)", "32768"), 65536);
                 config.method = lower(prompt("Method: get / put / mixed", "get"));
                 std::cout << "Size presets: 256B, 512B, 1KiB, 4KiB, 8KiB, 16KiB, 64KiB, 256KiB, "
                              "1MiB, 4MiB\n";
@@ -982,7 +994,6 @@ int main(int argc, char** argv) {
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
-                   "           [--server-max-connections 32768]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
@@ -1009,7 +1020,7 @@ int main(int argc, char** argv) {
             args.allow({"--target", "--method", "--get-size", "--put-size", "--get-percent",
                         "--connections", "--workers", "--warmup", "--duration", "--requests",
                         "--repetitions", "--timeout", "--output", "--cipher", "--tls",
-                        "--server-workers", "--server-max-connections"});
+                        "--server-workers"});
             const auto config = configuration(args);
             auto target = load_target(args.require("--target"));
             return run(target, config, args.get("--output", default_output(config)));

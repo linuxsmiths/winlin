@@ -1,10 +1,12 @@
 #pragma once
 
-#include "winlin/core.hpp"
+#include "winlin/host.hpp"
+#include "winlin/cpu.hpp"
 
 #include <memory>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <span>
 
 #include <winsock2.h>
@@ -12,6 +14,7 @@
 #include <bcrypt.h>
 #include <psapi.h>
 #include <ws2tcpip.h>
+#include <winhttp.h>
 
 namespace winlin {
 inline std::runtime_error windows_error(std::string message, DWORD code = GetLastError()) {
@@ -121,6 +124,174 @@ inline Json usage() {
             {"involuntary_context_switches", nullptr}};
 }
 
+// GetSystemTimes includes idle in kernel time; remove it, retaining System/IRQ/DPC execution.
+inline double group_busy_cpu_seconds() {
+    FILETIME idle{}, kernel{}, user{};
+    if (!GetSystemTimes(&idle, &kernel, &user)) {
+        throw windows_error("Cannot collect whole-server CPU time");
+    }
+    return filetime_seconds(kernel) - filetime_seconds(idle) + filetime_seconds(user);
+}
+
+// GetSystemTimes covers only the caller's primary processor group on machines above 64 CPUs.
+// A disposable sampler thread visits every active group without changing any server worker's
+// affinity. Join before returning so results and exceptions have a single controlling owner.
+inline Json host_usage() {
+    unsigned sampled_groups{};
+    auto result = sample_host_cpu("GetSystemTimes kernel+user-idle; all processor groups", [&] {
+        const auto groups = GetActiveProcessorGroupCount();
+        if (!groups) {
+            throw windows_error("Cannot enumerate CPU processor groups");
+        }
+        if (groups == 1) {
+            const auto busy = group_busy_cpu_seconds();
+            sampled_groups = 1;
+            return busy;
+        }
+        double busy{};
+        std::exception_ptr failure;
+        std::jthread sampler([&] {
+            try {
+                DWORD size{};
+                if (GetLogicalProcessorInformationEx(RelationGroup, nullptr, &size) ||
+                    GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+                    throw windows_error("Cannot size CPU processor-group information");
+                }
+                std::vector<unsigned char> buffer(size);
+                auto* information =
+                    reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+                if (!GetLogicalProcessorInformationEx(RelationGroup, information, &size)) {
+                    throw windows_error("Cannot read CPU processor-group information");
+                }
+                const auto group_offset = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Group) +
+                                          offsetof(GROUP_RELATIONSHIP, GroupInfo);
+                if (size < group_offset || information->Relationship != RelationGroup ||
+                    !information->Group.ActiveGroupCount ||
+                    information->Group.ActiveGroupCount >
+                        (size - group_offset) / sizeof(PROCESSOR_GROUP_INFO)) {
+                    throw std::runtime_error("Incomplete CPU processor-group information");
+                }
+                for (WORD group = 0; group < information->Group.ActiveGroupCount; ++group) {
+                    GROUP_AFFINITY affinity{};
+                    affinity.Group = group;
+                    affinity.Mask = information->Group.GroupInfo[group].ActiveProcessorMask;
+                    if (!SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr)) {
+                        throw windows_error("Cannot sample CPU processor group " +
+                                            std::to_string(group));
+                    }
+                    busy += group_busy_cpu_seconds();
+                    ++sampled_groups;
+                }
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        sampler.join();
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+        return busy;
+    });
+    result["processor_groups_sampled"] = sampled_groups;
+    return result;
+}
+
+// Read the local Azure SKU leaf only, bypassing proxies and refusing redirects.
+// Each WinHTTP operation has a short timeout; the bounded response contains no machine identity.
+inline std::string azure_vm_sku() {
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    auto close = [](void* handle) {
+        if (!WinHttpCloseHandle(handle)) {
+            log_warning(windows_error("WinHttpCloseHandle").what());
+        }
+    };
+    using Internet = std::unique_ptr<void, decltype(close)>;
+    Internet session(WinHttpOpen(L"Winlin", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+                                 WINHTTP_NO_PROXY_BYPASS, 0),
+                     close);
+    if (!session || !WinHttpSetTimeouts(session.get(), 500, 500, 500, 500)) {
+        throw windows_error("Cannot initialize Azure metadata request");
+    }
+    Internet connection(WinHttpConnect(session.get(), L"169.254.169.254", 80, 0), close);
+    Internet request(
+        connection ? WinHttpOpenRequest(
+                         connection.get(), L"GET",
+                         L"/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text",
+                         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
+                   : nullptr,
+        close);
+    DWORD disabled =
+        WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
+    if (!request ||
+        !WinHttpSetOption(request.get(), WINHTTP_OPTION_DISABLE_FEATURE, &disabled,
+                          sizeof(disabled)) ||
+        !WinHttpSendRequest(request.get(), L"Metadata: true\r\n", static_cast<DWORD>(-1),
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.get(), nullptr)) {
+        throw windows_error("Azure metadata request failed");
+    }
+    DWORD status{}, size = sizeof(status);
+    if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                             WINHTTP_NO_HEADER_INDEX) ||
+        status != 200) {
+        throw std::runtime_error("Azure metadata SKU request was rejected");
+    }
+    std::string result;
+    std::array<char, 129> buffer{};
+    for (;;) {
+        if (Clock::now() >= deadline) {
+            throw std::runtime_error("Azure metadata SKU request timed out");
+        }
+        DWORD count{};
+        if (!WinHttpReadData(request.get(), buffer.data(), static_cast<DWORD>(buffer.size()),
+                             &count)) {
+            throw windows_error("Cannot read Azure metadata SKU");
+        }
+        if (!count) {
+            return result;
+        }
+        result.append(buffer.data(), count);
+        if (result.size() > 128) {
+            throw std::runtime_error("Azure metadata SKU exceeded size limit");
+        }
+    }
+}
+
+// Get only SMBIOS manufacturer/model and cache optional cloud metadata before benchmarking.
+inline Json machine_environment() {
+    static const Json machine = [] {
+        auto result = describe_machine("", "");
+        try {
+            constexpr DWORD provider = 0x52534d42; // RSMB: raw SMBIOS firmware table.
+            const auto size = GetSystemFirmwareTable(provider, 0, nullptr, 0);
+            if (size < 8 || size > 1024 * 1024) {
+                throw std::runtime_error("System SMBIOS table is missing or exceeds size limit");
+            }
+            std::vector<char> table(size);
+            if (GetSystemFirmwareTable(provider, 0, table.data(), size) != size) {
+                throw windows_error("Cannot read SMBIOS firmware");
+            }
+            DWORD length{};
+            std::memcpy(&length, table.data() + 4, sizeof(length));
+            if (length > size - 8) {
+                throw std::runtime_error("Malformed SMBIOS firmware length");
+            }
+            const auto [manufacturer, model] =
+                smbios_system(std::string_view(table.data() + 8, length));
+            result = describe_machine(manufacturer, model);
+            if (manufacturer == "Microsoft Corporation" && result.at("type") == "virtual_machine") {
+                apply_azure_sku(result, azure_vm_sku());
+            }
+        } catch (const std::exception& error) {
+            result["unavailable_reason"] = error.what();
+        }
+        return result;
+    }();
+    return machine;
+}
+
+// Keep OS/kernel first, then OS-visible capacity; Windows has no POSIX descriptor ceiling.
 inline Json environment() {
     using VersionFunction = LONG(WINAPI*)(OSVERSIONINFOW*);
     const auto module = GetModuleHandleW(L"ntdll.dll");
@@ -142,6 +313,11 @@ inline Json environment() {
     if (system.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64) {
         throw std::runtime_error("This Windows backend currently supports x86_64 only");
     }
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (!GlobalMemoryStatusEx(&memory)) {
+        throw windows_error("Cannot collect system RAM");
+    }
 #ifdef _MSC_VER
     const auto compiler = "MSVC " + std::to_string(_MSC_VER);
 #else
@@ -154,6 +330,12 @@ inline Json environment() {
             {"architecture", "x86_64"},
             {"logical_cpus", GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)},
             {"processor_groups", GetActiveProcessorGroupCount()},
+            {"system_ram_bytes", memory.ullTotalPhys},
+            {"machine", machine_environment()},
+            {"fd_limit",
+             {{"soft", nullptr},
+              {"hard", nullptr},
+              {"unavailable_reason", "Not applicable: Windows has no POSIX FD limit"}}},
             {"tls_library", "Schannel"},
             {"openssl", nullptr},
             {"winlin_version", WINLIN_VERSION},

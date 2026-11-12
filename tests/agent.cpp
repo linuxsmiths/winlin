@@ -60,8 +60,15 @@ int main() {
         Agent agent(config, process);
         const ConnectionInfo tls{"TLSv1.3", config.cipher};
         auto metadata = agent.request(head("GET", "/v1/capabilities", access), tls);
-        require(Json::parse(metadata.text).at("backend") == config.backend,
-                "Shared capability schema");
+        const auto discovery = Json::parse(metadata.text);
+        require(discovery.contains("supported_backends") &&
+                    discovery.at("supported_transports") == Json({"http", "https"}),
+                "Discovery describes supported workload choices");
+        for (const auto* key :
+             {"backend", "transport", "cipher", "tls_version", "workers", "max_connections",
+              "ktls_tx", "ktls_rx", "benchmark_control", "run"}) {
+            require(!discovery.contains(key), "Discovery must not expose control settings");
+        }
         auto get = agent.request(head("GET", "/v1/object?size=4194304", access), tls);
         require(get.kind == AgentReply::Kind::object && get.size == 4194304, "Shared GET route");
         auto put = agent.request(head("PUT", "/v1/object", access, 512), tls);
@@ -110,6 +117,16 @@ int main() {
 
         config.role = AgentConfig::Role::workload;
         Agent workload(config, process, access);
+        const auto run_capabilities =
+            Json::parse(workload.request(head("GET", "/v1/capabilities", access), tls).text);
+        require(run_capabilities.at("run").at("workers") == config.workers &&
+                    run_capabilities.at("run").at("cipher") == config.cipher,
+                "Actual settings are separate from supported choices");
+        try {
+            BenchmarkOptions::parse({{"max_connections", 32}});
+            require(false, "Implementation connection ceiling must not be configurable");
+        } catch (const std::invalid_argument&) {
+        }
         require(workload.request(head("GET", "/v1/object?size=256", ""), tls).status == 409,
                 "Workload requires its active run ID");
         require(workload.request(head("GET", "/v1/object?size=256", "wrong"), tls).status == 409,

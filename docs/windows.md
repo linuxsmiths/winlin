@@ -110,8 +110,8 @@ changes firewall/Schannel policies.
 Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
-CMake builds. Startup `-Workers`,
-`-MaxConnections`, and `-Cipher` configure control only; workload settings come
+CMake builds. Startup `-Workers`
+and `-Cipher` configure control only; workload settings come
 from each remote start request. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
@@ -146,15 +146,21 @@ The control endpoint never serves object traffic. `POST /v1/benchmark/start`
 accepts a JSON body up to 64 KiB, for example:
 
 ```json
-{"tls":"off","workers":4,"max_connections":1024,"lease_seconds":300}
+{"tls":"off","workers":4,"lease_seconds":300}
 ```
 
 For HTTPS, use `"tls":"on"` and optionally
-`"cipher":"TLS_AES_256_GCM_SHA384"`. Workers, connection limits, TLS mode, and
+`"cipher":"TLS_AES_256_GCM_SHA384"`. Workers, TLS mode, and
 cipher can change between runs without restarting control. The response includes
 `port`, `transport`, `backend`, effective `settings`, and an ephemeral `run_id`.
 The workload is ready before start succeeds. Only one run may exist; conflicting
 starts return HTTP 409. Abandoned leases automatically stop and join the workload.
+Discovery lists supported choices and a fixed 65,536-connection implementation
+ceiling; connection limits are not user settings. Effective settings are reported
+separately in the workload's `run` block and the client's `server_run` result.
+Host details include total OS-visible RAM and SMBIOS machine information.
+Azure SKU detection queries only IMDS `vmSize` with bounded, proxy-free requests;
+unavailable metadata is labelled explicitly. POSIX FD limits are not applicable.
 
 Use the returned `run_id` in the **`X-Winlin-Run` workload header**.
 Only object GET/PUT and capabilities
@@ -162,7 +168,7 @@ are available there. Sample counters through control with
 `GET /v1/benchmark/telemetry?run_id=ID`, then release the run with
 `POST /v1/benchmark/stop?run_id=ID`. These calls reject non-owner IDs.
 Runtime failures produce errors rather
-than apparently successful stale telemetry. Plain HTTP capabilities report null
+than apparently successful stale telemetry. Plain HTTP run settings report null
 TLS version and cipher. Run IDs are ephemeral;
 plain HTTP carries them unencrypted and is suitable only on an isolated network.
 
@@ -182,7 +188,7 @@ The bundled public certificate needs no fingerprint entry:
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
 ./scripts/run-client.sh run --target .winlin-local/windows.json \
-  --tls off --server-workers 4 --server-max-connections 1024 \
+  --tls off --server-workers 4 \
   --method mixed --get-percent 50 --get-size 4KiB --put-size 16KiB \
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 ```
@@ -200,14 +206,21 @@ unavailable and returned as `null`.
 
 **Application-process CPU is not total OS CPU.** HTTP.sys/Schannel can execute
 work charged to the System process, outside this server's process counters.
-Results record this scope and the client emits a warning. Whole-system and
-kernel attribution are needed before comparing total TLS CPU efficiency with
-Linux. Neither implementation currently collects that attribution.
+Results record this limitation in JSON notes. Whole-server CPU time is collected
+separately using `GetSystemTimes` across every active processor group, subtracting
+idle time from kernel plus user time. On multi-group hosts a temporary sampler
+thread visits the groups without changing server worker affinities.
+Reference CPIO multiplies whole-server busy CPU time by calibrated invariant-TSC
+frequency and divides by completed I/Os, using the same clock/calculation as Linux.
+It includes work charged to System, but also all unrelated workloads: use an
+otherwise idle server. It is estimated reference cycles, not measured core-clock
+cycles; detailed kernel/TLS attribution is still unavailable.
 `cpu_cycles` comes directly from `QueryProcessCycleTime`, not CPU time multiplied
 by nominal frequency. `cpu_cycles_source` identifies that API; an unavailable
 sample is null with `cpu_cycles_unavailable_reason`. CPU cycles also exclude
 HTTP.sys/Schannel work charged to System and include control-process overhead;
-they are not whole-machine hardware-counter measurements.
+they are not whole-machine hardware-counter measurements and are not used for
+reference CPIO.
 Processor-group count is recorded, but worker affinity and group/NUMA placement
 are not tuned automatically. Verify scheduling on hosts with more than 64 logical
 processors before interpreting scaling results.
