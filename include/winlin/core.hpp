@@ -21,7 +21,8 @@
 #include <nlohmann/json.hpp>
 
 namespace winlin {
-using Json = nlohmann::json;
+// Preserve deliberately chosen presentation order, including nested server environment fields.
+using Json = nlohmann::ordered_json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_object_size = 64 * 1024 * 1024;
 constexpr std::size_t max_header_size = 16384;
@@ -34,23 +35,6 @@ constexpr std::array<std::size_t, 10> size_presets{256,   512,   1024,   4096,  
 // Keep worker diagnostics together and off stdout, which also carries JSON control output.
 inline void log_warning(std::string_view message) {
     std::osyncstream(std::cerr) << "winlin: WARNING: " << message << '\n';
-}
-
-// Accept native text-file line endings without relaxing the credential's format or size bounds.
-inline std::string parse_token(std::string token) {
-    if (!token.empty() && token.back() == '\n') {
-        token.pop_back();
-    }
-    if (!token.empty() && token.back() == '\r') {
-        token.pop_back();
-    }
-    if (token.size() < 32 || token.size() > 256 ||
-        !std::all_of(token.begin(), token.end(), [](unsigned char ch) {
-            return std::isxdigit(ch);
-        })) {
-        throw std::runtime_error("Credential must contain 32-256 hexadecimal characters");
-    }
-    return token;
 }
 
 // Require the entire argument to be an unsigned integer; partial parses hide configuration errors.

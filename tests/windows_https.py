@@ -16,15 +16,15 @@ import time
 from https_contract import exercise_single_instance, tls_context
 
 
-SERVER, PORT, HTTP_PORT, HTTPS_PORT, TOKEN_FILE, PIN, STOP_FILE = sys.argv[1:]
+SERVER, PORT, HTTP_PORT, HTTPS_PORT, PIN, STOP_FILE = sys.argv[1:]
 PORT, HTTP_PORT, HTTPS_PORT = map(int, (PORT, HTTP_PORT, HTTPS_PORT))
 LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-server.ps1"
 
 
 class Agent:
-    """Own a permanent native control process and its provisioned, persistent pairing state."""
+    """Own a permanent native control process and its provisioned endpoints."""
 
-    def __init__(self, cipher="TLS_AES_128_GCM_SHA256", authenticated=True):
+    def __init__(self, cipher="TLS_AES_128_GCM_SHA256"):
         self.port = PORT
         arguments = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
@@ -32,8 +32,6 @@ class Agent:
             "-HttpsPort", str(HTTPS_PORT), "-Workers", "2", "-MaxConnections", "128",
             "-Cipher", cipher, "-StopFile", STOP_FILE,
         ]
-        if authenticated:
-            arguments += ["-TokenFile", TOKEN_FILE]
         self.process = subprocess.Popen(
             arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -76,20 +74,20 @@ class Agent:
             Path(STOP_FILE).unlink(missing_ok=True)
         assert self.process.returncode == 0, stderr
 
-    def request(self, method, path, token=None, body=None):
+    def request(self, method, path, body=None):
         """Send one control request, reconnecting automatically after an error response."""
-        return request(self.connection, method, path, token, body)
+        return request(self.connection, method, path, body=body)
 
-    def start(self, settings, token):
+    def start(self, settings):
         """Request one exclusive in-process workload with remotely selected tuning."""
-        status, payload = self.request("POST", "/v1/benchmark/start", token, json.dumps(settings))
+        status, payload = self.request("POST", "/v1/benchmark/start", json.dumps(settings))
         assert status == 200, (status, payload)
         return json.loads(payload)
 
 
-def request(connection, method, path, token=None, body=None):
-    """Keep request body bytes and bearer selection explicit for both transports."""
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+def request(connection, method, path, run_id=None, body=None):
+    """Keep request body bytes and workload run selection explicit for both transports."""
+    headers = {"X-Winlin-Run": run_id} if run_id else {}
     connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     return response.status, response.read()
@@ -104,12 +102,12 @@ def data_connection(mode):
     return http.client.HTTPConnection("127.0.0.1", HTTP_PORT, timeout=5)
 
 
-def exercise_run(agent, token, cipher, mode, workers):
-    """Switch transport/workers without restarting control; exercise actual authenticated data I/O."""
+def exercise_run(agent, cipher, mode, workers):
+    """Switch transport/workers without restarting control; exercise actual leased data I/O."""
     connection_limit = 64 if workers == 1 else 256
     settings = {"tls": mode, "cipher": cipher, "workers": workers,
                 "max_connections": connection_limit}
-    run = agent.start(settings, token)
+    run = agent.start(settings)
     run_id = run["run_id"]
     assert len(run_id) == 64
     assert run["port"] == (HTTPS_PORT if mode == "on" else HTTP_PORT)
@@ -118,18 +116,21 @@ def exercise_run(agent, token, cipher, mode, workers):
     assert run["settings"]["workers"] == workers
     assert run["settings"]["max_connections"] == connection_limit
     assert run["settings"]["cipher"] == (cipher if mode == "on" else None)
-    assert agent.request("POST", "/v1/benchmark/start", token, json.dumps(settings))[0] == 409
-    assert agent.request("POST", "/v1/benchmark/stop?run_id=wrong", token)[0] == 409
-    assert agent.request("GET", "/v1/benchmark/telemetry?run_id=wrong", token)[0] == 409
-    assert agent.request("GET", "/v1/object?size=512", token)[0] == 404
+    assert agent.request("POST", "/v1/benchmark/start", json.dumps(settings))[0] == 409
+    assert agent.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
+    assert agent.request("GET", "/v1/benchmark/telemetry?run_id=wrong")[0] == 409
+    assert agent.request("GET", "/v1/object?size=512")[0] == 404
 
     connection = data_connection(mode)
     try:
-        assert request(connection, "GET", "/v1/capabilities")[0] == 401
-        assert request(connection, "GET", "/v1/object?size=512", "0" * 64)[0] == 401
+        assert request(connection, "GET", "/v1/capabilities")[0] == 409
+        assert request(connection, "GET", "/v1/object?size=512", "0" * 64)[0] == 409
         status, payload = request(connection, "GET", "/v1/capabilities", run_id)
         capabilities = json.loads(payload)
         assert status == 200 and capabilities["workers"] == workers
+        assert "authentication" not in capabilities
+        assert next(iter(capabilities)) == "environment"
+        assert list(capabilities["environment"])[:2] == ["os", "kernel"]
         assert capabilities["max_connections"] == connection_limit
         assert capabilities["cipher"] == (cipher if mode == "on" else None)
         assert capabilities["tls_version"] == ("TLSv1.3" if mode == "on" else None)
@@ -141,7 +142,7 @@ def exercise_run(agent, token, cipher, mode, workers):
             assert request(connection, "PUT", "/v1/object", run_id, b"x" * size) == (200, b"")
         # A partial PUT must not be acknowledged or counted before all bytes have arrived.
         connection.putrequest("PUT", "/v1/object")
-        connection.putheader("Authorization", f"Bearer {run_id}")
+        connection.putheader("X-Winlin-Run", run_id)
         connection.putheader("Content-Length", "512")
         connection.endheaders()
         connection.send(b"x" * 256)
@@ -179,11 +180,11 @@ def exercise_run(agent, token, cipher, mode, workers):
         with socket.create_connection(("127.0.0.1", HTTP_PORT), timeout=5) as raw:
             raw.sendall(
                 (f"GET /v1/object?size=512 HTTP/1.0\r\nHost: localhost\r\n"
-                 f"Authorization: Bearer {run_id}\r\n\r\n").encode()
+                 f"X-Winlin-Run: {run_id}\r\n\r\n").encode()
             )
             assert raw.recv(4096).startswith(b"HTTP/1.1 400 ")
 
-    status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}", token)
+    status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
     telemetry = json.loads(payload)
     assert status == 200 and telemetry["get_completed"] >= 8 and telemetry["put_completed"] >= 9
     assert telemetry["active_connections"] is None and telemetry["tls_handshakes"] is None
@@ -195,14 +196,13 @@ def exercise_run(agent, token, cipher, mode, workers):
     else:
         assert process["cpu_cycles"] > 0 and process["cpu_cycles_source"] == "QueryProcessCycleTime"
         assert process["cpu_cycles_unavailable_reason"] is None
-    assert agent.request("POST", f"/v1/benchmark/stop?run_id={run_id}", token)[0] == 200
-    assert agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}", token)[0] == 409
+    assert agent.request("POST", f"/v1/benchmark/stop?run_id={run_id}")[0] == 200
+    assert agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")[0] == 409
 
 
-bootstrap = Path(TOKEN_FILE).read_text().strip()
 agent = Agent()
 try:
-    exercise_single_instance([SERVER, "--token-file", TOKEN_FILE], PORT)
+    exercise_single_instance([SERVER], PORT)
     agent.connection.connect()
     assert hashlib.sha256(agent.connection.sock.getpeercert(binary_form=True)).hexdigest() == PIN
     cipher = agent.connection.sock.cipher()[0]
@@ -212,24 +212,21 @@ assert cipher in ("TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"), cipher
 
 agent = Agent(cipher)
 try:
-    assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401
-    status, payload = agent.request("POST", "/v1/pair", bootstrap)
-    assert status == 200, payload
-    token = json.loads(payload)["access_token"]
-    status, payload = agent.request("GET", "/v1/capabilities", token)
+    assert agent.request("POST", "/v1/pair")[0] == 404
+    status, payload = agent.request("GET", "/v1/capabilities")
     capabilities = json.loads(payload)
     assert status == 200 and capabilities["benchmark_control"]
+    assert "authentication" not in capabilities
     assert capabilities["benchmark_tls_modes"] == ["on", "off"]
-    status, payload = agent.request("POST", "/v1/benchmark/start", token, '{"tls":"ktls"}')
+    status, payload = agent.request("POST", "/v1/benchmark/start", '{"tls":"ktls"}')
     assert status == 501 and b"kTLS" in payload, payload
-    assert agent.request("POST", "/v1/benchmark/start", token, '{"tls":"on","cipher":"bad"}')[0] == 400
-    assert agent.request("POST", "/v1/benchmark/start", token, " " * 65537)[0] == 400
+    assert agent.request("POST", "/v1/benchmark/start", '{"tls":"on","cipher":"bad"}')[0] == 400
+    assert agent.request("POST", "/v1/benchmark/start", " " * 65537)[0] == 400
 
     # Split JSON across receives: no workload may start from a partial control body.
     body = json.dumps({"tls": "off", "workers": 1})
     connection = agent.connection
     connection.putrequest("POST", "/v1/benchmark/start")
-    connection.putheader("Authorization", f"Bearer {token}")
     connection.putheader("Content-Length", str(len(body)))
     connection.endheaders()
     connection.send(body[:5].encode())
@@ -244,28 +241,28 @@ try:
     response = connection.getresponse()
     run = json.loads(response.read())
     assert response.status == 200, run
-    assert agent.request("POST", f"/v1/benchmark/stop?run_id={run['run_id']}", token)[0] == 200
+    assert agent.request("POST", f"/v1/benchmark/stop?run_id={run['run_id']}")[0] == 200
 
     for mode, workers in (("off", 1), ("on", 3), ("off", 3), ("on", 1)):
-        exercise_run(agent, token, cipher, mode, workers)
+        exercise_run(agent, cipher, mode, workers)
 
     # Changing the run cipher must change validation, not rewrite machine-wide Schannel policy.
     other_cipher = ("TLS_AES_256_GCM_SHA384" if cipher == "TLS_AES_128_GCM_SHA256"
                     else "TLS_AES_128_GCM_SHA256")
-    mismatch = agent.start({"tls": "on", "cipher": other_cipher}, token)
+    mismatch = agent.start({"tls": "on", "cipher": other_cipher})
     connection = data_connection("on")
     try:
         status, payload = request(connection, "GET", "/v1/object?size=512", mismatch["run_id"])
         assert status == 400 and b"cipher" in payload, payload
     finally:
         connection.close()
-    assert agent.request("POST", f"/v1/benchmark/stop?run_id={mismatch['run_id']}", token)[0] == 200
+    assert agent.request("POST", f"/v1/benchmark/stop?run_id={mismatch['run_id']}")[0] == 200
 
-    expired = agent.start({"tls": "off", "lease_seconds": 1}, token)
+    expired = agent.start({"tls": "off", "lease_seconds": 1})
     time.sleep(2.2)
-    assert agent.request("GET", f"/v1/benchmark/telemetry?run_id={expired['run_id']}", token)[0] == 409
+    assert agent.request("GET", f"/v1/benchmark/telemetry?run_id={expired['run_id']}")[0] == 409
     # Leaving a workload active also verifies whole-server shutdown joins its data-plane workers.
-    agent.start({"tls": "on", "cipher": cipher}, token)
+    agent.start({"tls": "on", "cipher": cipher})
 
     legacy = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     legacy.check_hostname = False
@@ -283,24 +280,15 @@ finally:
 
 agent = Agent(cipher)
 try:
-    assert agent.request("GET", "/v1/capabilities", token)[0] == 200
-    assert agent.request("POST", "/v1/pair", bootstrap)[0] == 409
+    assert agent.request("GET", "/v1/capabilities")[0] == 200
 finally:
     agent.stop()
 
 other = "TLS_AES_256_GCM_SHA384" if cipher == "TLS_AES_128_GCM_SHA256" else "TLS_AES_128_GCM_SHA256"
 agent = Agent(other)
 try:
-    status, payload = agent.request("GET", "/v1/capabilities", token)
-    assert status == 400 and b"cipher" in payload, payload
-finally:
-    agent.stop()
-
-agent = Agent(cipher, authenticated=False)
-try:
     status, payload = agent.request("GET", "/v1/capabilities")
-    assert status == 200 and json.loads(payload)["authentication"] == "none", payload
-    exercise_run(agent, None, cipher, "off", 2)
+    assert status == 400 and b"cipher" in payload, payload
 finally:
     agent.stop()
 
@@ -308,6 +296,6 @@ with socket.socket() as guard_owner:
     guard_owner.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
     guard_owner.bind(("127.0.0.1", 8444))
     guard_owner.listen(1)
-    exercise_single_instance([SERVER, "--token-file", TOKEN_FILE], PORT)
+    exercise_single_instance([SERVER], PORT)
 
 print(f"Windows HTTP.sys control, HTTP/HTTPS workload switching, leases and IOCP GET/PUT checks passed ({cipher}).")

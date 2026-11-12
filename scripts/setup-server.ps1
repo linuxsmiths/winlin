@@ -5,8 +5,7 @@ param(
     [ValidateRange(1, 65535)][int]$HttpPort = 38444,
     [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
-    [string]$CertificateThumbprint = '',
-    [switch]$RequireAuthentication
+    [string]$CertificateThumbprint = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,10 +24,6 @@ if ($Port -eq $HttpPort -or $Port -eq $HttpsPort -or $HttpPort -eq $HttpsPort) {
 $state = [IO.Path]::GetFullPath($StateDirectory)
 Initialize-WinlinPrivateDirectory -Path $state
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$tokenFile = if ($RequireAuthentication) { Join-Path $state 'pairing-token' } else { $null }
-if ($RequireAuthentication -and (Test-Path -LiteralPath $tokenFile)) {
-    throw 'Pairing-token file already exists. Reuse its configured endpoint or choose a fresh StateDirectory.'
-}
 $endpoint = "${BindAddress}:$Port"
 $url = "https://${BindAddress}:$Port/"
 $createdCertificate = $false
@@ -36,7 +31,6 @@ $httpUrl = "http://${BindAddress}:$HttpPort/"
 $httpsUrl = "https://${BindAddress}:$HttpsPort/"
 $createdBindings = @()
 $createdUrls = @()
-$createdToken = $false
 # Track only resources created here, so rollback never removes an existing endpoint or certificate.
 try {
     if ($CertificateThumbprint) {
@@ -80,20 +74,6 @@ try {
             "user=$user", 'listen=yes', 'delegate=no') | Out-Host
         $createdUrls += $reservation
     }
-    if ($RequireAuthentication) {
-        $random = [byte[]]::new(32)
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($random) } finally { $rng.Dispose() }
-        $token = ([BitConverter]::ToString($random)).Replace('-', '').ToLowerInvariant()
-        $stream = New-WinlinPrivateFileStream -Path $tokenFile
-        $createdToken = $true
-        try {
-            $bytes = [Text.Encoding]::ASCII.GetBytes("$token`n")
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        }
-        finally { $stream.Dispose() }
-    }
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $pin = ([BitConverter]::ToString($sha.ComputeHash($certificate.RawData))).Replace('-', '').ToLowerInvariant() }
     finally { $sha.Dispose() }
@@ -110,16 +90,10 @@ try {
         CertificateThumbprint = $thumbprint
         CertificateSha256 = $pin
         CreatedCertificate = $createdCertificate
-        TokenFile = $tokenFile
     }
 }
 catch {
     # Cleanup warnings must not prevent later rollback actions or replace the provisioning error.
-    if ($createdToken) {
-        $null = Invoke-WinlinCleanup -Description 'pairing token' -Action {
-            Remove-Item -LiteralPath $tokenFile
-        }
-    }
     foreach ($reservation in $createdUrls) {
         $null = Invoke-WinlinCleanup -Description 'URL reservation' -Action {
             Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'urlacl', "url=$reservation")

@@ -11,8 +11,6 @@ param(
     [ValidateRange(1, 256)][int]$Workers,
     [ValidateRange(1, 65536)][int]$MaxConnections,
     [string]$Cipher,
-    [string]$TokenFile = '',
-    [string]$SessionFile,
     [string]$StopFile,
     [switch]$Help
 )
@@ -23,19 +21,18 @@ if ($Help) {
 Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-StateDirectory PATH] [-ServerExe PATH] [-BindAddress IP] [-Port N]
     [-HttpPort N] [-HttpsPort N]
-    [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-TokenFile PATH]
-    [-SessionFile PATH] [-StopFile PATH]
+    [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-StopFile PATH]
 
-Defaults: build\Release\winlin-server.exe, no authentication, HTTPS control 127.0.0.1:38443,
+Defaults: build\Release\winlin-server.exe, HTTPS control 127.0.0.1:38443,
 HTTP workload port 38444 and HTTPS workload port 38445.
-An explicit -TokenFile enables authentication. Default directories are relative to the repository; supplied
+Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary
 discovery. Clients select per-run workload TLS/cipher/workers/limits remotely.
 The startup Workers, MaxConnections and Cipher options affect control only.
 
 Provision the matching HTTP.sys endpoint with scripts\setup-server.ps1 first.
-Run as the same account that owns its URL reservation and credential files.
-This launcher never builds, provisions certificates, resets pairing, or changes
+Run as the same account that owns its URL reservation.
+This launcher never builds, provisions certificates, or changes
 firewall/Schannel policies. See docs\windows.md for setup.
 '@
     return
@@ -45,7 +42,7 @@ try {
     . (Join-Path $PSScriptRoot 'windows-common.ps1')
     Assert-WinlinWindows
 
-    foreach ($name in @('BuildDirectory', 'StateDirectory', 'ServerExe', 'BindAddress', 'TokenFile')) {
+    foreach ($name in @('BuildDirectory', 'StateDirectory', 'ServerExe', 'BindAddress')) {
         if ($PSBoundParameters.ContainsKey($name) -and -not [string]$PSBoundParameters[$name]) {
             throw "$name must not be empty."
         }
@@ -62,20 +59,11 @@ try {
 
     $serverArguments = @('--bind', $BindAddress, '--port', "$Port",
         '--http-port', "$HttpPort", '--https-port', "$HttpsPort")
-    if ($TokenFile) {
-        $TokenFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenFile)
-        if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
-            throw "Pairing-token file not found: $TokenFile."
-        }
-        $serverArguments += @('--token-file', $TokenFile)
-    }
-
     # Do not duplicate native default policy here; forward optional settings only when supplied.
     $optionalOptions = [ordered]@{
         Workers = '--workers'
         MaxConnections = '--max-connections'
         Cipher = '--cipher'
-        SessionFile = '--session-file'
         StopFile = '--stop-file'
     }
     foreach ($name in $optionalOptions.Keys) {

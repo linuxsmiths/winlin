@@ -12,8 +12,8 @@ memory, networking, and kernel activity behind those results.
 
 Winlin has native HTTP/HTTPS workload implementations for Linux (TCP, OpenSSL and
 kTLS) and Windows (HTTP.sys/Schannel), with an interactive/noninteractive Linux client,
-pairing and discovery, GET/PUT workloads, process telemetry, and JSON results.
-Both servers share agent routing, authentication, capabilities, and workload
+target registration and discovery, GET/PUT workloads, process telemetry, and JSON results.
+Both servers share agent routing, run leases, capabilities, and workload
 semantics. The kTLS backend verifies activation per direction and refuses
 userspace fallback.
 An always-HTTPS controller configures one exclusive run at a time: clients select
@@ -64,7 +64,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-See [the HTTPS quickstart](docs/https.md) for certificate setup, pairing, workloads,
+See [the HTTPS quickstart](docs/https.md) for certificate setup, registration, workloads,
 results, and current limitations. A deliberately public certificate/key is
 included for convenience; no manual certificate setup is needed for Linux.
 Use the foreground launchers:
@@ -89,16 +89,13 @@ Choose server tuning in the client benchmark menu, or for example:
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
-`-- --help` for native help. Authentication is disabled by default on both OSes:
-**Add server** needs no token file or credential copying. Explicit `--token-file`
-(Windows `-TokenFile`) enables optional authenticated pairing. Existing credential
-files are left untouched but are not used automatically. Launchers never build.
+`-- --help` for native help. **Add server** discovers the endpoint and saves its
+certificate pin locally. Launchers never build.
 
 **The bundled TLS identity is public and provides no trustworthy server
 authentication.** It is for isolated synthetic benchmarks only. The client
 recognizes it automatically; custom certificates/pins remain supported. See
-[the fixture documentation](certs/benchmark/README.md). Actual pairing tokens
-and saved controller credentials are not bundled or checked into Git.
+[the fixture documentation](certs/benchmark/README.md).
 
 Linux runtime launches ensure a soft file-descriptor limit of at least **524,288**,
 preserving higher limits. If the inherited hard limit is too low, startup fails
@@ -117,11 +114,11 @@ ctest --test-dir build -C Release --output-on-failure
 Installation requires elevation; building does not. Windows uses native OS
 libraries, not OpenSSL, and the client remains Linux-only. See the
 [Windows server guide](docs/windows.md) for certificate bindings, URL ACLs,
-Linux-client pairing, and optional privileged HTTPS tests.
+Linux-client registration, and optional privileged HTTPS tests.
 
 After provisioning, start the Windows server in the foreground with
 `.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 38443`. It defaults to
-`build\Release\winlin-server.exe`, without authentication; use
+`build\Release\winlin-server.exe`; use
 `-BuildDirectory`, `-Configuration`, `-StateDirectory`, or `-ServerExe` to
 override discovery. Run with `-Help` for all supported options.
 
@@ -163,8 +160,7 @@ Linux client
 The client is the user's entry point. It will discover an already-running Winlin
 server agent at a supplied IP address, report its capabilities, and allow the
 user to register it as a benchmark target. Onboarding will use a known agent
-port and automatic registration. Custom server identities require confirmation;
-token-based pairing is optional.
+port and automatic registration. Custom server identities require confirmation.
 
 An interactive, menu-driven console will let users select targets and benchmarks,
 configure workloads, run tests, and inspect results or comparisons.

@@ -38,14 +38,14 @@ These rules apply to all development in this repository.
   failed and exit with a nonzero status. Worker failures must reach the
   controlling thread rather than leaving a run hanging or falsely successful.
 - Send diagnostics to stderr when stdout carries structured output. Never log
-  credentials, access tokens, or private keys.
+  run IDs or private keys.
 - Preserve completed results where possible and clearly mark incomplete or
   failed runs.
 
 ## Cross-platform behavior and measurement integrity
 
 - Keep Linux and Windows server behavior in sync. Put shared routing,
-  authentication, capabilities, and telemetry schemas in the shared agent;
+  run leases, capabilities, and telemetry schemas in the shared agent;
   keep native transport details in their platform-specific implementations.
 - Never silently substitute a backend, TLS configuration, or workload. Reject
   unsupported configurations explicitly.

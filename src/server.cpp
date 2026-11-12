@@ -51,20 +51,7 @@ struct Server : Agent {
 
     Server(const Args& args, const BenchmarkOptions* options = nullptr,
            const std::string& run_id = {})
-        : Agent(
-              options ? workload_config(args, *options) : linux_config(args),
-              options                            ? "workload"
-              : args.get("--token-file").empty() ? ""
-                                                 : token_file(args.get("--token-file")),
-              options ? std::optional<std::string>(run_id)
-              : args.get("--token-file").empty()
-                  ? std::nullopt
-                  : optional_token_file(
-                        args.get("--session-file", args.get("--token-file") + ".session")),
-              [path = args.get("--session-file", args.get("--token-file") + ".session")] {
-                  return issue_token_file(path);
-              },
-              equal_secret, usage),
+        : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id),
           tls(options && options->tls == "off"
                   ? Context(nullptr, SSL_CTX_free)
                   : context(true,
@@ -72,9 +59,6 @@ struct Server : Agent {
                                     : args.get("--cipher", "TLS_AES_128_GCM_SHA256"),
                             options && options->tls == "ktls")),
           payload(options ? max_object_size : 0), ktls(options && options->tls == "ktls") {
-        if (!options && args.get("--token-file").empty()) {
-            log_warning("Authentication disabled; use only on an isolated benchmark network");
-        }
         if (tls &&
             (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
              SSL_CTX_use_PrivateKey_file(tls.get(), args.require("--key").c_str(),
@@ -482,14 +466,11 @@ public:
 int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout
-            << "winlin-server --cert certificate.pem --key private.key\n"
-               "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
-               "  [--http-port 38444] [--https-port 38445]\n"
-               "  Benchmark workers/TLS/kTLS are selected by the client per run.\n"
-               "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n"
-               "  [--token-file path] (optional authentication; default: none)\n"
-               "  [--session-file path] (requires --token-file; default: TOKEN-FILE.session)\n";
+        std::cout << "winlin-server --cert certificate.pem --key private.key\n"
+                     "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
+                     "  [--http-port 38444] [--https-port 38445]\n"
+                     "  Benchmark workers/TLS/kTLS are selected by the client per run.\n"
+                     "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n";
         return 0;
     }
     try {
@@ -497,9 +478,8 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
-        args.allow({"--cert", "--key", "--token-file", "--bind", "--port", "--workers", "--backend",
-                    "--cipher", "--max-connections", "--session-file", "--http-port",
-                    "--https-port"});
+        args.allow({"--cert", "--key", "--bind", "--port", "--workers", "--backend", "--cipher",
+                    "--max-connections", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port = number(args.get("--http-port", "38444"), 65535);
         const auto https_port = number(args.get("--https-port", "38445"), 65535);

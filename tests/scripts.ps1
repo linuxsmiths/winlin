@@ -108,13 +108,11 @@ exit 0
 '@
     $state = Join-Path $fixture 'private state'
     New-Item -ItemType Directory -Path $state | Out-Null
-    $token = Join-Path $state 'pairing-token'
-    Set-Content -LiteralPath $token -Value 'fixture, not a credential'
 
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-StateDirectory', $state, '-BindAddress', '10.0.0.4',
         '-Port', '9443', '-HttpPort', '9444', '-HttpsPort', '9445', '-Workers', '3', '-MaxConnections', '64',
-        '-Cipher', 'TLS_AES_256_GCM_SHA384', '-SessionFile', 'session with spaces',
+        '-Cipher', 'TLS_AES_256_GCM_SHA384',
         '-StopFile', 'stop with spaces'
     )
     if ($result.ExitCode -ne 0) { throw "Launcher fixture failed: $($result.Output)" }
@@ -122,7 +120,7 @@ exit 0
     $expected = @(
         '--bind', '10.0.0.4', '--port', '9443', '--http-port', '9444', '--https-port', '9445', '--workers', '3',
         '--max-connections', '64', '--cipher', 'TLS_AES_256_GCM_SHA384',
-        '--session-file', 'session with spaces', '--stop-file', 'stop with spaces'
+        '--stop-file', 'stop with spaces'
     )
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
         throw "Launcher altered argument boundaries or defaults: $arguments"
@@ -133,25 +131,25 @@ exit 0
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-StateDirectory', (Join-Path $fixture 'no state')
     )
-    if ($result.ExitCode -ne 0 -or ($result.Output -join "`n") -match '--token-file') {
-        throw "Default launch must need no credential files: $($result.Output)"
+    if ($result.ExitCode -ne 0) {
+        throw "Default launch must need no state files: $($result.Output)"
     }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
     $expected = @('--bind', '127.0.0.1', '--port', '38443',
         '--http-port', '38444', '--https-port', '38445')
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
-        throw "Default launcher endpoint or authentication changed unexpectedly: $arguments"
+        throw "Default launcher endpoints changed unexpectedly: $arguments"
     }
 
     $result = Invoke-LauncherFixture -Arguments @(
-        '-ServerExe', $fakeServer, '-TokenFile', $token, '-Cipher', 'FAIL_TEST'
+        '-ServerExe', $fakeServer, '-Cipher', 'FAIL_TEST'
     )
     if ($result.ExitCode -ne 23 -or ($result.Output -join "`n") -notmatch 'FATAL:') {
         throw "Launcher lost application failure: $($result.Output)"
     }
     foreach ($arguments in @(
         @('-BuildDirectory', (Join-Path $fixture 'missing build')),
-        @('-ServerExe', $fakeServer, '-TokenFile', (Join-Path $state 'missing token'))
+        @('-ServerExe', (Join-Path $state 'missing executable'))
     )) {
         $result = Invoke-LauncherFixture -Arguments $arguments
         if ($result.ExitCode -ne 1 -or ($result.Output -join "`n") -notmatch 'FATAL:') {

@@ -272,9 +272,8 @@ HttpHead request_head(const HTTP_REQUEST& request) {
     std::string text = method + " " + std::string(request.pRawUrl, request.RawUrlLength) +
                        " HTTP/" + std::to_string(request.Version.MajorVersion) + "." +
                        std::to_string(request.Version.MinorVersion) + "\r\n";
-    const std::array<std::pair<HTTP_HEADER_ID, const char*>, 5> names{
+    const std::array<std::pair<HTTP_HEADER_ID, const char*>, 4> names{
         {{HttpHeaderHost, "Host"},
-         {HttpHeaderAuthorization, "Authorization"},
          {HttpHeaderContentLength, "Content-Length"},
          {HttpHeaderConnection, "Connection"},
          {HttpHeaderTransferEncoding, "Transfer-Encoding"}}};
@@ -283,6 +282,14 @@ HttpHead request_head(const HTTP_REQUEST& request) {
         if (header.pRawValue) {
             text += std::string(name) + ": " +
                     std::string(header.pRawValue, header.RawValueLength) + "\r\n";
+        }
+    }
+    // HTTP.sys exposes the workload lease header through UnknownHeaders, not KnownHeaders.
+    for (USHORT index = 0; index < request.Headers.UnknownHeaderCount; ++index) {
+        const auto& header = request.Headers.pUnknownHeaders[index];
+        if (lower(std::string(header.pName, header.NameLength)) == "x-winlin-run") {
+            text +=
+                "X-Winlin-Run: " + std::string(header.pRawValue, header.RawValueLength) + "\r\n";
         }
     }
     text += "\r\n";
@@ -356,35 +363,17 @@ struct Runtime {
     unsigned port{};
 
     explicit Runtime(const Args& args)
-        : agent(
-              windows_config(args),
-              args.get("--token-file").empty() ? "" : token_file(args.get("--token-file")),
-              args.get("--token-file").empty()
-                  ? std::nullopt
-                  : optional_token_file(
-                        args.get("--session-file", args.get("--token-file") + ".session")),
-              [path = args.get("--session-file", args.get("--token-file") + ".session")] {
-                  return issue_token_file(path);
-              },
-              equal_secret, usage),
-          stop_file(args.get("--stop-file")), address(args.get("--bind", "127.0.0.1")),
+        : agent(windows_config(args), usage), stop_file(args.get("--stop-file")),
+          address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "38443"), 65535))) {
-        if (args.get("--token-file").empty()) {
-            log_warning("Authentication disabled; use only on an isolated benchmark network");
-        }
         initialize();
     }
 
-    // Workloads use an in-memory lease credential and share the control runtime's native engine.
+    // Workloads use an in-memory run ID and share the control runtime's native engine.
     Runtime(AgentConfig config, const std::string& run_id, std::string bind_address,
             unsigned bind_port)
-        : agent(
-              std::move(config), "workload-bootstrap", run_id,
-              []() -> std::string {
-                  throw std::logic_error("Workload endpoints cannot pair");
-              },
-              equal_secret, usage),
-          payload(max_object_size), address(std::move(bind_address)), port(bind_port) {
+        : agent(std::move(config), usage, run_id), payload(max_object_size),
+          address(std::move(bind_address)), port(bind_port) {
         initialize();
     }
 
@@ -870,9 +859,8 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
         std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
-                     "  [--token-file path] (optional authentication; default: none)\n"
                      "  [--workers 8] [--backend httpsys] [--cipher TLS_AES_128_GCM_SHA256]\n"
-                     "  [--max-connections 32768] [--session-file path] [--stop-file path]\n"
+                     "  [--max-connections 32768] [--stop-file path]\n"
                      "Per-run workload TLS/cipher/workers/limits are controlled remotely.\n"
                      "Configure the HTTP.sys certificate bindings and URL ACLs using "
                      "scripts/setup-server.ps1 first.\n";
@@ -889,9 +877,8 @@ int wmain(int argc, wchar_t** argv) {
             arguments.push_back(value.data());
         }
         Args args(argc, arguments.data());
-        args.allow({"--token-file", "--bind", "--port", "--workers", "--backend", "--cipher",
-                    "--max-connections", "--session-file", "--stop-file", "--http-port",
-                    "--https-port"});
+        args.allow({"--bind", "--port", "--workers", "--backend", "--cipher", "--max-connections",
+                    "--stop-file", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port =
             static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));

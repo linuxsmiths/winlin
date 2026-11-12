@@ -66,11 +66,7 @@ This imports the bundled **deliberately public** RSA test certificate/key into
 `LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
 SSL bindings for HTTPS control (default **38443**) and HTTPS workload (**38445**),
 plus URL reservations for both and the plain HTTP workload (**38444**), for the
-current user. All three ports must be distinct. Authentication is disabled
-by default; no pairing-token file is needed. Optional setup
-`-RequireAuthentication` creates a bootstrap credential in
-`.winlin-local\pairing-token`. Only the owner, SYSTEM and
-Administrators may access credential files. The current user owns the state;
+current user. All three ports must be distinct. The current user owns the state;
 run the server as that same account. Service-account provisioning is not automated.
 
 The PFX import password is intentionally public and is supplied automatically.
@@ -86,7 +82,7 @@ script's output is the pin used by the Linux client. The client already recogniz
 the bundled fixture; custom certificates require this SHA-256 pin explicitly.
 
 Use `-StateDirectory PATH` for a fresh independent endpoint state. Existing
-bindings, URL reservations, and pairing-token files are not silently replaced.
+bindings and URL reservations are not silently replaced.
 Existing state directories must already be private; setup does not rewrite a
 shared directory's permissions. On setup failure, resources created by that
 invocation are rolled back.
@@ -105,19 +101,18 @@ Start the server (the same user can do this without elevation after setup):
     -Port 38443 -HttpPort 38444 -HttpsPort 38445
 ```
 
-The launcher defaults to the repository's `build\Release\winlin-server.exe` with
-no authentication. Match `-BindAddress`, `-Port`, `-HttpPort` and `-HttpsPort`
+The launcher defaults to the repository's `build\Release\winlin-server.exe`.
+Match `-BindAddress`, `-Port`, `-HttpPort` and `-HttpsPort`
 to the provisioned endpoints. Native options are `--bind`, `--port`,
-`--http-port` and `--https-port`. The launcher never builds, provisions certificates, resets pairing, elevates, or
+`--http-port` and `--https-port`. The launcher never builds, provisions certificates, elevates, or
 changes firewall/Schannel policies.
 
 Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
-CMake builds. Explicit `-TokenFile FILE` enables authentication, with optional
-`-SessionFile FILE` for credential persistence. Startup `-Workers`,
+CMake builds. Startup `-Workers`,
 `-MaxConnections`, and `-Cipher` configure control only; workload settings come
-from each remote start request. Existing credential files are otherwise ignored. `-Help` lists options
+from each remote start request. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 
@@ -161,28 +156,28 @@ cipher can change between runs without restarting control. The response includes
 The workload is ready before start succeeds. Only one run may exist; conflicting
 starts return HTTP 409. Abandoned leases automatically stop and join the workload.
 
-Use the returned `run_id` as the **Bearer credential on the workload endpoint**,
-even when control authentication is disabled. Only object GET/PUT and capabilities
+Use the returned `run_id` in the **`X-Winlin-Run` workload header**.
+Only object GET/PUT and capabilities
 are available there. Sample counters through control with
 `GET /v1/benchmark/telemetry?run_id=ID`, then release the run with
-`POST /v1/benchmark/stop?run_id=ID`. These calls retain optional control-token
-authentication and reject non-owner IDs. Runtime failures produce errors rather
+`POST /v1/benchmark/stop?run_id=ID`. These calls reject non-owner IDs.
+Runtime failures produce errors rather
 than apparently successful stale telemetry. Plain HTTP capabilities report null
-TLS version and cipher. Run IDs are ephemeral, not persisted pairing credentials;
+TLS version and cipher. Run IDs are ephemeral;
 plain HTTP carries them unencrypted and is suitable only on an isolated network.
 
 Press Ctrl+C to stop gracefully. For local automation, `-StopFile PATH` (native
 `--stop-file PATH`) also requests a graceful stop when that file appears. The file
 must not already exist at startup, and remains the caller's responsibility to remove.
 
-## Pair and run from Linux
+## Add a server and run from Linux
 
-No authentication setup or file transfer is needed. Verify the certificate
+No file transfer is needed. Verify the certificate
 fingerprint through an independent trusted channel if using a custom certificate.
 The bundled public certificate needs no fingerprint entry:
 
 ```sh
-./scripts/run-client.sh pair --host 10.0.0.4 --port 38443 \
+./scripts/run-client.sh add --host 10.0.0.4 --port 38443 \
   --target .winlin-local/windows.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
@@ -191,15 +186,6 @@ The bundled public certificate needs no fingerprint entry:
   --method mixed --get-percent 50 --get-size 4KiB --put-size 16KiB \
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 ```
-
-To opt into authentication, provision with `-RequireAuthentication`, launch with
-`-TokenFile .winlin-local\pairing-token`, securely copy that file to the client
-(mode `0600`), and pass `--token-file FILE` to CLI `pair`.
-Only this explicit token mode consumes the bootstrap credential and creates
-`PAIRING-TOKEN-FILE.session` on the server, or the path selected by
-`--session-file`. Preserve it across restarts. To reset pairing deliberately,
-stop the server, remove that exact session file and the matching Linux target
-file, replace the bootstrap credential securely, and restart.
 
 The same interactive Linux menu can register Windows targets. See the
 [HTTPS guide](https.md) for workload controls, measurement semantics, and JSON
@@ -249,8 +235,8 @@ modules load correctly even when CTest is invoked from PowerShell 7.
 These tests provision the public certificate, two bindings and three URL
 reservations on distinct ephemeral loopback ports. They exercise exclusive run
 ownership, bounded/split control JSON, lease expiry, live HTTP/HTTPS and worker
-switching, workload authentication and isolation, concurrent/persistent GET/PUT,
-TLS/cipher rejection, process cycle telemetry, and pairing across restarts,
+switching, workload isolation, concurrent/persistent GET/PUT,
+TLS/cipher rejection, process cycle telemetry, and control discovery across restarts,
 then remove their own resources. They do not change global cipher policy.
 
 For intentional manual endpoint removal, stop the server first and delete only
@@ -265,5 +251,5 @@ netsh http delete sslcert ipport=10.0.0.4:38445
 ```
 
 Remove the specific test certificate from `LocalMachine\My` only if you created
-it for this endpoint and no other endpoint uses it. Credential/state file removal
-and certificate rotation should be deliberate; prep/build never reset pairing.
+it for this endpoint and no other endpoint uses it. State-file removal and
+certificate rotation should be deliberate; prep/build never change endpoint identities.

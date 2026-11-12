@@ -103,30 +103,6 @@ function Get-WinlinSdk {
     return $null
 }
 
-# Apply the credential ACL atomically at creation, using the API available in each PowerShell edition.
-function New-WinlinPrivateFileStream {
-    param([Parameter(Mandatory)][string]$Path)
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $acl = [Security.AccessControl.FileSecurity]::new()
-    $acl.SetOwner($sid)
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($identity in @($sid, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
-                            [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))) {
-        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-            $identity, [Security.AccessControl.FileSystemRights]::FullControl,
-            [Security.AccessControl.AccessControlType]::Allow)
-        $acl.AddAccessRule($rule)
-    }
-    if ($PSVersionTable.PSEdition -eq 'Desktop') {
-        return [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew,
-            [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None,
-            4096, [IO.FileOptions]::None, $acl)
-    }
-    return [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path), [IO.FileMode]::CreateNew,
-        [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None,
-        4096, [IO.FileOptions]::None, $acl)
-}
-
 # Never repair permissions on an existing shared directory: that could break unrelated workloads.
 function Initialize-WinlinPrivateDirectory {
     param([Parameter(Mandatory)][string]$Path)

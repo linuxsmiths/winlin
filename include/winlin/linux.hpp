@@ -339,7 +339,7 @@ inline void wait_socket(StreamSocket& socket, Clock::time_point deadline) {
 
 // Finish the selected transport setup before sending bytes. A null context explicitly selects
 // plaintext for an advertised workload endpoint; HTTPS is never automatically downgraded.
-// TLS pins are checked before credentials; only interactive discovery may omit a TLS pin.
+// Only interactive discovery may omit a TLS pin.
 inline std::unique_ptr<StreamSocket> connect_stream(SSL_CTX* ctx, const std::string& host,
                                                     const std::string& port, const std::string& pin,
                                                     double timeout = 10) {
@@ -444,7 +444,7 @@ inline Json environment() {
             {"compiler", __VERSION__}};
 }
 
-// Validate the opened inode, not just its pathname, before reading credentials or target metadata.
+// Validate the opened inode, not just its pathname, before reading saved target metadata.
 // O_NONBLOCK prevents a hostile special file from hanging validation; only regular files pass.
 inline std::string read_private(const std::string& path, std::size_t maximum = 65536) {
     Fd file(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
@@ -482,62 +482,4 @@ inline std::string read_private(const std::string& path, std::size_t maximum = 6
     return content;
 }
 
-inline std::string token_file(const std::string& path) {
-    return parse_token(read_private(path, 258));
-}
-
-// Only absence means unpaired; permission and filesystem failures must not reset an existing
-// identity.
-inline std::optional<std::string> optional_token_file(const std::string& path) {
-    struct stat status{};
-    if (lstat(path.c_str(), &status) == 0) {
-        return token_file(path);
-    }
-    if (errno != ENOENT) {
-        throw system_error("Cannot inspect session file");
-    }
-    return std::nullopt;
-}
-
-// Create the credential exclusively with private permissions, then flush before publishing it.
-inline std::string issue_token_file(const std::string& path) {
-    unsigned char bytes[32]{};
-    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
-        throw tls_error("RAND_bytes");
-    }
-    constexpr char hex[] = "0123456789abcdef";
-    std::string secret;
-    for (auto byte : bytes) {
-        secret += hex[byte >> 4];
-        secret += hex[byte & 15];
-    }
-    Fd file(open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
-    if (file.value < 0) {
-        throw system_error("Cannot create session credential");
-    }
-    try {
-        const auto content = secret + "\n";
-        std::size_t offset{};
-        while (offset < content.size()) {
-            const auto count =
-                ::write(file.value, content.data() + offset, content.size() - offset);
-            if (count < 0 && errno == EINTR) {
-                continue;
-            }
-            if (count <= 0) {
-                throw system_error("Cannot write session credential");
-            }
-            offset += count;
-        }
-        if (fsync(file.value)) {
-            throw system_error("Cannot flush session credential");
-        }
-    } catch (...) {
-        if (unlink(path.c_str()) != 0) {
-            log_warning(system_error("Cannot remove incomplete session credential").what());
-        }
-        throw;
-    }
-    return secret;
-}
 }

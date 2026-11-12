@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Document the public benchmark identity and optional authenticated mode.
+# Document the public benchmark identity and host endpoint settings.
 usage() {
     cat <<'EOF'
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
@@ -13,8 +13,7 @@ Workload data defaults to HTTP port 38444 or HTTPS port 38445; host overrides:
 --http-port PORT and --https-port PORT. No server restart is needed between modes.
 Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
 An existing server.pem/server.key in the state directory takes precedence.
-Authentication is disabled by default; no pairing-token file is needed.
-Native --cert/--key override TLS defaults; explicit --token-file enables authentication.
+Native --cert/--key override TLS defaults.
 Place launcher options first. Relative overrides use the caller's working directory.
 Use -- --help for the native server's help, without requiring state files.
 
@@ -24,7 +23,7 @@ Examples:
   scripts/run-server.sh --state-dir /private/endpoint --http-port 39000 --https-port 39001
 
 The bundled identity provides no trustworthy server authentication.
-This script never resets pairing, overwrites existing credentials, or builds.
+This script never overwrites existing certificates/keys or builds.
 Runtime launches require a soft file-descriptor limit of at least 524288.
 The launcher raises only its own soft limit; the hard limit must allow this.
 EOF
@@ -91,10 +90,8 @@ if [[ -e "$state_dir/server.pem" || -L "$state_dir/server.pem" ||
     certificate="$state_dir/server.pem"
     private_key="$state_dir/server.key"
 fi
-token_file=""
 has_certificate=false
 has_private_key=false
-has_token_file=false
 server_arguments=("$@")
 
 # Inspect option positions only, not values. Add defaults only when the caller did not provide them;
@@ -108,10 +105,6 @@ for (( index = 0; index < ${#server_arguments[@]}; index += 2 )); do
         --key)
             private_key="${server_arguments[index + 1]}"
             has_private_key=true
-            ;;
-        --token-file)
-            token_file="${server_arguments[index + 1]}"
-            has_token_file=true
             ;;
     esac
 done
@@ -144,10 +137,6 @@ if [[ "$soft_fd_limit" != unlimited ]] && (( soft_fd_limit < minimum_fd_limit ))
     fi
 fi
 
-if "$has_token_file" && [[ ! -f "$token_file" || ! -r "$token_file" ]]; then
-    printf 'winlin server launcher: FATAL: state file is missing or unreadable: %s\n' "$token_file" >&2
-    exit 1
-fi
 if [[ "$certificate" == "$repo_root/certs/benchmark/server.pem" ]]; then
     echo 'winlin server launcher: WARNING: using the PUBLIC benchmark certificate/key; no trustworthy server identity.' >&2
 fi

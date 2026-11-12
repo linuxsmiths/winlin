@@ -13,7 +13,7 @@ For Windows server provisioning, see the [Windows guide](windows.md).
 - Persistent GET, PUT, or mixed workloads with configurable object sizes,
   connections, worker threads, warmup, duration, request limit, and repetitions.
 - Interactive target selection and benchmark configuration, or noninteractive
-  `pair`, `inspect`, and `run` commands.
+  `add`, `inspect`, and `run` commands.
 - Client/server process CPU time, peak resident memory, available context switches, server
   operation counters, latency histograms, throughput, measured cycles per I/O when available,
   and saved JSON results.
@@ -23,7 +23,7 @@ Connections are distributed across a configurable number of worker threads,
 rather than creating one thread per connection. The server uses SO_REUSEPORT
 listeners. Windows uses HTTP.sys, Schannel and IOCP for asynchronous HTTP
 processing. Shared agent logic and a shared HTTPS contract test keep
-authentication, discovery, object semantics, and result fields aligned.
+discovery, run leases, object semantics, and result fields aligned.
 Both implementations still need tuning and validation on large machines.
 
 ## Local quickstart
@@ -37,8 +37,7 @@ No manual certificate setup is needed. In one terminal, start the server:
 ```
 
 The launcher uses `build/winlin-server`, the **deliberately public** certificate/key
-in `certs/benchmark/`. Authentication is disabled by default on both OSes:
-no token files, credential transfer, or authentication prompts are needed.
+in `certs/benchmark/`.
 The bundled identity provides **no trustworthy server authentication**: anyone
 can impersonate it. Use only on isolated synthetic benchmark networks.
 
@@ -47,8 +46,6 @@ a partial custom pair is an error, not a reason to fall back to the public pair.
 Override directories with
 `--build-dir PATH` and `--state-dir PATH` before native server options.
 Individual `--cert` and `--key` options override the TLS defaults.
-Explicit `--token-file FILE` enables optional authentication; existing token and
-session files are otherwise ignored, not deleted.
 For example:
 
 ```sh
@@ -57,9 +54,8 @@ For example:
 ```
 
 Default directories are repository-relative; supplied relative paths use your
-current directory. No launcher resets pairing, overwrites existing credentials,
-builds, or changes system-wide host settings. An explicit missing `--token-file`
-remains an error. Direct executable invocations remain supported.
+current directory. No launcher overwrites certificates/keys, builds, or changes
+system-wide host settings. Direct executable invocations remain supported.
 
 Both Linux launchers raise their process's soft file-descriptor limit to at least
 524,288 (512K), leaving higher limits and the hard limit unchanged. A lower hard
@@ -89,8 +85,8 @@ distinct from control. Allow all three ports from the benchmark client only.
 
 One exclusive, automatically issued run lease owns the workload. Concurrent start
 requests receive HTTP 409. The client stops the workload after completion or a
-caught failure; an abandoned workload expires after its bounded lease. Lease
-credentials require no user interaction and are omitted from results. Plain HTTP
+caught failure; an abandoned workload expires after its bounded lease. Run IDs
+are managed automatically and omitted from results. Plain HTTP
 provides no data confidentiality; use synthetic traffic on an isolated network.
 Server startup `--workers`, `--max-connections`, and `--cipher` configure control
 only; the client controls the workload's values separately.
@@ -104,7 +100,7 @@ probes, but does not prevent scanning or replace network isolation.
 The client already knows the bundled certificate, so no fingerprint entry is needed:
 
 ```sh
-./scripts/run-client.sh pair \
+./scripts/run-client.sh add \
   --host 127.0.0.1 \
   --target .winlin-local/local.json
 
@@ -112,37 +108,18 @@ The client already knows the bundled certificate, so no fingerprint entry is nee
 ```
 
 Remote testing uses the same command with the server's IP; no files need copying.
-Any reachable client can run benchmarks in this default mode. Use only an isolated
+Any reachable client can run benchmarks. Use only an isolated
 test network and restrict the port with firewall/VNet rules. Custom identities
 require `--fingerprint SHA256`; their fingerprint
 must be verified independently. This implementation uses exact certificate
 pinning, not CA-chain or certificate-expiry validation; a different certificate
 is rejected, even when no `--fingerprint` was provided.
 
-Default registration is repeatable and stores the endpoint, certificate pin, and
-cipher locally, without an access credential. Existing unauthenticated targets
-remain usable across server restarts.
-
-For optional authenticated mode, create a private token with
-`(umask 077; openssl rand -hex 32 > /path/to/new-pairing-token)` at a new path and
-start the server with `--token-file /path/to/new-pairing-token`. Transfer that file
-privately to the client and pass `--token-file FILE` to CLI `pair`. The client checks
-the pin before sending credentials, but the public fixture still cannot establish
-a trustworthy identity. Use a custom identity when authentication matters.
-Explicit token pairing consumes the bootstrap credential and exchanges it
-for a persistent access credential. The server saves this in
-`PAIRING-TOKEN-FILE.session` by default; `--session-file` overrides the location.
-The client saves its credential and certificate pin in the target JSON file.
-Linux files must remain private to their owner (mode `0600`); Windows credentials
-require an owner-only DACL that may also grant SYSTEM and Administrators access.
-Restarting the
-server preserves the pairing. Currently one controller credential is supported;
-additional independent controller identities and credential rotation are future
-work.
-
-To deliberately reset pairing, stop the server, remove its specific session
-credential file and the corresponding client target file, generate a fresh
-bootstrap credential, and restart. Do not delete these files during a run.
+Registration stores only the endpoint, certificate pin, and cipher locally.
+Saved targets remain usable across server restarts; existing target files also
+remain readable. Files must be owned by the current user with private permissions
+(mode `0600`). Client authentication is not supported; TLS server-certificate
+verification and automatic benchmark run leases are separate mechanisms.
 
 Alternatively, run `./scripts/run-client.sh` and select **Add server**. It prompts
 only for the IP address, port, and cipher. The bundled certificate
@@ -172,7 +149,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
 
 The launcher prefers this pair on subsequent starts. Obtain its fingerprint with
 `openssl x509 -in .winlin-local/server.pem -outform DER | openssl dgst -sha256`
-and pass the 64 hexadecimal digits as `--fingerprint SHA256` when pairing.
+and pass the 64 hexadecimal digits as `--fingerprint SHA256` when adding a server.
 Do not replace an existing endpoint identity unintentionally: saved client pins
 will correctly reject a different certificate.
 
@@ -235,7 +212,7 @@ HTTP pipelining, HTTP/2, and paced/open-loop arrivals are not implemented.
 GET returns bytes from a pre-generated, reusable server buffer. PUT is
 acknowledged only after its complete body has been consumed and discarded.
 Payload generation happens outside the measured workload. There is no storage
-I/O, but encryption, buffering, memory copies, HTTP parsing, and authentication
+I/O, but encryption, buffering, memory copies, HTTP parsing, and run-ID checks
 remain part of the measured stack. An automatically supplied per-run lease is
 checked on each request in both HTTP and HTTPS modes. Control and workload traffic
 use different listeners in the same process, so telemetry still includes control
@@ -245,7 +222,7 @@ overhead.
 
 Control and TLS workloads default to `TLS_AES_128_GCM_SHA256`. Client `run --cipher`
 selects the workload cipher on both ends without changing the saved control
-connection. Startup server `--cipher` and client `pair --cipher` configure control
+connection. Startup server `--cipher` and client `add --cipher` configure control
 only. Cipher/TLS fields are `null` for plain HTTP. Unsupported selections fail;
 there is no silent cipher substitution.
 
@@ -292,7 +269,11 @@ JSON output defaults to a uniquely named file under `results/`; `--output`
 selects another path. Existing output files are not overwritten on startup.
 Completed repetitions are saved as the run progresses, and a caught run failure
 is recorded with `status: failed`. Abrupt termination may leave `status: running`.
-Treat target files as secrets; result files deliberately omit access credentials.
+Target files contain server addresses and certificate pins; results omit run IDs.
+
+Server details put `environment` first, with OS, kernel, architecture and CPU
+count before library/build metadata, followed by backend and effective workload
+settings. JSON output preserves this order rather than sorting keys alphabetically.
 
 Results contain the effective workload and cipher, client/server environment and
 build details, backend/offload capabilities, process telemetry snapshots and

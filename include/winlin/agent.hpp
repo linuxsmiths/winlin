@@ -4,9 +4,6 @@
 
 #include <atomic>
 #include <functional>
-#include <memory>
-#include <mutex>
-#include <optional>
 #include <thread>
 
 namespace winlin {
@@ -32,9 +29,6 @@ struct AgentConfig {
     std::string process_cpu_scope{"server process only"};
 
     static AgentConfig from_args(const Args& args, std::string backend) {
-        if (!args.get("--session-file").empty() && args.get("--token-file").empty()) {
-            throw std::invalid_argument("--session-file requires --token-file");
-        }
         AgentConfig result;
         result.backend = std::move(backend);
         result.cipher = args.get("--cipher", result.cipher);
@@ -74,16 +68,10 @@ struct AgentReply {
     }
 };
 
-// Keep authentication, routes and result schemas identical across Linux and Windows. Native worker
-// threads share this instance; pairing is serialized and published credentials/counters are atomic.
-// Platform callbacks must persist credentials before publication and must never log their contents.
-// An empty bootstrap disables authentication and credential persistence for isolated benchmarks.
+// Keep routes and result schemas identical across native servers. Workers share atomic counters;
+// an immutable workload run ID associates data requests with the controller's active lease.
 class Agent {
-    std::string bootstrap_;
-    std::atomic<std::shared_ptr<const std::string>> credential_;
-    std::mutex pairing_mutex_;
-    std::function<std::string()> issue_credential_;
-    std::function<bool(std::string_view, std::string_view)> equal_;
+    std::string run_id_;
     std::function<Json()> process_usage_;
 
 public:
@@ -92,15 +80,12 @@ public:
     std::atomic<std::uint64_t> connections{}, handshakes{}, tx_ktls{}, rx_ktls{};
     std::atomic<std::uint64_t> gets{}, puts{}, get_bytes{}, put_bytes{}, active{};
 
-    Agent(AgentConfig settings, std::string bootstrap, std::optional<std::string> credential,
-          std::function<std::string()> issue,
-          std::function<bool(std::string_view, std::string_view)> equal,
-          std::function<Json()> process_usage)
-        : bootstrap_(std::move(bootstrap)), issue_credential_(std::move(issue)),
-          equal_(std::move(equal)), process_usage_(std::move(process_usage)),
+    // Workload adapters must supply the active lease ID; control needs no saved client state.
+    Agent(AgentConfig settings, std::function<Json()> process_usage, std::string run_id = {})
+        : run_id_(std::move(run_id)), process_usage_(std::move(process_usage)),
           config(std::move(settings)) {
-        if (credential) {
-            credential_.store(std::make_shared<const std::string>(*credential));
+        if (config.role == AgentConfig::Role::workload && run_id_.empty()) {
+            throw std::invalid_argument("Workload requires an active run ID");
         }
     }
 
@@ -131,35 +116,31 @@ public:
                    unavailable.end()) {
             unavailable.push_back("hardware_cycles");
         }
-        return {
-            {"protocol_version", 1},
-            {"environment", config.environment},
-            {"backend", config.backend},
-            {"authentication", config.role == AgentConfig::Role::workload ? "run_lease"
-                               : bootstrap_.empty()                       ? "none"
-                                                                          : "token"},
-            {"transport", config.tls ? "https" : "http"},
-            {"tls_version", config.tls ? Json(connection.tls_version) : Json(nullptr)},
-            {"cipher", config.tls ? Json(connection.cipher) : Json(nullptr)},
-            {"benchmark_control", controller != nullptr},
-            {"benchmark_tls_modes", config.benchmark_tls_modes},
-            {"http_version", "1.1"},
-            {"ktls_tx", connection.ktls_tx},
-            {"ktls_rx", connection.ktls_rx},
-            {"max_object_size_bytes", max_object_size},
-            {"max_connections", config.connection_limit},
-            {"workers", config.workers},
-            {"load_modes", {"closed_loop"}},
-            {"handshake_benchmark", false},
-            {"unavailable_metrics", unavailable},
-            {"cpu_cycles_source", process.value("cpu_cycles_source", Json(nullptr))},
-            {"cpu_cycles_unavailable_reason",
-             process.value("cpu_cycles_unavailable_reason", Json("Not collected"))},
-            {"process_cpu_scope", config.process_cpu_scope},
-            {"telemetry_scope", "whole server process including control; one active run lease"}};
+        return {{"environment", config.environment},
+                {"backend", config.backend},
+                {"transport", config.tls ? "https" : "http"},
+                {"tls_version", config.tls ? Json(connection.tls_version) : Json(nullptr)},
+                {"cipher", config.tls ? Json(connection.cipher) : Json(nullptr)},
+                {"workers", config.workers},
+                {"max_connections", config.connection_limit},
+                {"benchmark_control", controller != nullptr},
+                {"benchmark_tls_modes", config.benchmark_tls_modes},
+                {"http_version", "1.1"},
+                {"ktls_tx", connection.ktls_tx},
+                {"ktls_rx", connection.ktls_rx},
+                {"max_object_size_bytes", max_object_size},
+                {"load_modes", {"closed_loop"}},
+                {"handshake_benchmark", false},
+                {"unavailable_metrics", unavailable},
+                {"cpu_cycles_source", process.value("cpu_cycles_source", Json(nullptr))},
+                {"cpu_cycles_unavailable_reason",
+                 process.value("cpu_cycles_unavailable_reason", Json("Not collected"))},
+                {"process_cpu_scope", config.process_cpu_scope},
+                {"telemetry_scope", "whole server process including control; one active run lease"},
+                {"protocol_version", 1}};
     }
 
-    // Enforce optional authentication before dispatching without changing the requested workload.
+    // Enforce the selected transport and workload lease before dispatching a bounded request.
     AgentReply request(const HttpHead& head, const ConnectionInfo& connection,
                        std::string_view body = {}) {
         try {
@@ -184,20 +165,10 @@ public:
                  path != "/v1/capabilities")) {
                 return AgentReply::error(404, "Use the advertised control or workload endpoint");
             }
-            const bool pairing = method == "POST" && path == "/v1/pair";
-            if (!bootstrap_.empty()) {
-                const auto credential = credential_.load();
-                const auto auth = head.fields.find("authorization");
-                const std::string_view supplied =
-                    auth == head.fields.end() ? std::string_view{} : auth->second;
-                std::string expected = "Bearer ";
-                if (pairing) {
-                    expected += bootstrap_;
-                } else if (credential) {
-                    expected += *credential;
-                }
-                if ((!pairing && !credential) || !equal_(supplied, expected)) {
-                    return AgentReply::error(401, "unauthorized");
+            if (config.role == AgentConfig::Role::workload) {
+                const auto run = head.fields.find("x-winlin-run");
+                if (run == head.fields.end() || run->second != run_id_) {
+                    return AgentReply::error(409, "Workload run ID does not match active lease");
                 }
             }
             AgentReply reply;
@@ -221,24 +192,6 @@ public:
             } else if (controller && method == "POST" &&
                        path.starts_with("/v1/benchmark/stop?run_id=") && !head.length) {
                 reply.text = controller->stop(std::string_view(path).substr(26)).dump();
-            } else if (pairing) {
-                if (head.length) {
-                    return AgentReply::error(400, "Pairing body must be empty");
-                }
-                if (bootstrap_.empty()) {
-                    // Default registration has no credential or exclusive controller ownership.
-                    reply.text = Json{{"access_token", ""}}.dump();
-                } else {
-                    std::lock_guard lock(pairing_mutex_);
-                    // A concurrent pairing may have won after the earlier authentication snapshot.
-                    if (credential_.load()) {
-                        return AgentReply::error(409, "already paired");
-                    }
-                    const auto token = issue_credential_();
-                    credential_.store(std::make_shared<const std::string>(token));
-                    reply.text = Json{{"access_token", token}}.dump();
-                }
-                reply.close = true;
             } else if (method == "GET" && path == "/v1/capabilities" && !head.length) {
                 reply.text = capabilities(connection).dump();
             } else if (method == "GET" && path == "/v1/telemetry" && !head.length) {

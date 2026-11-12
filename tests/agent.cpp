@@ -11,11 +11,11 @@ void require(bool condition, const char* message) {
     }
 }
 
-HttpHead head(std::string method, std::string path, std::string token, std::size_t length = 0) {
+HttpHead head(std::string method, std::string path, std::string run_id, std::size_t length = 0) {
     return parse_head(method + " " + path +
                       " HTTP/1.1\r\nHost: 127.0.0.1:38443\r\n"
-                      "Authorization: Bearer " +
-                      token + "\r\nContent-Length: " + std::to_string(length) + "\r\n\r\n");
+                      "X-Winlin-Run: " +
+                      run_id + "\r\nContent-Length: " + std::to_string(length) + "\r\n\r\n");
 }
 
 // Exercise lease ownership and cleanup independently of privileged native listeners and counters.
@@ -48,34 +48,17 @@ struct TestBenchmark : BenchmarkInstance {
 
 int main() {
     try {
-        const std::string bootstrap(64, 'a'), access(64, 'b');
-        unsigned writes{};
+        const std::string access(64, 'b');
         AgentConfig config;
         config.backend = "httpsys-schannel";
         config.connection_metrics = false;
         config.workers = 2;
         config.environment = {{"os", "test"}};
-        // Isolate protocol behavior from native credential storage and process-counter providers.
-        auto issue = [&] {
-            ++writes;
-            return access;
-        };
-        auto equal = [](std::string_view a, std::string_view b) {
-            return a == b;
-        };
         auto process = [] {
             return Json{{"voluntary_context_switches", nullptr}};
         };
-        Agent agent(config, bootstrap, std::nullopt, issue, equal, process);
+        Agent agent(config, process);
         const ConnectionInfo tls{"TLSv1.3", config.cipher};
-        require(agent.request(head("GET", "/v1/capabilities", bootstrap), tls).status == 401,
-                "Bootstrap credential cannot run benchmarks");
-        auto paired = agent.request(head("POST", "/v1/pair", bootstrap), tls);
-        require(paired.status == 200 && Json::parse(paired.text).at("access_token") == access,
-                "Pairing exchanges bootstrap for a credential");
-        require(writes == 1, "Pairing persists exactly once");
-        require(agent.request(head("POST", "/v1/pair", bootstrap), tls).status == 409,
-                "Pairing is single-use");
         auto metadata = agent.request(head("GET", "/v1/capabilities", access), tls);
         require(Json::parse(metadata.text).at("backend") == config.backend,
                 "Shared capability schema");
@@ -95,43 +78,45 @@ int main() {
                 "Cipher mismatch is rejected");
         require(agent.telemetry().at("accepted_connections").is_null(),
                 "Unsupported counters are null");
-        Agent restarted(config, bootstrap, access, issue, equal, process);
+        Agent restarted(config, process);
         require(restarted.request(head("GET", "/v1/capabilities", access), tls).status == 200,
-                "Persisted credential survives restart");
+                "Control discovery needs no persistent client state after restart");
         config.backend = "openssl-ktls";
-        Agent ktls(config, bootstrap, access, issue, equal, process);
+        Agent ktls(config, process);
         require(ktls.request(head("GET", "/v1/object?size=256", access), tls).status == 501,
                 "kTLS TX cannot silently fall back");
         require(ktls.request(head("PUT", "/v1/object", access, 256), tls).status == 501,
                 "kTLS RX cannot silently fall back");
-        require(parse_token(bootstrap + "\r\n") == bootstrap, "CRLF credential portability");
-
         config.backend = "openssl";
-        Agent open(config, "", std::nullopt, issue, equal, process);
+        Agent open(config, process);
         const auto anonymous = parse_head(
             "GET /v1/capabilities HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
         const auto capabilities = open.request(anonymous, tls);
         require(capabilities.status == 200 &&
-                    Json::parse(capabilities.text).at("authentication") == "none",
-                "Default capabilities need no authentication");
-        const auto before_registration = writes;
-        for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            const auto registration = open.request(head("POST", "/v1/pair", ""), tls);
-            require(registration.status == 200 &&
-                        Json::parse(registration.text).at("access_token") == "",
-                    "Default registration is repeatable and has no credential");
-        }
-        require(writes == before_registration, "Default registration never writes credentials");
+                    !Json::parse(capabilities.text).contains("authentication"),
+                "Capabilities omit removed client settings");
+        require(open.request(head("POST", "/v1/pair", ""), tls).status == 404,
+                "Removed registration route is unavailable");
         require(open.request(head("GET", "/v1/object?size=512", ""), tls).kind ==
                     AgentReply::Kind::object,
-                "Default GET needs no credential");
+                "Standalone GET route");
         require(open.request(head("PUT", "/v1/object", "", 512), tls).kind ==
                     AgentReply::Kind::consume_put,
-                "Default PUT needs no credential");
+                "Standalone PUT route");
         require(open.request(head("GET", "/v1/telemetry", ""), tls).status == 200,
-                "Default telemetry needs no credential");
+                "Control telemetry route");
         require(open.request(anonymous, {"TLSv1.2", config.cipher}).status == 400,
-                "No-auth mode still enforces the benchmark TLS contract");
+                "Discovery still enforces the benchmark TLS contract");
+
+        config.role = AgentConfig::Role::workload;
+        Agent workload(config, process, access);
+        require(workload.request(head("GET", "/v1/object?size=256", ""), tls).status == 409,
+                "Workload requires its active run ID");
+        require(workload.request(head("GET", "/v1/object?size=256", "wrong"), tls).status == 409,
+                "Another run cannot issue workload requests");
+        require(workload.request(head("GET", "/v1/object?size=256", access), tls).kind ==
+                    AgentReply::Kind::object,
+                "Matching run ID permits workload requests");
 
         std::atomic<unsigned> live{};
         bool fail_sample = false;

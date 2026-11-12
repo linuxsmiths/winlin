@@ -15,9 +15,6 @@ import threading
 client = sys.argv[1]
 with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
     directory = Path(temporary)
-    token = directory / "token"
-    token.write_text("00" * 32 + "\n")
-    token.chmod(0o600)
     target = directory / "unreachable.json"
 
     # A bound but non-listening socket guarantees refusal without racing another process for a port.
@@ -25,8 +22,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
         refused.bind(("127.0.0.1", 0))
         port = refused.getsockname()[1]
         cases = [
-            ([client, "pair", "--host", "127.0.0.1", "--port", str(port),
-              "--token-file", str(token), "--target", str(target)], None, 1),
+            ([client, "add", "--host", "127.0.0.1", "--port", str(port),
+              "--target", str(target)], None, 1),
             ([client], f"1\n127.0.0.1\n{port}\n\n2\n0\n", 0),
         ]
         for arguments, input_text, expected in cases:
@@ -64,7 +61,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             })
         else:
             self.respond({
-                "authentication": "none", "backend": "test", "benchmark_control": True,
+                "backend": "test", "benchmark_control": True,
                 "benchmark_tls_modes": ["on", "off"],
                 "transport": "https" if self.server.encrypted else "http",
                 "workers": self.server.settings.get("workers", 8),
@@ -87,10 +84,11 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
             self.respond({"stopped": True})
         else:
-            self.respond({"access_token": ""})
+            self.respond({"error": "Unsupported route"}, status=404)
 
     def respond(self, payload, status=None):
         self.server.authorizations.append(self.headers.get("Authorization"))
+        self.server.run_ids.append(self.headers.get("X-Winlin-Run"))
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(self.server.response_status if status is None else status)
         self.send_header("Content-Length", str(len(body)))
@@ -106,6 +104,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     plain.peer, server.peer = server, plain
     for endpoint, encrypted in ((server, True), (plain, False)):
         endpoint.authorizations = []
+        endpoint.run_ids = []
         endpoint.response_status = 200
         endpoint.fail_workload = False
         endpoint.settings = {}
@@ -126,12 +125,18 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         for index in range(2):
             target = directory / f"client-{index}.json"
             result = subprocess.run(
-                [client, "pair", "--host", "127.0.0.1", "--port", port,
+                [client, "add", "--host", "127.0.0.1", "--port", port,
                  "--target", str(target)],
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 0, result.stdout + result.stderr
-            assert json.loads(target.read_text())["access_token"] == ""
+            assert "access_token" not in json.loads(target.read_text())
+            assert "authentication" not in result.stdout
+
+        # Older target metadata remains readable, but obsolete values never reach the wire.
+        saved = json.loads(target.read_text())
+        saved["access_token"] = "obsolete"
+        target.write_text(json.dumps(saved))
 
         result = subprocess.run(
             [client], input=f"1\n127.0.0.1\n{port}\n\n2\n1\n0\n",
@@ -139,9 +144,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "state")),
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "Paired target saved" in result.stdout, result.stdout + result.stderr
-        assert result.stdout.count('"authentication": "none"') == 2, result.stdout
-        assert "pairing-token" not in result.stdout
+        assert "Target saved" in result.stdout, result.stdout + result.stderr
+        assert "authentication" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
 
         benchmark = [
@@ -180,8 +184,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert report["workload_endpoint"]["transport"] == "http"
         assert report["configuration"]["tls_version"] is None
         assert report["server_capabilities"]["workers"] == 3
-        assert plain.authorizations and all(value == "Bearer " + "aa" * 32
-                                            for value in plain.authorizations)
+        assert plain.run_ids and all(value == "aa" * 32 for value in plain.run_ids)
+        assert all(value is None for value in plain.authorizations)
 
         server.fail_workload = True
         output = directory / "failed-benchmark.json"
@@ -201,26 +205,14 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert note not in result.stdout + result.stderr
         server.fail_workload = False
 
-        token = directory / "optional-token"
-        token.write_text("00" * 32 + "\n")
-        token.chmod(0o600)
         rejected = directory / "rejected.json"
+        server.response_status = 503
         result = subprocess.run(
-            [client, "pair", "--host", "127.0.0.1", "--port", port,
-             "--target", str(rejected), "--token-file", str(token)],
+            [client, "add", "--host", "127.0.0.1", "--port", port, "--target", str(rejected)],
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 1, result.stdout + result.stderr
-        assert "Server authentication is disabled" in result.stderr, result.stderr
-        assert not rejected.exists()
-
-        server.response_status = 401
-        result = subprocess.run(
-            [client, "pair", "--host", "127.0.0.1", "--port", port, "--target", str(rejected)],
-            capture_output=True, text=True, timeout=15,
-        )
-        assert result.returncode == 1, result.stdout + result.stderr
-        assert "Restart it without --token-file" in result.stderr, result.stderr
+        assert "Server rejected control request (HTTP 503)" in result.stderr, result.stderr
         assert not rejected.exists()
     finally:
         server.shutdown()

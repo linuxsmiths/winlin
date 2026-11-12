@@ -14,8 +14,7 @@ convenience, not a secret or access credential.
 
 Use only on isolated benchmark networks with synthetic data. Never reuse this key
 for a real identity, install the certificate as a trusted root, or replace these
-fixtures with real credentials. Pairing tokens and saved controller credentials
-remain private and must not be checked into Git.
+fixtures with real credentials.
 
 Custom Linux `--cert`/`--key`, Windows `-CertificateThumbprint`, and client
 `--fingerprint` options remain available. Existing Linux certificate/key files in

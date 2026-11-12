@@ -30,7 +30,7 @@ def command(*arguments, expected=0, **kwargs):
 
 
 class Controller:
-    """Own only test-created processes; keep their guard, credentials and diagnostics isolated."""
+    """Own only test-created processes; keep their guard and diagnostics isolated."""
 
     def __init__(self, directory, bind=None, extra=()):
         self.directory = directory
@@ -50,7 +50,6 @@ class Controller:
             assert line, self.process.stderr.read()
             self.ready = json.loads(line)
             self.port = self.ready["port"]
-            self.token = None
         except BaseException:
             self.stop()
             raise
@@ -71,8 +70,7 @@ class Controller:
             host, self.port, context=tls_context(), timeout=10,
         )
         try:
-            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-            connection.request(method, path, body=body, headers=headers)
+            connection.request(method, path, body=body)
             response = connection.getresponse()
             payload = response.read()
             return response.status, json.loads(payload)
@@ -105,8 +103,8 @@ class Workload:
         options = {} if lease["transport"] == "http" else {"context": tls_context()}
         self.connection = connection_type("127.0.0.1", lease["port"], timeout=10, **options)
 
-    def request(self, method, path, body=None, authorized=True):
-        headers = {"Authorization": f"Bearer {self.lease['run_id']}"} if authorized else {}
+    def request(self, method, path, body=None, include_run=True):
+        headers = {"X-Winlin-Run": self.lease['run_id']} if include_run else {}
         self.connection.request(method, path, body=body, headers=headers)
         response = self.connection.getresponse()
         return response.status, response.read()
@@ -120,21 +118,24 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert controller.request("GET", "/v1/capabilities", host="127.0.0.2")[0] == 200
         status, capabilities = controller.request("GET", "/v1/capabilities")
         assert status == 200 and capabilities["benchmark_control"]
+        assert "authentication" not in capabilities
+        assert next(iter(capabilities)) == "environment"
+        assert list(capabilities["environment"])[:2] == ["os", "kernel"]
+        assert controller.request("POST", "/v1/pair")[0] == 404
         assert capabilities["benchmark_tls_modes"] == ["on", "off", "ktls"]
         assert controller.request("GET", "/v1/object?size=512")[0] == 404
         exercise_single_instance([SERVER], controller.port)
 
         target = directory / "client/target.json"
         command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+            CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
             "--target", target,
         )
-        assert json.loads(target.read_text())["access_token"] == ""
+        assert "access_token" not in json.loads(target.read_text())
         assert target.stat().st_mode & 0o777 == 0o600
-        assert not (directory / "pairing-token").exists()
         bad_target = directory / "wrong-pin.json"
         refused = command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+            CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
             "--target", bad_target, "--fingerprint", "00" * 32, expected=1,
         )
         assert "certificate changed" in refused.stderr and not bad_target.exists()
@@ -175,7 +176,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             assert status == 200 and metadata["transport"] == "http"
             assert metadata["tls_version"] is None and metadata["cipher"] is None
             assert metadata["workers"] == 3 and metadata["max_connections"] == 32
-            assert data.request("GET", "/v1/object?size=256", authorized=False)[0] == 401
+            assert "authentication" not in metadata
+            assert data.request("GET", "/v1/object?size=256", include_run=False)[0] == 409
             for size in (0, 256, 4096, 65536, 4194304):
                 status, payload = data.request("GET", f"/v1/object?size={size}")
                 assert status == 200 and len(payload) == size
@@ -185,7 +187,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             with socket.create_connection(("127.0.0.1", lease["port"]), timeout=5) as raw:
                 raw.sendall(
                     (f"GET /v1/object?size=512 HTTP/1.1\r\nHost: localhost\r\n"
-                     f"Authorization: Bearer {lease['run_id']}\r\n\r\n").encode()
+                     f"X-Winlin-Run: {lease['run_id']}\r\n\r\n").encode()
                 )
                 response = http.client.HTTPResponse(raw)
                 response.begin()
@@ -226,6 +228,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             assert '"server_cpu_percent"' in invocation.stdout
             assert '"server_cycles_per_io"' in invocation.stdout
             assert "run_id" not in output.read_text() and "access_token" not in output.read_text()
+            assert "authentication" not in invocation.stdout + output.read_text()
+            assert next(iter(report["server_capabilities"])) == "environment"
+            assert list(report["server_capabilities"]["environment"])[:2] == ["os", "kernel"]
             for repetition in report["results"]:
                 assert repetition["completed"] == repetition["issued"] == 100
                 assert repetition["errors"] == 0
@@ -274,45 +279,18 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 raise AssertionError("Explicit loopback override accepted another IPv4 address")
         except ConnectionRefusedError:
             pass
-        # A fresh menu still needs no token, transport option, or certificate confirmation.
+        # A fresh menu discovers control without transport options or fixture confirmation.
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n\n2\n1\n"
                            f"3\n1\noff\n2\n32\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
-        assert "Paired target saved" in menu.stdout
-        assert "pairing-token" not in menu.stdout and "Trust this certificate?" not in menu.stdout
+        assert "Target saved" in menu.stdout
+        assert "authentication" not in menu.stdout and "Trust this certificate?" not in menu.stdout
         menu_report = json.loads(menu_output.read_text())
         assert menu_report["benchmark"] == "http"
         assert menu_report["server_configuration"]["workers"] == 2
-    finally:
-        controller.stop()
-
-    # Optional host authentication must protect control without leaking its credential to data.
-    authenticated = directory / "authenticated"
-    authenticated.mkdir()
-    token_file = authenticated / "bootstrap"
-    token_file.write_text("ab" * 32 + "\n")
-    token_file.chmod(0o600)
-    controller = Controller(authenticated, extra=("--token-file", str(token_file)))
-    try:
-        assert controller.request("GET", "/v1/capabilities")[0] == 401
-        target = authenticated / "target.json"
-        command(CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
-                "--target", target, "--token-file", token_file)
-        command(CLIENT, "inspect", "--target", target)
-        command(CLIENT, "run", "--target", target, "--tls", "off",
-                "--connections", "1", "--workers", "1", "--warmup", "0", "--duration", "1",
-                "--requests", "2", "--repetitions", "1", "--output", authenticated / "result.json")
-    finally:
-        controller.stop()
-    controller = Controller(authenticated, extra=("--token-file", str(token_file)))
-    try:
-        saved = json.loads(target.read_text())
-        saved["port"] = str(controller.port)
-        target.write_text(json.dumps(saved))
-        command(CLIENT, "inspect", "--target", target)
     finally:
         controller.stop()
 
@@ -326,13 +304,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     try:
         target = custom / "target.json"
         refused = command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+            CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
             "--target", target, expected=1,
         )
         assert "certificate changed" in refused.stderr and not target.exists()
         pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(
             (custom / "server.pem").read_text())).hexdigest()
-        command(CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+        command(CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
                 "--target", target, "--fingerprint", pin)
     finally:
         controller.stop()

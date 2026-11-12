@@ -16,7 +16,7 @@ Examples:
   scripts/run-client.sh inspect --target .winlin-local/local.json
   scripts/run-client.sh --build-dir build-client run --target target.json
 
-This script does not build, pair targets, or change credentials.
+This script does not build or change saved targets.
 Runtime launches require a soft file-descriptor limit of at least 524288.
 The launcher raises only its own soft limit; the hard limit must allow this.
 EOF

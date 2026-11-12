@@ -68,7 +68,7 @@ public:
     virtual Json telemetry() const = 0;
 };
 
-// Preserve protocol error statuses across native adapters without logging credentials or bodies.
+// Preserve protocol error statuses across native adapters without logging run IDs or bodies.
 class BenchmarkError : public std::runtime_error {
 public:
     int status;

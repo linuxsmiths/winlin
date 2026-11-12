@@ -91,8 +91,8 @@ class Scripts(unittest.TestCase):
             executable = self.checkout / "build" / name
             executable.write_text(f"#!{sys.executable}\n" + MOCK)
             executable.chmod(0o755)
-        for name in ("server.pem", "server.key", "pairing-token"):
-            (self.checkout / ".winlin-local" / name).write_text("launcher fixture, not a credential")
+        for name in ("server.pem", "server.key"):
+            (self.checkout / ".winlin-local" / name).write_text("launcher fixture")
 
     def run_script(self, script, *arguments, expected=0, fd_limits=None, **environment):
         """Run from outside the repository to catch accidental working-directory assumptions."""
@@ -218,10 +218,10 @@ class Scripts(unittest.TestCase):
         result = self.run_script(
             "run-server.sh", "--state-dir", "private state", "--",
             "--cert", str(custom / "server.pem"), "--key", str(custom / "server.key"),
-            "--token-file", str(custom / "pairing-token"), "--backend", "ktls",
+            "--backend", "ktls",
         )
         arguments = json.loads(result.stdout)["arguments"]
-        for option in ("--cert", "--key", "--token-file"):
+        for option in ("--cert", "--key"):
             self.assertEqual(arguments.count(option), 1)
         self.assertEqual(arguments[-2:], ["--backend", "ktls"])
 
@@ -250,7 +250,7 @@ class Scripts(unittest.TestCase):
         )
         self.run_script("run-server.sh", "--workers", expected=2)
         self.assertEqual(len(self.calls("winlin-server")), before)
-        # Native help must not require a certificate or pairing state.
+        # Native help must not require certificate files.
         result = self.run_script("run-server.sh", "--state-dir", "missing state", "--", "--help")
         self.assertEqual(json.loads(result.stdout)["arguments"], ["--help"])
 
@@ -280,8 +280,8 @@ class Scripts(unittest.TestCase):
                     result = self.run_script(script, fd_limits=(524289, hard))
                     self.assertEqual(json.loads(result.stdout)["soft_fd_limit"], 524289)
 
-    def test_server_launcher_public_identity_without_authentication(self):
-        """A fresh checkout needs no manual TLS setup or token files, even with old state."""
+    def test_server_launcher_public_identity(self):
+        """A fresh checkout needs no manual TLS setup or server state files."""
         state = self.directory / "fresh state"
         result = self.run_script("run-server.sh", "--state-dir", str(state))
         arguments = json.loads(result.stdout)["arguments"]
@@ -290,18 +290,7 @@ class Scripts(unittest.TestCase):
             "--key", str(self.checkout / "certs/benchmark/server.key"),
         ])
         self.assertIn("PUBLIC benchmark certificate", result.stderr)
-        token = state / "pairing-token"
-        self.assertFalse(token.exists())
-        self.assertNotIn("--token-file", arguments)
-        state.mkdir()
-        token.write_text("existing optional token\n")
-        self.run_script("run-server.sh", "--state-dir", str(state))
-        self.assertEqual(token.read_text(), "existing optional token\n")
-        missing = state / "explicitly missing token"
-        self.run_script(
-            "run-server.sh", "--state-dir", str(state), "--token-file", str(missing), expected=1,
-        )
-        self.assertFalse(missing.exists())
+        self.assertFalse(state.exists())
 
     def test_server_launcher_does_not_replace_partial_custom_identity(self):
         """A missing custom key must fail instead of switching an existing endpoint to public TLS."""

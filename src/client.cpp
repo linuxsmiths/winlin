@@ -12,10 +12,10 @@ namespace {
 using namespace winlin;
 namespace fs = std::filesystem;
 
-// Hold one approved server identity and its credential for controller/load workers. Never serialize
-// this entire object into benchmark reports or diagnostics; token is private target-file data.
+// Hold the saved server identity and an optional workload lease, shared read-only by load workers.
+// Run IDs exist only in memory and must not be serialized into results or saved targets.
 struct Target {
-    std::string host, port, pin, token, cipher;
+    std::string host, port, pin, run_id, cipher;
     bool tls{true};
 };
 
@@ -80,28 +80,21 @@ void write_private(const fs::path& path, const Json& value, bool exclusive) {
     }
 }
 
-// Validate saved identity/credentials without letting JSON parse errors echo secret file contents.
+// Validate saved server metadata without echoing file contents in parse errors.
 Target load_target(const std::string& path) {
     const auto content = read_private(path);
     try {
         const auto json = Json::parse(content);
-        Target result{json.at("host"), json.at("port"), json.at("certificate_sha256"),
-                      json.at("access_token"), json.at("cipher")};
+        Target result{json.at("host"), json.at("port"), json.at("certificate_sha256"), "",
+                      json.at("cipher")};
         check_host(result.host);
         if (!number(result.port, 65535)) {
             throw std::invalid_argument("Invalid port");
         }
         result.pin = checked_pin(result.pin);
-        if (!result.token.empty() &&
-            (result.token.size() != 64 ||
-             !std::all_of(result.token.begin(), result.token.end(), [](unsigned char ch) {
-                 return std::isxdigit(ch);
-             }))) {
-            throw std::invalid_argument("Invalid token");
-        }
         return result;
     } catch (const std::exception&) {
-        throw std::runtime_error("Invalid target file (credentials are not displayed)");
+        throw std::runtime_error("Invalid target file");
     }
 }
 
@@ -121,7 +114,7 @@ Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     const std::string request =
         method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
-        (target.token.empty() ? "" : "\r\nAuthorization: Bearer " + target.token) +
+        (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
         "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
         body;
     std::size_t sent{};
@@ -207,16 +200,14 @@ fs::path state_directory() {
     return directory;
 }
 
-// Register a target without credentials by default; an explicit token opts into authenticated
-// pairing.
-void pair_target(const std::string& host, const std::string& port, const std::string& token_path,
-                 const std::string& pin, const fs::path& output, const std::string& cipher) {
+// Verify the server's pinned capabilities before saving its address and TLS settings locally.
+void add_target(const std::string& host, const std::string& port, const std::string& pin,
+                const fs::path& output, const std::string& cipher) {
     check_host(host);
     if (!number(port, 65535)) {
         throw std::invalid_argument("Port must be positive");
     }
-    Target target{host, port, checked_pin(pin), token_path.empty() ? "" : token_file(token_path),
-                  cipher};
+    Target target{host, port, checked_pin(pin), "", cipher};
     if (target.pin == benchmark_certificate_sha256) {
         log_warning(
             "Using the public benchmark certificate; this does not authenticate server identity");
@@ -226,36 +217,13 @@ void pair_target(const std::string& host, const std::string& port, const std::st
     if (!output.parent_path().empty()) {
         fs::create_directories(output.parent_path());
     }
-    write_private(output, Json::object(), true);
-    try {
-        const auto response = exchange(ctx.get(), target, "POST", "/v1/pair");
-        if (response.status != 200) {
-            if (response.status == 401 && token_path.empty()) {
-                throw std::runtime_error(
-                    "Server requires authentication. Restart it without --token-file for automatic "
-                    "benchmark registration, or use CLI pair --token-file FILE");
-            }
-            throw std::runtime_error("Pairing rejected (HTTP " + std::to_string(response.status) +
-                                     ")");
-        }
-        target.token = Json::parse(response.body).at("access_token");
-        if (!token_path.empty() && target.token.empty()) {
-            throw std::runtime_error(
-                "Server authentication is disabled; omit --token-file for default registration");
-        }
-        write_private(output,
-                      {{"host", host},
-                       {"port", port},
-                       {"certificate_sha256", target.pin},
-                       {"access_token", target.token},
-                       {"cipher", cipher}},
-                      false);
-    } catch (...) {
-        fs::remove(output);
-        throw;
-    }
-    std::cout << "Paired target saved to " << output.string() << '\n';
-    std::cout << control(ctx.get(), target, "/v1/capabilities").dump(2) << '\n';
+    const auto capabilities = control(ctx.get(), target, "/v1/capabilities");
+    write_private(
+        output,
+        {{"host", host}, {"port", port}, {"certificate_sha256", target.pin}, {"cipher", cipher}},
+        true);
+    std::cout << "Target saved to " << output.string() << '\n';
+    std::cout << capabilities.dump(2) << '\n';
 }
 
 // Accumulate one worker's counters and histograms without shared hot-path locks. The controller
@@ -325,7 +293,7 @@ struct LoadConnection {
         const auto path = get ? "/v1/object?size=" + std::to_string(config.get_size) : "/v1/object";
         header = std::string(get ? "GET " : "PUT ") + path + " HTTP/1.1\r\nHost: " + target.host +
                  ":" + target.port +
-                 (target.token.empty() ? "" : "\r\nAuthorization: Bearer " + target.token) +
+                 (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
                  "\r\nContent-Length: " + std::to_string(get ? 0 : config.put_size) + "\r\n\r\n";
         offset = 0;
         input.clear();
@@ -905,7 +873,7 @@ std::string select_target() {
     }
     std::sort(paths.begin(), paths.end());
     if (paths.empty()) {
-        throw std::runtime_error("No registered targets; pair a server first");
+        throw std::runtime_error("No registered targets; add a server first");
     }
     for (std::size_t index = 0; index < paths.size(); ++index) {
         const auto target = load_target(paths[index]);
@@ -945,8 +913,8 @@ void interactive() {
                         continue;
                     }
                 }
-                pair_target(host, port, "", pin, state_directory() / (host + "-" + port + ".json"),
-                            cipher);
+                add_target(host, port, pin, state_directory() / (host + "-" + port + ".json"),
+                           cipher);
             } else if (action == "2") {
                 const auto target = load_target(select_target());
                 auto ctx = context(false, target.cipher);
@@ -1005,7 +973,7 @@ int main(int argc, char** argv) {
         if (command == "--help" || command == "help") {
             std::cout
                 << "winlin                         Interactive console\n"
-                   "winlin pair --host IP --target FILE [--token-file FILE] [--fingerprint "
+                   "winlin add --host IP --target FILE [--fingerprint "
                    "SHA256]\n"
                    "            [--port 38443] [--cipher TLS_AES_128_GCM_SHA256]\n"
                    "            Default: bundled PUBLIC benchmark certificate (no trusted "
@@ -1023,13 +991,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         Args args(argc, argv, 2);
-        if (command == "pair") {
-            args.allow(
-                {"--host", "--port", "--token-file", "--fingerprint", "--target", "--cipher"});
-            pair_target(args.require("--host"), args.get("--port", "38443"),
-                        args.get("--token-file"),
-                        args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
-                        args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));
+        if (command == "add" || command == "pair") {
+            args.allow({"--host", "--port", "--fingerprint", "--target", "--cipher"});
+            add_target(args.require("--host"), args.get("--port", "38443"),
+                       args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
+                       args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));
             return 0;
         }
         if (command == "inspect") {
