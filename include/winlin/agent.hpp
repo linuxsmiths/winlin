@@ -1,6 +1,6 @@
 #pragma once
 
-#include "winlin/core.hpp"
+#include "winlin/benchmark.hpp"
 
 #include <atomic>
 #include <functional>
@@ -17,7 +17,10 @@ constexpr std::uint16_t server_guard_port = 8444;
 // Describe platform capabilities without mixing transport APIs into the common agent. Native
 // adapters must explicitly mark counters and CPU attribution they cannot collect accurately.
 struct AgentConfig {
+    enum class Role { standalone, control, workload } role{Role::standalone};
     std::string backend;
+    bool tls{true};
+    std::vector<std::string> benchmark_tls_modes;
     std::string cipher{"TLS_AES_128_GCM_SHA256"};
     unsigned connection_limit{32768};
     unsigned workers{};
@@ -58,7 +61,7 @@ struct ConnectionInfo {
 // Tell a native transport whether to send text, reuse the object payload, or drain a PUT body.
 // A consume_put reply is not an acknowledgement: the transport must finish receiving it first.
 struct AgentReply {
-    enum class Kind { text, object, consume_put };
+    enum class Kind { text, object, consume_put, consume_control };
     int status{200};
     Kind kind{Kind::text};
     bool close{};
@@ -85,6 +88,7 @@ class Agent {
 
 public:
     AgentConfig config;
+    BenchmarkController* controller{};
     std::atomic<std::uint64_t> connections{}, handshakes{}, tx_ktls{}, rx_ktls{};
     std::atomic<std::uint64_t> gets{}, puts{}, get_bytes{}, put_bytes{}, active{};
 
@@ -119,27 +123,45 @@ public:
 
     // Include actual connection properties so selecting kTLS does not imply activation.
     Json capabilities(const ConnectionInfo& connection) const {
-        return {{"protocol_version", 1},
-                {"environment", config.environment},
-                {"backend", config.backend},
-                {"authentication", bootstrap_.empty() ? "none" : "token"},
-                {"tls_version", connection.tls_version},
-                {"cipher", connection.cipher},
-                {"http_version", "1.1"},
-                {"ktls_tx", connection.ktls_tx},
-                {"ktls_rx", connection.ktls_rx},
-                {"max_object_size_bytes", max_object_size},
-                {"max_connections", config.connection_limit},
-                {"workers", config.workers},
-                {"load_modes", {"closed_loop"}},
-                {"handshake_benchmark", false},
-                {"unavailable_metrics", config.unavailable_metrics},
-                {"process_cpu_scope", config.process_cpu_scope},
-                {"telemetry_scope", "whole server process; use an exclusive test target"}};
+        const auto process = process_usage_();
+        auto unavailable = config.unavailable_metrics;
+        if (process.contains("cpu_cycles") && !process.at("cpu_cycles").is_null()) {
+            std::erase(unavailable, "hardware_cycles");
+        } else if (std::find(unavailable.begin(), unavailable.end(), "hardware_cycles") ==
+                   unavailable.end()) {
+            unavailable.push_back("hardware_cycles");
+        }
+        return {
+            {"protocol_version", 1},
+            {"environment", config.environment},
+            {"backend", config.backend},
+            {"authentication", config.role == AgentConfig::Role::workload ? "run_lease"
+                               : bootstrap_.empty()                       ? "none"
+                                                                          : "token"},
+            {"transport", config.tls ? "https" : "http"},
+            {"tls_version", config.tls ? Json(connection.tls_version) : Json(nullptr)},
+            {"cipher", config.tls ? Json(connection.cipher) : Json(nullptr)},
+            {"benchmark_control", controller != nullptr},
+            {"benchmark_tls_modes", config.benchmark_tls_modes},
+            {"http_version", "1.1"},
+            {"ktls_tx", connection.ktls_tx},
+            {"ktls_rx", connection.ktls_rx},
+            {"max_object_size_bytes", max_object_size},
+            {"max_connections", config.connection_limit},
+            {"workers", config.workers},
+            {"load_modes", {"closed_loop"}},
+            {"handshake_benchmark", false},
+            {"unavailable_metrics", unavailable},
+            {"cpu_cycles_source", process.value("cpu_cycles_source", Json(nullptr))},
+            {"cpu_cycles_unavailable_reason",
+             process.value("cpu_cycles_unavailable_reason", Json("Not collected"))},
+            {"process_cpu_scope", config.process_cpu_scope},
+            {"telemetry_scope", "whole server process including control; one active run lease"}};
     }
 
     // Enforce optional authentication before dispatching without changing the requested workload.
-    AgentReply request(const HttpHead& head, const ConnectionInfo& connection) {
+    AgentReply request(const HttpHead& head, const ConnectionInfo& connection,
+                       std::string_view body = {}) {
         try {
             const auto first_space = head.first.find(' ');
             const auto last_space = head.first.rfind(' ');
@@ -148,12 +170,20 @@ public:
                 head.length > max_object_size) {
                 return AgentReply::error(400, "Expected HTTP/1.1 with Host and a bounded body");
             }
-            if (connection.tls_version != "TLSv1.3" || connection.cipher != config.cipher) {
+            if ((config.tls &&
+                 (connection.tls_version != "TLSv1.3" || connection.cipher != config.cipher)) ||
+                (!config.tls && (!connection.tls_version.empty() || !connection.cipher.empty()))) {
                 return AgentReply::error(
                     400, "Negotiated TLS version/cipher does not match server configuration");
             }
             const auto method = head.first.substr(0, first_space);
             const auto path = head.first.substr(first_space + 1, last_space - first_space - 1);
+            const bool object = path.starts_with("/v1/object");
+            if ((config.role == AgentConfig::Role::control && object) ||
+                (config.role == AgentConfig::Role::workload && !object &&
+                 path != "/v1/capabilities")) {
+                return AgentReply::error(404, "Use the advertised control or workload endpoint");
+            }
             const bool pairing = method == "POST" && path == "/v1/pair";
             if (!bootstrap_.empty()) {
                 const auto credential = credential_.load();
@@ -172,7 +202,26 @@ public:
             }
             AgentReply reply;
             reply.close = head.close;
-            if (pairing) {
+            if (controller && method == "POST" && path == "/v1/benchmark/start") {
+                if (!head.length || head.length > 65536) {
+                    return AgentReply::error(400, "Expected bounded JSON benchmark settings");
+                }
+                if (body.empty()) {
+                    reply.kind = AgentReply::Kind::consume_control;
+                    reply.size = head.length;
+                    return reply;
+                }
+                if (body.size() != head.length) {
+                    return AgentReply::error(400, "Incomplete benchmark settings");
+                }
+                reply.text = controller->start(Json::parse(body)).dump();
+            } else if (controller && method == "GET" &&
+                       path.starts_with("/v1/benchmark/telemetry?run_id=") && !head.length) {
+                reply.text = controller->telemetry(std::string_view(path).substr(31)).dump();
+            } else if (controller && method == "POST" &&
+                       path.starts_with("/v1/benchmark/stop?run_id=") && !head.length) {
+                reply.text = controller->stop(std::string_view(path).substr(26)).dump();
+            } else if (pairing) {
                 if (head.length) {
                     return AgentReply::error(400, "Pairing body must be empty");
                 }
@@ -212,8 +261,14 @@ public:
                 return AgentReply::error(404, "unsupported method or path");
             }
             return reply;
+        } catch (const BenchmarkError& error) {
+            return AgentReply::error(error.status, error.what());
+        } catch (const Json::exception&) {
+            return AgentReply::error(400, "Invalid benchmark JSON settings");
         } catch (const std::invalid_argument&) {
             return AgentReply::error(400, "invalid request");
+        } catch (const std::exception& error) {
+            return AgentReply::error(503, std::string("Benchmark service failed: ") + error.what());
         }
     }
 };

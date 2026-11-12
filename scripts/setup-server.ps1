@@ -2,6 +2,8 @@
 param(
     [string]$BindAddress = '127.0.0.1',
     [ValidateRange(1, 65535)][int]$Port = 38443,
+    [ValidateRange(1, 65535)][int]$HttpPort = 38444,
+    [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
     [string]$CertificateThumbprint = '',
     [switch]$RequireAuthentication
@@ -17,6 +19,9 @@ if ($ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $BindAdd
 }
 $BindAddress = $ip.ToString()
 if ($BindAddress -eq '0.0.0.0') { throw 'Use a specific IPv4 address, not a wildcard.' }
+if ($Port -eq $HttpPort -or $Port -eq $HttpsPort -or $HttpPort -eq $HttpsPort) {
+    throw 'Control, HTTP and HTTPS workload ports must be distinct.'
+}
 $state = [IO.Path]::GetFullPath($StateDirectory)
 Initialize-WinlinPrivateDirectory -Path $state
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -27,8 +32,10 @@ if ($RequireAuthentication -and (Test-Path -LiteralPath $tokenFile)) {
 $endpoint = "${BindAddress}:$Port"
 $url = "https://${BindAddress}:$Port/"
 $createdCertificate = $false
-$createdBinding = $false
-$createdUrl = $false
+$httpUrl = "http://${BindAddress}:$HttpPort/"
+$httpsUrl = "https://${BindAddress}:$HttpsPort/"
+$createdBindings = @()
+$createdUrls = @()
 $createdToken = $false
 # Track only resources created here, so rollback never removes an existing endpoint or certificate.
 try {
@@ -61,13 +68,18 @@ try {
         Write-Warning 'Using the PUBLIC benchmark certificate/key; this provides no trustworthy server identity.'
     }
     $thumbprint = $certificate.Thumbprint
-    Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'sslcert', "ipport=$endpoint",
-        "certhash=$thumbprint", 'certstorename=MY', 'appid={49071664-1d0a-4a82-bbb2-72878abc7ca2}',
-        'disablehttp2=enable', 'disablequic=enable', 'disablelegacytls=enable', 'disabletls12=enable') | Out-Host
-    $createdBinding = $true
-    Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'urlacl', "url=$url",
-        "user=$user", 'listen=yes', 'delegate=no') | Out-Host
-    $createdUrl = $true
+    foreach ($bindingEndpoint in @($endpoint, "${BindAddress}:$HttpsPort")) {
+        # Add, never update: a conflict must fail without overwriting an existing endpoint.
+        Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'sslcert', "ipport=$bindingEndpoint",
+            "certhash=$thumbprint", 'certstorename=MY', 'appid={49071664-1d0a-4a82-bbb2-72878abc7ca2}',
+            'disablehttp2=enable', 'disablequic=enable', 'disablelegacytls=enable', 'disabletls12=enable') | Out-Host
+        $createdBindings += $bindingEndpoint
+    }
+    foreach ($reservation in @($url, $httpUrl, $httpsUrl)) {
+        Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'urlacl', "url=$reservation",
+            "user=$user", 'listen=yes', 'delegate=no') | Out-Host
+        $createdUrls += $reservation
+    }
     if ($RequireAuthentication) {
         $random = [byte[]]::new(32)
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -88,7 +100,13 @@ try {
     [pscustomobject]@{
         BindAddress = $BindAddress
         Port = $Port
+        HttpPort = $HttpPort
+        HttpsPort = $HttpsPort
         Url = $url
+        HttpUrl = $httpUrl
+        HttpsUrl = $httpsUrl
+        Urls = $createdUrls
+        SslEndpoints = $createdBindings
         CertificateThumbprint = $thumbprint
         CertificateSha256 = $pin
         CreatedCertificate = $createdCertificate
@@ -102,14 +120,14 @@ catch {
             Remove-Item -LiteralPath $tokenFile
         }
     }
-    if ($createdUrl) {
+    foreach ($reservation in $createdUrls) {
         $null = Invoke-WinlinCleanup -Description 'URL reservation' -Action {
-            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'urlacl', "url=$url")
+            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'urlacl', "url=$reservation")
         }
     }
-    if ($createdBinding) {
+    foreach ($bindingEndpoint in $createdBindings) {
         $null = Invoke-WinlinCleanup -Description 'certificate binding' -Action {
-            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'sslcert', "ipport=$endpoint")
+            Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'delete', 'sslcert', "ipport=$bindingEndpoint")
         }
     }
     if ($createdCertificate) {

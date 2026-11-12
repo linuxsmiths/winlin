@@ -17,6 +17,33 @@ HttpHead head(std::string method, std::string path, std::string token, std::size
                       "Authorization: Bearer " +
                       token + "\r\nContent-Length: " + std::to_string(length) + "\r\n\r\n");
 }
+
+// Exercise lease ownership and cleanup independently of privileged native listeners and counters.
+struct TestBenchmark : BenchmarkInstance {
+    std::atomic<unsigned>& live;
+    BenchmarkOptions options;
+    bool fail_sample;
+
+    TestBenchmark(std::atomic<unsigned>& count, BenchmarkOptions settings, bool failure)
+        : live(count), options(std::move(settings)), fail_sample(failure) {
+        ++live;
+    }
+
+    ~TestBenchmark() override {
+        --live;
+    }
+
+    Json describe() const override {
+        return {{"port", 38444}, {"transport", options.tls == "off" ? "http" : "https"}};
+    }
+
+    Json telemetry() const override {
+        if (fail_sample) {
+            throw BenchmarkError(503, "test workload failed");
+        }
+        return {{"workers", options.workers}};
+    }
+};
 }
 
 int main() {
@@ -105,6 +132,52 @@ int main() {
                 "Default telemetry needs no credential");
         require(open.request(anonymous, {"TLSv1.2", config.cipher}).status == 400,
                 "No-auth mode still enforces the benchmark TLS contract");
+
+        std::atomic<unsigned> live{};
+        bool fail_sample = false;
+        BenchmarkController controller(
+            [&] {
+                return access;
+            },
+            [&](const BenchmarkOptions& options, const std::string&) {
+                return std::make_unique<TestBenchmark>(live, options, fail_sample);
+            });
+        open.controller = &controller;
+        open.config.role = AgentConfig::Role::control;
+        const auto settings = Json{{"tls", "off"}, {"workers", 3}}.dump();
+        const auto start = head("POST", "/v1/benchmark/start", "", settings.size());
+        require(open.request(start, tls).kind == AgentReply::Kind::consume_control,
+                "Control JSON must be fully buffered before starting workers");
+        auto started = open.request(start, tls, settings);
+        require(started.status == 200 && live == 1, "Starting creates exactly one workload");
+        require(open.request(start, tls, settings).status == 409, "Overlapping runs are rejected");
+        require(open.request(head("GET", "/v1/object?size=512", ""), tls).status == 404,
+                "Permanent control endpoint never serves benchmark objects");
+        require(open.request(head("GET", "/v1/benchmark/telemetry?run_id=wrong", ""), tls).status ==
+                    409,
+                "Another controller cannot sample the active run");
+        require(controller.telemetry(access).at("workers") == 3,
+                "Runtime settings reach the adapter");
+        controller.stop(access);
+        require(live == 0, "Stopping joins and releases the active runtime");
+        fail_sample = true;
+        controller.start({{"workers", 1}});
+        try {
+            controller.stop(access);
+            require(false, "Broken telemetry must be reported");
+        } catch (const BenchmarkError&) {
+        }
+        require(live == 0, "A failed final sample must still release the runtime");
+        fail_sample = false;
+        controller.start({{"tls", "off"}, {"workers", 2}, {"lease_seconds", 1}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+        require(live == 0, "An abandoned workload is stopped when its lease expires");
+        open.config.tls = false;
+        open.config.cipher.clear();
+        open.config.role = AgentConfig::Role::standalone;
+        require(open.request(anonymous, {}).status == 200, "Explicit HTTP mode accepts plaintext");
+        require(open.request(anonymous, tls).status == 400,
+                "HTTP mode does not silently accept TLS");
         std::cout << "Shared agent tests passed\n";
         return 0;
     } catch (const std::exception& failure) {

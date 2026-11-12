@@ -10,12 +10,16 @@ memory, networking, and kernel activity behind those results.
 
 ## Project status
 
-Winlin has native HTTPS server implementations for Linux (OpenSSL and kTLS) and
-Windows (HTTP.sys/Schannel), with an interactive/noninteractive Linux client,
+Winlin has native HTTP/HTTPS workload implementations for Linux (TCP, OpenSSL and
+kTLS) and Windows (HTTP.sys/Schannel), with an interactive/noninteractive Linux client,
 pairing and discovery, GET/PUT workloads, process telemetry, and JSON results.
 Both servers share agent routing, authentication, capabilities, and workload
 semantics. The kTLS backend verifies activation per direction and refuses
 userspace fallback.
+An always-HTTPS controller configures one exclusive run at a time: clients select
+workload TLS on/off, kTLS, cipher, server workers, and connection limits without
+restarting the server. Final summaries include server CPU usage, CPU time per I/O,
+and measured cycles per I/O when OS counters are available.
 
 **Paced load, handshake benchmarks, and hardware profiling are not implemented
 yet.** The broader architecture and benchmark areas below describe
@@ -71,8 +75,16 @@ Use the foreground launchers:
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
-The Linux HTTPS server listens on `0.0.0.0:38443` by default, accepting remote IPv4
+The Linux HTTPS controller listens on `0.0.0.0:38443` by default, accepting remote IPv4
 clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
+It advertises a separate per-run data endpoint: port 38444 for HTTP or 38445 for
+HTTPS/kTLS. Allow these ports from the client through firewall/VNet rules.
+Choose server tuning in the client benchmark menu, or for example:
+
+```sh
+./scripts/run-client.sh run --target .winlin-local/local.json \
+  --tls off --server-workers 32 --workers 16 --connections 1024
+```
 
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native

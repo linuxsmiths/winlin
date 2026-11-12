@@ -2,6 +2,7 @@
 #include "winlin/agent.hpp"
 
 #include <cstddef>
+#include <condition_variable>
 #include <cstring>
 #include <http.h>
 #include <iostream>
@@ -159,12 +160,15 @@ AgentConfig windows_config(const Args& args) {
         throw std::invalid_argument("Windows backend must be httpsys (HTTP.sys/Schannel)");
     }
     auto config = AgentConfig::from_args(args, "httpsys-schannel");
+    config.role = AgentConfig::Role::control;
+    config.benchmark_tls_modes = {"on", "off"};
     if (config.cipher != "TLS_AES_128_GCM_SHA256" && config.cipher != "TLS_AES_256_GCM_SHA384") {
         throw std::invalid_argument(
             "Schannel backend supports TLS_AES_128_GCM_SHA256 or TLS_AES_256_GCM_SHA384");
     }
     config.environment = environment();
     config.connection_metrics = false;
+    std::erase(config.unavailable_metrics, "hardware_cycles");
     config.unavailable_metrics.insert(config.unavailable_metrics.end(),
                                       {"accepted_connections", "active_connections",
                                        "tls_handshakes", "voluntary_context_switches",
@@ -173,6 +177,41 @@ AgentConfig windows_config(const Args& args) {
     config.process_cpu_scope =
         "application process only; excludes HTTP.sys/Schannel work charged to System";
     return config;
+}
+
+// Derive data-plane configuration only from the remotely requested run settings.
+AgentConfig workload_config(const AgentConfig& host, const BenchmarkOptions& options) {
+    if (options.tls == "ktls") {
+        throw BenchmarkError(501, "Windows HTTP.sys/Schannel does not support kTLS");
+    }
+    if (options.tls != "on" && options.tls != "off") {
+        throw std::invalid_argument("Windows TLS mode must be on or off");
+    }
+    if (options.tls == "on" && options.cipher != "TLS_AES_128_GCM_SHA256" &&
+        options.cipher != "TLS_AES_256_GCM_SHA384") {
+        throw std::invalid_argument("Unsupported Schannel TLS 1.3 cipher");
+    }
+    auto config = host;
+    config.role = AgentConfig::Role::workload;
+    config.tls = options.tls == "on";
+    config.backend = config.tls ? "httpsys-schannel" : "httpsys";
+    config.cipher = options.cipher;
+    config.workers = options.workers;
+    config.connection_limit = options.max_connections;
+    return config;
+}
+
+// Generate an ephemeral run bearer without creating or changing any host credential file.
+std::string issue_run_id() {
+    std::array<char, 32> bytes{};
+    randomize(bytes);
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    for (unsigned char byte : bytes) {
+        result += hex[byte >> 4];
+        result += hex[byte & 15];
+    }
+    return result;
 }
 
 // MinGW's HTTP header predates this Win8 ABI; MSVC uses the current SDK definition.
@@ -269,6 +308,9 @@ struct Request {
     std::array<char, 16384> body_buffer{};
     HTTP_REQUEST_ID id{};
     AgentReply reply;
+    HttpHead parsed_head;
+    ConnectionInfo connection;
+    std::string control_body;
     std::size_t remaining{};
     HTTP_RESPONSE response{};
     HTTP_DATA_CHUNK chunk{};
@@ -306,7 +348,7 @@ struct Runtime {
     Handle stopping_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     std::atomic<bool> stopping{};
     std::atomic<unsigned> live{};
-    std::mutex failure_mutex;
+    mutable std::mutex failure_mutex;
     std::string failure;
     std::vector<std::jthread> threads;
     std::string stop_file;
@@ -325,12 +367,29 @@ struct Runtime {
                   return issue_token_file(path);
               },
               equal_secret, usage),
-          payload(max_object_size), stop_file(args.get("--stop-file")),
-          address(args.get("--bind", "127.0.0.1")),
+          stop_file(args.get("--stop-file")), address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "38443"), 65535))) {
         if (args.get("--token-file").empty()) {
             log_warning("Authentication disabled; use only on an isolated benchmark network");
         }
+        initialize();
+    }
+
+    // Workloads use an in-memory lease credential and share the control runtime's native engine.
+    Runtime(AgentConfig config, const std::string& run_id, std::string bind_address,
+            unsigned bind_port)
+        : agent(
+              std::move(config), "workload-bootstrap", run_id,
+              []() -> std::string {
+                  throw std::logic_error("Workload endpoints cannot pair");
+              },
+              equal_secret, usage),
+          payload(max_object_size), address(std::move(bind_address)), port(bind_port) {
+        initialize();
+    }
+
+    // Register the selected transport with its pre-provisioned URL ACL; HTTP needs no SSL state.
+    void initialize() {
         if (!port) {
             throw std::invalid_argument("HTTP.sys requires an explicitly bound nonzero port");
         }
@@ -346,7 +405,9 @@ struct Runtime {
             GetFileAttributesW(wide(stop_file).c_str()) != INVALID_FILE_ATTRIBUTES) {
             throw std::invalid_argument("Stop file already exists; choose a fresh path");
         }
-        randomize(payload);
+        if (!payload.empty()) {
+            randomize(payload);
+        }
         check(HttpCreateRequestQueue(HTTPAPI_VERSION{2, 0}, nullptr, nullptr, 0, &queue.value),
               "HttpCreateRequestQueue");
         check(HttpCreateServerSession(HTTPAPI_VERSION{2, 0}, &session.value, 0),
@@ -376,9 +437,10 @@ struct Runtime {
         check(HttpSetUrlGroupProperty(group.value, HttpServerTimeoutsProperty, &timeouts,
                                       sizeof(timeouts)),
               "Set HTTP.sys timeouts");
-        const auto url = wide("https://" + address + ":" + std::to_string(port) + "/");
+        const auto url = wide(std::string(agent.config.tls ? "https://" : "http://") + address +
+                              ":" + std::to_string(port) + "/");
         check(HttpAddUrlToUrlGroup(group.value, url.c_str(), 0, 0),
-              "Register HTTPS URL (check URL ACL and certificate binding)");
+              "Register HTTP.sys URL (check URL ACL and, for HTTPS, certificate binding)");
         completion_port.value =
             CreateIoCompletionPort(queue.value, nullptr, 0, agent.config.workers);
         if (!completion_port.value) {
@@ -453,7 +515,7 @@ struct Runtime {
 
     // Publish readiness only after workers/accepts exist, and preserve failures through orderly
     // teardown.
-    void run() {
+    void run(bool control = true, const std::function<void()>& listening = {}) {
         bool console_registered = false;
         try {
             for (unsigned i = 0; i < agent.config.workers; ++i) {
@@ -464,23 +526,34 @@ struct Runtime {
             for (unsigned i = 0; i < agent.config.workers * 4; ++i) {
                 accept();
             }
-            stop_event = stopping_event.value;
-            console_registered = SetConsoleCtrlHandler(on_console, TRUE);
-            if (!console_registered) {
-                log_warning(
-                    windows_error(
-                        "Console handler unavailable; use --stop-file for headless shutdown")
-                        .what());
+            {
+                std::lock_guard lock(failure_mutex);
+                if (!failure.empty()) {
+                    throw std::runtime_error(failure);
+                }
             }
-            std::cout << Json{{"event", "listening"},
-                              {"port", port},
-                              {"backend", agent.config.backend},
-                              {"workers", agent.config.workers}}
-                             .dump()
-                      << std::endl;
+            if (control) {
+                stop_event = stopping_event.value;
+                console_registered = SetConsoleCtrlHandler(on_console, TRUE);
+                if (!console_registered) {
+                    log_warning(
+                        windows_error(
+                            "Console handler unavailable; use --stop-file for headless shutdown")
+                            .what());
+                }
+                std::cout << Json{{"event", "listening"},
+                                  {"port", port},
+                                  {"backend", agent.config.backend},
+                                  {"workers", agent.config.workers}}
+                                 .dump()
+                          << std::endl;
+            }
+            if (listening) {
+                listening();
+            }
             for (;;) {
                 const auto wait = WaitForSingleObject(stopping_event.value, 100);
-                if (wait == WAIT_OBJECT_0) {
+                if (wait == WAIT_OBJECT_0 || stopping) {
                     break;
                 }
                 if (wait != WAIT_TIMEOUT) {
@@ -511,7 +584,9 @@ struct Runtime {
                 log_warning(windows_error("Remove console handler").what());
             }
             console_registered = false;
-            stop_event = nullptr;
+            if (control) {
+                stop_event = nullptr;
+            }
             shutdown();
             threads.clear();
             if (!failure.empty()) {
@@ -521,8 +596,11 @@ struct Runtime {
             if (console_registered && !SetConsoleCtrlHandler(on_console, FALSE)) {
                 log_warning(windows_error("Remove console handler during shutdown").what());
             }
-            stop_event = nullptr;
+            if (control) {
+                stop_event = nullptr;
+            }
             shutdown();
+            threads.clear();
             throw;
         }
     }
@@ -560,14 +638,18 @@ void Request::receive() {
                                      nullptr, &operation.overlapped));
 }
 
-// Drain the complete PUT before counting or acknowledging it; receiving some bytes is not success.
+// Fully receive PUT or bounded control JSON before acknowledging or dispatching it.
 void Request::read_body() {
     if (!remaining) {
-        ++runtime.agent.puts;
-        runtime.agent.put_bytes += reply.size;
-        const auto close = reply.close;
-        reply = AgentReply{};
-        reply.close = close;
+        if (reply.kind == AgentReply::Kind::consume_control) {
+            reply = runtime.agent.request(parsed_head, connection, control_body);
+        } else {
+            ++runtime.agent.puts;
+            runtime.agent.put_bytes += reply.size;
+            const auto close = reply.close;
+            reply = AgentReply{};
+            reply.close = close;
+        }
         send();
         return;
     }
@@ -652,11 +734,21 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
         }
         if (state == State::receive) {
             try {
-                reply = runtime.agent.request(request_head(*header()), connection_info(*header()));
+                parsed_head = request_head(*header());
+                connection =
+                    runtime.agent.config.tls ? connection_info(*header()) : ConnectionInfo{};
+                reply = runtime.agent.request(parsed_head, connection);
             } catch (const std::invalid_argument& failure) {
                 reply = AgentReply::error(400, failure.what());
             }
-            if (reply.kind == AgentReply::Kind::consume_put) {
+            if (reply.kind == AgentReply::Kind::consume_put ||
+                reply.kind == AgentReply::Kind::consume_control) {
+                if (reply.kind == AgentReply::Kind::consume_control) {
+                    if (reply.size > 65536) {
+                        throw std::logic_error("Control body exceeds native receive limit");
+                    }
+                    control_body.reserve(reply.size);
+                }
                 remaining = reply.size;
                 read_body();
             } else {
@@ -664,9 +756,12 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
             }
         } else if (state == State::body) {
             if (!bytes || bytes > remaining) {
-                reply = AgentReply::error(400, "Incomplete PUT body");
+                reply = AgentReply::error(400, "Incomplete request body");
                 send();
             } else {
+                if (reply.kind == AgentReply::Kind::consume_control) {
+                    control_body.append(body_buffer.data(), bytes);
+                }
                 remaining -= bytes;
                 read_body();
             }
@@ -688,16 +783,98 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
         delete this;
     }
 }
+
+// Own one in-process workload and its controller thread. Readiness is published only after IOCP
+// accepts exist; destruction signals that runtime alone and joins it before removing its URL.
+class NativeBenchmark final : public BenchmarkInstance {
+    Runtime runtime_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    bool ready_{}, finished_{};
+    std::string error_;
+    std::jthread thread_;
+
+public:
+    // Wait for either native readiness or failure so start never advertises an unusable listener.
+    NativeBenchmark(AgentConfig config, const std::string& run_id, const std::string& address,
+                    unsigned port)
+        : runtime_(std::move(config), run_id, address, port), thread_([this] {
+              try {
+                  runtime_.run(false, [this] {
+                      {
+                          std::lock_guard lock(mutex_);
+                          ready_ = true;
+                      }
+                      changed_.notify_all();
+                  });
+              } catch (const std::exception& failure) {
+                  std::lock_guard lock(mutex_);
+                  error_ = failure.what();
+              }
+              {
+                  std::lock_guard lock(mutex_);
+                  finished_ = true;
+              }
+              changed_.notify_all();
+          }) {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [this] {
+            return ready_ || finished_;
+        });
+        if (finished_) {
+            throw BenchmarkError(500, "Workload startup failed: " + error_);
+        }
+    }
+
+    // Stop only this data plane; the permanent control endpoint and console handler remain intact.
+    ~NativeBenchmark() override {
+        if (!SetEvent(runtime_.stopping_event.value)) {
+            log_warning(windows_error("Signal workload shutdown").what());
+            runtime_.shutdown();
+        }
+        thread_.join();
+    }
+
+    // Advertise the host-selected port, never a remotely supplied network address or credential.
+    Json describe() const override {
+        return {{"port", runtime_.port},
+                {"transport", runtime_.agent.config.tls ? "https" : "http"},
+                {"backend", runtime_.agent.config.backend}};
+    }
+
+    // Surface worker/controller failures instead of returning counters for a silently dead run.
+    Json telemetry() const override {
+        {
+            std::lock_guard lock(mutex_);
+            if (finished_) {
+                throw BenchmarkError(500, "Workload stopped unexpectedly: " + error_);
+            }
+        }
+        {
+            std::lock_guard lock(runtime_.failure_mutex);
+            if (!runtime_.failure.empty()) {
+                throw BenchmarkError(500, "Workload runtime failed: " + runtime_.failure);
+            }
+        }
+        try {
+            return runtime_.agent.telemetry();
+        } catch (const std::exception& failure) {
+            throw BenchmarkError(500, "Workload telemetry failed: " + std::string(failure.what()));
+        }
+    }
+};
 }
 
 int wmain(int argc, wchar_t** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
         std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
+                     "  [--http-port 38444] [--https-port 38445]\n"
                      "  [--token-file path] (optional authentication; default: none)\n"
                      "  [--workers 8] [--backend httpsys] [--cipher TLS_AES_128_GCM_SHA256]\n"
                      "  [--max-connections 32768] [--session-file path] [--stop-file path]\n"
-                     "Configure the HTTP.sys certificate binding and URL ACL using "
+                     "Per-run workload TLS/cipher/workers/limits are controlled remotely.\n"
+                     "Configure the HTTP.sys certificate bindings and URL ACLs using "
                      "scripts/setup-server.ps1 first.\n";
         return 0;
     }
@@ -713,9 +890,37 @@ int wmain(int argc, wchar_t** argv) {
         }
         Args args(argc, arguments.data());
         args.allow({"--token-file", "--bind", "--port", "--workers", "--backend", "--cipher",
-                    "--max-connections", "--session-file", "--stop-file"});
+                    "--max-connections", "--session-file", "--stop-file", "--http-port",
+                    "--https-port"});
+        const auto control_port = number(args.get("--port", "38443"), 65535);
+        const auto http_port =
+            static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));
+        const auto https_port =
+            static_cast<unsigned>(number(args.get("--https-port", "38445"), 65535));
+        if (!control_port || !http_port || !https_port || http_port == https_port ||
+            control_port == http_port || control_port == https_port) {
+            throw std::invalid_argument(
+                "Control, HTTP and HTTPS ports must be nonzero and distinct");
+        }
         ServerGuard instance_guard;
+        const auto host_config = windows_config(args);
+        const auto address = args.get("--bind", "127.0.0.1");
+        BenchmarkController controller(
+            issue_run_id, [&](const BenchmarkOptions& options, const std::string& run_id) {
+                auto config = workload_config(host_config, options);
+                try {
+                    return std::make_unique<NativeBenchmark>(std::move(config), run_id, address,
+                                                             options.tls == "off" ? http_port
+                                                                                  : https_port);
+                } catch (const BenchmarkError&) {
+                    throw;
+                } catch (const std::exception& failure) {
+                    throw BenchmarkError(500, "Cannot start HTTP.sys workload: " +
+                                                  std::string(failure.what()));
+                }
+            });
         Runtime server(args);
+        server.agent.controller = &controller;
         server.run();
         return 0;
     } catch (const std::exception& failure) {

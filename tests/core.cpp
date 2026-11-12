@@ -88,6 +88,21 @@ int main() {
                   delta.at("involuntary_context_switches").is_null(),
               "Unavailable Windows counters stay null");
         check(delta.at("cpu_core_equivalents") == .5, "CPU deltas with unavailable counters");
+        check(delta.at("cpu_cycles").is_null(),
+              "Missing cycles must not be estimated from CPU time");
+        auto counted_before = before;
+        auto counted_after = after;
+        counted_before["cpu_cycles"] = 1000;
+        counted_after["cpu_cycles"] = 2500;
+        counted_after["cpu_cycles_source"] = "test hardware counter";
+        const auto counted = usage_delta(counted_before, counted_after, 2);
+        check(counted.at("cpu_cycles") == 1500 && counted.at("cpu_utilization_percent") == 50,
+              "Cycles and CPU utilization use measured sample deltas");
+        counted_before["cpu_cycles"] = nullptr;
+        const auto missing_boundary = usage_delta(counted_before, counted_after, 2);
+        check(missing_boundary.at("cpu_cycles").is_null() &&
+                  !missing_boundary.at("cpu_cycles_unavailable_reason").is_null(),
+              "Cycles unavailable at either boundary need a reason, never an estimate");
         std::cout << "core tests passed\n";
         return 0;
     } catch (const std::exception& error) {

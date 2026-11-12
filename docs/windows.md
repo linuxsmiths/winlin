@@ -1,7 +1,7 @@
 # Windows HTTP.sys/Schannel server
 
-The Windows server implements the same pairing, discovery, telemetry, synthetic
-GET/PUT, and keep-alive API as Linux. Shared logic lives in
+The Windows server implements the same permanent HTTPS control API and exclusive,
+per-run synthetic GET/PUT workloads as Linux. Shared logic lives in
 `include/winlin/agent.hpp`; only transport, credential storage, cryptography and
 OS telemetry differ. The Linux client does not need a different workload format.
 
@@ -47,7 +47,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DWINLIN_BUILD_CLIENT=OFF
 cmake --build build --config Release --parallel 2
 ```
 
-## Configure a test endpoint
+## Configure control and workload endpoints
 
 HTTP.sys owns TLS termination, so certificates belong in the Windows certificate
 store and are bound to an IP/port. Unlike Linux, the server does not read PEM
@@ -57,13 +57,16 @@ From an **elevated** PowerShell terminal, configure a specific local test-networ
 IPv4 address (use `127.0.0.1` for loopback only):
 
 ```powershell
-$setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 -Port 38443
+$setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 `
+    -Port 38443 -HttpPort 38444 -HttpsPort 38445
 $setup | Format-List
 ```
 
 This imports the bundled **deliberately public** RSA test certificate/key into
 `LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
-SSL binding and a URL reservation for the current user. Authentication is disabled
+SSL bindings for HTTPS control (default **38443**) and HTTPS workload (**38445**),
+plus URL reservations for both and the plain HTTP workload (**38444**), for the
+current user. All three ports must be distinct. Authentication is disabled
 by default; no pairing-token file is needed. Optional setup
 `-RequireAuthentication` creates a bootstrap credential in
 `.winlin-local\pairing-token`. Only the owner, SYSTEM and
@@ -88,28 +91,33 @@ Existing state directories must already be private; setup does not rewrite a
 shared directory's permissions. On setup failure, resources created by that
 invocation are rolled back.
 
-The binding disables HTTP/2, QUIC, TLS 1.0/1.1 and TLS 1.2 for this endpoint,
+The HTTPS bindings disable HTTP/2, QUIC, TLS 1.0/1.1 and TLS 1.2 for these endpoints,
 without changing machine-wide Schannel policy. Setup does **not** create firewall
-rules. Allow the chosen TCP port only from authorized benchmark clients using
+rules. Allow the three selected TCP ports only from authorized benchmark clients using
 your host firewall and VNet configuration. Never expose the agent to the internet.
+Plain HTTP data also requires HTTP/1.1; other request versions are rejected even
+if machine-wide HTTP.sys HTTP/2 support is enabled. Responses disable kernel caching.
 
 Start the server (the same user can do this without elevation after setup):
 
 ```powershell
-.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 38443 -Workers 8
+.\scripts\run-server.ps1 -BindAddress 10.0.0.4 `
+    -Port 38443 -HttpPort 38444 -HttpsPort 38445
 ```
 
 The launcher defaults to the repository's `build\Release\winlin-server.exe` with
-no authentication. Match `-BindAddress` and `-Port` to the provisioned
-endpoint. It never builds, provisions certificates, resets pairing, elevates, or
+no authentication. Match `-BindAddress`, `-Port`, `-HttpPort` and `-HttpsPort`
+to the provisioned endpoints. Native options are `--bind`, `--port`,
+`--http-port` and `--https-port`. The launcher never builds, provisions certificates, resets pairing, elevates, or
 changes firewall/Schannel policies.
 
 Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
 CMake builds. Explicit `-TokenFile FILE` enables authentication, with optional
-`-SessionFile FILE` for credential persistence; unspecified tuning options retain
-native defaults. Existing credential files are otherwise ignored. `-Help` lists options
+`-SessionFile FILE` for credential persistence. Startup `-Workers`,
+`-MaxConnections`, and `-Cipher` configure control only; workload settings come
+from each remote start request. Existing credential files are otherwise ignored. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 
@@ -123,16 +131,45 @@ server before running integration tests.
 The Linux launchers' 512K file-descriptor limit does not apply to HTTP.sys/Winsock;
 there is no corresponding Windows `RLIMIT_NOFILE` setting to raise.
 
-The backend is `httpsys-schannel`. `--backend httpsys` is accepted explicitly;
-OpenSSL/kTLS backend requests fail rather than falling back.
+Control uses `httpsys-schannel`. Workload TLS `on` uses `httpsys-schannel`;
+TLS `off` uses `httpsys`. Both use the same in-process native HTTP.sys/IOCP engine,
+not another executable or child process. `--backend httpsys` is accepted explicitly;
+OpenSSL backends and per-run `ktls` requests fail rather than falling back.
 
 The default cipher is `TLS_AES_128_GCM_SHA256`. To use
-`TLS_AES_256_GCM_SHA384`, select it with `-Cipher` in the launcher (native
-`--cipher`) and `--cipher` on the Linux client. HTTP.sys reports negotiated
+`TLS_AES_256_GCM_SHA384`, select it in the remote run settings (`--cipher` on the
+Linux client). The launcher `-Cipher` (native `--cipher`) independently selects
+the control cipher. HTTP.sys reports negotiated
 protocol/algorithm/key size; mismatches or
 missing information cause request rejection. The server does not claim that
 `--cipher` rewrites Schannel's handshake policy. The Linux client offers only
 the selected TLS 1.3 suite.
+
+### Remote run lifecycle
+
+The control endpoint never serves object traffic. `POST /v1/benchmark/start`
+accepts a JSON body up to 64 KiB, for example:
+
+```json
+{"tls":"off","workers":4,"max_connections":1024,"lease_seconds":300}
+```
+
+For HTTPS, use `"tls":"on"` and optionally
+`"cipher":"TLS_AES_256_GCM_SHA384"`. Workers, connection limits, TLS mode, and
+cipher can change between runs without restarting control. The response includes
+`port`, `transport`, `backend`, effective `settings`, and an ephemeral `run_id`.
+The workload is ready before start succeeds. Only one run may exist; conflicting
+starts return HTTP 409. Abandoned leases automatically stop and join the workload.
+
+Use the returned `run_id` as the **Bearer credential on the workload endpoint**,
+even when control authentication is disabled. Only object GET/PUT and capabilities
+are available there. Sample counters through control with
+`GET /v1/benchmark/telemetry?run_id=ID`, then release the run with
+`POST /v1/benchmark/stop?run_id=ID`. These calls retain optional control-token
+authentication and reject non-owner IDs. Runtime failures produce errors rather
+than apparently successful stale telemetry. Plain HTTP capabilities report null
+TLS version and cipher. Run IDs are ephemeral, not persisted pairing credentials;
+plain HTTP carries them unencrypted and is suitable only on an isolated network.
 
 Press Ctrl+C to stop gracefully. For local automation, `-StopFile PATH` (native
 `--stop-file PATH`) also requests a graceful stop when that file appears. The file
@@ -150,6 +187,7 @@ The bundled public certificate needs no fingerprint entry:
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
 ./scripts/run-client.sh run --target .winlin-local/windows.json \
+  --tls off --server-workers 4 --server-max-connections 1024 \
   --method mixed --get-percent 50 --get-size 4KiB --put-size 16KiB \
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 ```
@@ -169,7 +207,7 @@ results.
 
 ## Telemetry and comparison caveats
 
-Operation counts, bytes, CPU time, and peak working set use the common result
+Operation counts, bytes, CPU time, CPU cycles, and peak working set use the common result
 schema. Context-switch counts and raw accepted/active connection and TLS
 handshake counts are not collected on Windows yet; these are explicitly
 unavailable and returned as `null`.
@@ -179,6 +217,11 @@ work charged to the System process, outside this server's process counters.
 Results record this scope and the client emits a warning. Whole-system and
 kernel attribution are needed before comparing total TLS CPU efficiency with
 Linux. Neither implementation currently collects that attribution.
+`cpu_cycles` comes directly from `QueryProcessCycleTime`, not CPU time multiplied
+by nominal frequency. `cpu_cycles_source` identifies that API; an unavailable
+sample is null with `cpu_cycles_unavailable_reason`. CPU cycles also exclude
+HTTP.sys/Schannel work charged to System and include control-process overhead;
+they are not whole-machine hardware-counter measurements.
 Processor-group count is recorded, but worker affinity and group/NUMA placement
 are not tuned automatically. Verify scheduling on hosts with more than 64 logical
 processors before interpreting scaling results.
@@ -203,9 +246,11 @@ ctest --test-dir build -C Release --output-on-failure
 CTest starts Windows PowerShell with a fresh module search path so its built-in
 modules load correctly even when CTest is invoked from PowerShell 7.
 
-These tests provision a temporary certificate/binding/URL reservation on an
-ephemeral loopback port, exercise the same HTTP contract as Linux, test
-concurrent/persistent GET/PUT, TLS/cipher rejection, and pairing across restarts,
+These tests provision the public certificate, two bindings and three URL
+reservations on distinct ephemeral loopback ports. They exercise exclusive run
+ownership, bounded/split control JSON, lease expiry, live HTTP/HTTPS and worker
+switching, workload authentication and isolation, concurrent/persistent GET/PUT,
+TLS/cipher rejection, process cycle telemetry, and pairing across restarts,
 then remove their own resources. They do not change global cipher policy.
 
 For intentional manual endpoint removal, stop the server first and delete only
@@ -213,7 +258,10 @@ its configured URL reservation and binding:
 
 ```powershell
 netsh http delete urlacl url=https://10.0.0.4:38443/
+netsh http delete urlacl url=http://10.0.0.4:38444/
+netsh http delete urlacl url=https://10.0.0.4:38445/
 netsh http delete sslcert ipport=10.0.0.4:38443
+netsh http delete sslcert ipport=10.0.0.4:38445
 ```
 
 Remove the specific test certificate from `LocalMachine\My` only if you created

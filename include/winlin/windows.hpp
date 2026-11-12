@@ -299,7 +299,15 @@ inline Json usage() {
         !GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
         throw windows_error("Cannot collect process telemetry");
     }
-    return {{"user_cpu_seconds", filetime_seconds(user)},
+    ULONG64 cycles{};
+    const bool cycles_available = QueryProcessCycleTime(GetCurrentProcess(), &cycles) != FALSE;
+    const auto cycles_error = cycles_available ? ERROR_SUCCESS : GetLastError();
+    return {{"cpu_cycles", cycles_available ? Json(cycles) : Json(nullptr)},
+            {"cpu_cycles_source", cycles_available ? Json("QueryProcessCycleTime") : Json(nullptr)},
+            {"cpu_cycles_unavailable_reason",
+             cycles_available ? Json(nullptr)
+                              : Json(windows_error("QueryProcessCycleTime", cycles_error).what())},
+            {"user_cpu_seconds", filetime_seconds(user)},
             {"system_cpu_seconds", filetime_seconds(kernel)},
             {"peak_rss_bytes", memory.PeakWorkingSetSize},
             {"voluntary_context_switches", nullptr},

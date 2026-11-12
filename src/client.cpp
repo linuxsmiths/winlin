@@ -16,6 +16,7 @@ namespace fs = std::filesystem;
 // this entire object into benchmark reports or diagnostics; token is private target-file data.
 struct Target {
     std::string host, port, pin, token, cipher;
+    bool tls{true};
 };
 
 std::string checked_pin(std::string pin) {
@@ -115,13 +116,14 @@ struct Response {
 
 // Use a separately pinned connection for control traffic, bounded independently of load duration.
 Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
-                  const std::string& path) {
-    auto socket = connect_tls(ctx, target.host, target.port, target.pin);
+                  const std::string& path, const std::string& body = {}) {
+    auto socket = connect_stream(target.tls ? ctx : nullptr, target.host, target.port, target.pin);
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     const std::string request =
         method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
         (target.token.empty() ? "" : "\r\nAuthorization: Bearer " + target.token) +
-        "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
+        body;
     std::size_t sent{};
     while (sent < request.size()) {
         const int count = socket->write(request.data() + sent, request.size() - sent);
@@ -292,7 +294,7 @@ struct Stats {
 // Own one pinned persistent connection with at most one outstanding workload request. One worker
 // drives it; response bytes are drained before latency is recorded or another request is issued.
 struct LoadConnection {
-    TlsSocket socket;
+    StreamSocket socket;
     enum class State {
         handshake,
         idle,
@@ -309,7 +311,7 @@ struct LoadConnection {
 
     LoadConnection(Fd fd, SSL_CTX* ctx, const Target& target)
         : socket(std::exchange(fd.value, -1), ctx) {
-        if (SSL_set_tlsext_host_name(socket.ssl.get(), target.host.c_str()) != 1) {
+        if (socket.ssl && SSL_set_tlsext_host_name(socket.ssl.get(), target.host.c_str()) != 1) {
             throw tls_error("Cannot set load connection TLS server name");
         }
     }
@@ -339,7 +341,7 @@ struct LoadConnection {
                 if (!socket.handshake(false)) {
                     return false;
                 }
-                if (!equal_secret(fingerprint(socket.ssl.get()), target.pin)) {
+                if (socket.ssl && !equal_secret(fingerprint(socket.ssl.get()), target.pin)) {
                     throw std::runtime_error("Server certificate changed during load setup");
                 }
                 state = State::idle;
@@ -546,7 +548,8 @@ public:
 // Coordinate setup, warmup and measurement without charging connection establishment to throughput.
 // Every worker must reach both gates even after failure, or the controller would wait forever.
 Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
-           const std::vector<char>& payload, unsigned repetition) {
+           const std::vector<char>& payload, unsigned repetition, SSL_CTX* control_ctx,
+           const Target& control_target, const std::string& run_id) {
     std::latch setup_done(config.workers), warmup_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};
@@ -617,7 +620,8 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     Json server_before, client_before;
     if (!abort) {
         try {
-            server_before = control(ctx, target, "/v1/telemetry");
+            server_before =
+                control(control_ctx, control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
             client_before = usage();
         } catch (const std::exception& error) {
             fail(error.what());
@@ -635,7 +639,8 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     }
     const double elapsed = std::chrono::duration<double>(combined.end - measure_start).count();
     const auto client_after = usage();
-    const auto server_after = control(ctx, target, "/v1/telemetry");
+    const auto server_after =
+        control(control_ctx, control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
@@ -667,6 +672,10 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
             {"object_goodput_bytes_per_second", (combined.received + combined.sent) / elapsed},
             {"server_cpu_seconds_per_request",
              combined.completed ? Json(server_cpu / combined.completed) : Json(nullptr)},
+            {"server_cycles_per_request",
+             combined.completed && !server_usage.at("cpu_cycles").is_null()
+                 ? Json(server_usage.at("cpu_cycles").get<double>() / combined.completed)
+                 : Json(nullptr)},
             {"latency", combined.latency.json()},
             {"client_process", client_usage},
             {"latency_by_method",
@@ -679,6 +688,10 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
 
 RunConfig configuration(const Args& args) {
     RunConfig config;
+    config.tls = args.get("--tls", "on");
+    config.cipher = args.get("--cipher", config.cipher);
+    config.server_workers = number(args.get("--server-workers", "8"), 256);
+    config.server_max_connections = number(args.get("--server-max-connections", "32768"), 65536);
     config.method = lower(args.get("--method", "get"));
     config.get_size = object_size(args.get("--get-size", "4KiB"));
     config.put_size = object_size(args.get("--put-size", "4KiB"));
@@ -704,17 +717,12 @@ RunConfig configuration(const Args& args) {
 int run(Target target, const RunConfig& config, const fs::path& output) {
     auto ctx = context(false, target.cipher);
     auto capabilities = control(ctx.get(), target, "/v1/capabilities");
-    if (capabilities.at("backend") == "openssl-ktls" &&
-        (((config.method == "get" || (config.method == "mixed" && config.get_percent)) &&
-          !capabilities.at("ktls_tx").get<bool>()) ||
-         ((config.method == "put" || (config.method == "mixed" && config.get_percent < 100)) &&
-          !capabilities.at("ktls_rx").get<bool>()))) {
-        throw std::runtime_error(
-            "Requested kTLS direction is unavailable; refusing userspace fallback");
+    if (!capabilities.value("benchmark_control", false)) {
+        throw std::runtime_error("Server lacks benchmark control; update and restart the server");
     }
-    if (config.connections + 1 > capabilities.at("max_connections").get<unsigned>()) {
-        throw std::invalid_argument(
-            "Server connection limit must allow load connections plus control sampling");
+    const auto modes = capabilities.at("benchmark_tls_modes").get<std::vector<std::string>>();
+    if (std::find(modes.begin(), modes.end(), config.tls) == modes.end()) {
+        throw std::invalid_argument("Server does not support requested TLS mode: " + config.tls);
     }
     std::vector<char> payload(std::max<std::size_t>(1, config.put_size));
     if (RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
@@ -724,7 +732,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     std::vector<std::string> notes{
         "Closed-loop workload: percentiles exclude arrival-rate queueing and do not establish an "
         "SLA.",
-        "Server telemetry is process-wide; concurrent users invalidate attribution.",
+        "Server process telemetry includes the HTTPS controller; one benchmark lease is active.",
         "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
         "load interval.",
         "In-flight requests are drained after the duration limit; elapsed time includes draining."};
@@ -738,8 +746,8 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                            "CPU/request is not total OS CPU cost.");
     }
     Json report = {
-        {"schema_version", 1},
-        {"benchmark", "https"},
+        {"schema_version", 2},
+        {"benchmark", config.tls == "off" ? "http" : "https"},
         {"notes", notes},
         {"status", "running"},
         {"target",
@@ -751,16 +759,60 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
          std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
              .count()},
         {"results", Json::array()}};
-    report["configuration"]["cipher"] = target.cipher;
     if (!output.parent_path().empty()) {
         fs::create_directories(output.parent_path());
     }
     write_private(output, report, true);
     bool errors = false;
+    std::string run_id;
+    auto command = [&](const std::string& path, const std::string& body = {}) {
+        const auto response = exchange(ctx.get(), target, "POST", path, body);
+        if (response.status != 200) {
+            throw std::runtime_error(
+                "Server rejected benchmark control (HTTP " + std::to_string(response.status) +
+                "): " + Json::parse(response.body).value("error", "unknown error"));
+        }
+        return Json::parse(response.body);
+    };
     try {
+        const Json settings{
+            {"tls", config.tls},
+            {"cipher", config.cipher},
+            {"workers", config.server_workers},
+            {"max_connections", config.server_max_connections},
+            {"lease_seconds", static_cast<unsigned>(std::ceil(config.warmup + config.duration +
+                                                              3 * config.timeout + 60))}};
+        const auto started = command("/v1/benchmark/start", settings.dump());
+        run_id = started.at("run_id");
+        Target workload{target.host,   std::to_string(started.at("port").get<unsigned>()),
+                        target.pin,    run_id,
+                        config.cipher, config.tls != "off"};
+        auto workload_ctx =
+            workload.tls ? context(false, config.cipher) : Context(nullptr, SSL_CTX_free);
+        auto workload_capabilities = control(workload_ctx.get(), workload, "/v1/capabilities");
+        if (workload_capabilities.at("transport") != (workload.tls ? "https" : "http") ||
+            workload_capabilities.at("workers") != config.server_workers ||
+            workload_capabilities.at("max_connections") != config.server_max_connections) {
+            throw std::runtime_error("Server did not apply the requested benchmark settings");
+        }
+        if (config.tls == "ktls" &&
+            (((config.method == "get" || (config.method == "mixed" && config.get_percent)) &&
+              !workload_capabilities.at("ktls_tx").get<bool>()) ||
+             ((config.method == "put" || (config.method == "mixed" && config.get_percent < 100)) &&
+              !workload_capabilities.at("ktls_rx").get<bool>()))) {
+            throw std::runtime_error(
+                "Requested kTLS direction is unavailable; refusing userspace fallback");
+        }
+        report["control_capabilities"] = capabilities;
+        report["server_capabilities"] = workload_capabilities;
+        report["server_configuration"] = started.at("settings");
+        report["workload_endpoint"] = {
+            {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
+        write_private(output, report, false);
         std::cout << "Run  requests/s     p50(us)     p99(us)   errors\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
-            auto result = trial(ctx.get(), target, config, payload, index);
+            auto result = trial(workload_ctx.get(), workload, config, payload, index, ctx.get(),
+                                target, run_id);
             errors = errors || result.at("errors").get<std::uint64_t>() != 0 ||
                      result.at("completed").get<std::uint64_t>() == 0;
             std::cout << std::fixed << std::setprecision(2) << std::setw(3) << index
@@ -774,14 +826,46 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
             report["results"].push_back(std::move(result));
             write_private(output, report, false);
         }
+        report["server_final_telemetry"] = command("/v1/benchmark/stop?run_id=" + run_id);
+        run_id.clear();
         report["status"] = errors ? "completed_with_errors" : "completed";
         write_private(output, report, false);
     } catch (const std::exception& error) {
+        if (!run_id.empty()) {
+            try {
+                command("/v1/benchmark/stop?run_id=" + run_id);
+            } catch (const std::exception& cleanup) {
+                log_warning(std::string("Cannot stop workload; its bounded lease will expire: ") +
+                            cleanup.what());
+            }
+        }
         report["status"] = "failed";
         report["failure"] = error.what();
         write_private(output, report, false);
         throw;
     }
+    Json summaries = Json::array();
+    for (const auto& result : report["results"]) {
+        summaries.push_back(
+            {{"repetition", result.at("repetition")},
+             {"requests_per_second", result.at("requests_per_second")},
+             {"errors", result.at("errors")},
+             {"server_cpu_percent", result.at("server_process").at("cpu_utilization_percent")},
+             {"server_cpu_seconds_per_io", result.at("server_cpu_seconds_per_request")},
+             {"server_cycles_per_io", result.at("server_cycles_per_request")},
+             {"client_process", result.at("client_process")},
+             {"server_process", result.at("server_process")},
+             {"server_telemetry", result.at("server_after")},
+             {"profiling",
+              {{"cache_miss_rate", nullptr},
+               {"unavailable_reason", "Hardware profiling is not collected yet"}}}});
+    }
+    std::cout << "\nFinal telemetry summary (CPU percent: 100% = one core; null = unavailable)\n"
+              << Json{{"server_configuration", report.at("server_configuration")},
+                      {"server_capabilities", report.at("server_capabilities")},
+                      {"repetitions", summaries}}
+                     .dump(2)
+              << '\n';
     std::cout << "Results saved to " << output.string() << '\n';
     if (errors) {
         log_warning(
@@ -790,8 +874,9 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     return errors ? 2 : 0;
 }
 
-std::string default_output() {
-    return "results/https-" +
+// Keep default result names consistent with the selected workload, not the control transport.
+std::string default_output(const RunConfig& config) {
+    return std::string("results/") + (config.tls == "off" ? "http-" : "https-") +
            std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::system_clock::now().time_since_epoch())
                               .count()) +
@@ -837,7 +922,7 @@ std::string select_target() {
 void interactive() {
     while (std::cin) {
         std::cout
-            << "\nWinlin\n1. Add server\n2. Inspect server\n3. Run HTTPS benchmark\n0. Exit\n";
+            << "\nWinlin\n1. Add server\n2. Inspect server\n3. Run HTTP/HTTPS benchmark\n0. Exit\n";
         const auto action = prompt("Select", "0");
         if (action == "0") {
             return;
@@ -849,7 +934,7 @@ void interactive() {
                 const auto port = prompt("Agent port", "38443");
                 const auto cipher = prompt("TLS 1.3 cipher", "TLS_AES_128_GCM_SHA256");
                 auto ctx = context(false, cipher);
-                auto socket = connect_tls(ctx.get(), host, port, {});
+                auto socket = connect_stream(ctx.get(), host, port, {});
                 const auto pin = fingerprint(socket->ssl.get());
                 std::cout << "Server certificate SHA-256: " << pin << '\n';
                 // Only the bundled public fixture is accepted automatically; custom identities
@@ -869,6 +954,13 @@ void interactive() {
             } else if (action == "3") {
                 const auto target = load_target(select_target());
                 RunConfig config;
+                config.tls = lower(prompt("Benchmark TLS: on / off / ktls", "on"));
+                if (config.tls != "off") {
+                    config.cipher = prompt("Benchmark TLS 1.3 cipher", config.cipher);
+                }
+                config.server_workers = number(prompt("Server workers (1-256)", "8"), 256);
+                config.server_max_connections =
+                    number(prompt("Server connection limit (1-65536)", "32768"), 65536);
                 config.method = lower(prompt("Method: get / put / mixed", "get"));
                 std::cout << "Size presets: 256B, 512B, 1KiB, 4KiB, 8KiB, 16KiB, 64KiB, 256KiB, "
                              "1MiB, 4MiB\n";
@@ -890,7 +982,7 @@ void interactive() {
                 config.requests = number(prompt("Request limit (0 = duration only)", "0"));
                 config.repetitions = number(prompt("Repetitions", "3"), 1000);
                 config.validate();
-                run(target, config, prompt("Result file", default_output()));
+                run(target, config, prompt("Result file", default_output(config)));
             } else {
                 std::cout << "Unknown selection\n";
             }
@@ -921,6 +1013,8 @@ int main(int argc, char** argv) {
                    "            Custom certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
+                   "           [--tls on|off|ktls] [--server-workers 8]\n"
+                   "           [--server-max-connections 32768]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
@@ -948,11 +1042,11 @@ int main(int argc, char** argv) {
         if (command == "run") {
             args.allow({"--target", "--method", "--get-size", "--put-size", "--get-percent",
                         "--connections", "--workers", "--warmup", "--duration", "--requests",
-                        "--repetitions", "--timeout", "--output", "--cipher"});
+                        "--repetitions", "--timeout", "--output", "--cipher", "--tls",
+                        "--server-workers", "--server-max-connections"});
             const auto config = configuration(args);
             auto target = load_target(args.require("--target"));
-            target.cipher = args.get("--cipher", target.cipher);
-            return run(target, config, args.get("--output", default_output()));
+            return run(target, config, args.get("--output", default_output(config)));
         }
         throw std::invalid_argument("Unknown command; use winlin --help");
     } catch (const std::exception& error) {

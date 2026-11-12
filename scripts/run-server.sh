@@ -7,7 +7,10 @@ usage() {
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
-HTTPS listens on 0.0.0.0:38443 (all IPv4 interfaces) unless --bind/--port overrides it.
+HTTPS control listens on 0.0.0.0:38443 unless --bind/--port overrides it.
+Clients select per-run server workers, TLS on/off/kTLS, cipher, and connection limit.
+Workload data defaults to HTTP port 38444 or HTTPS port 38445; host overrides:
+--http-port PORT and --https-port PORT. No server restart is needed between modes.
 Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
 An existing server.pem/server.key in the state directory takes precedence.
 Authentication is disabled by default; no pairing-token file is needed.
@@ -18,7 +21,7 @@ Use -- --help for the native server's help, without requiring state files.
 Examples:
   scripts/run-server.sh
   scripts/run-server.sh --bind 10.0.0.4 --workers 8
-  scripts/run-server.sh --state-dir /private/endpoint --backend ktls
+  scripts/run-server.sh --state-dir /private/endpoint --http-port 39000 --https-port 39001
 
 The bundled identity provides no trustworthy server authentication.
 This script never resets pairing, overwrites existing credentials, or builds.

@@ -75,7 +75,7 @@ if ($rollbackWarnings.Count -ne 1 -or $rollbackWarnings[0] -notmatch 'secondary 
 }
 
 # Exercise launcher plumbing on either host without claiming to emulate HTTP.sys or Windows ACLs.
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('winlin-launcher-' + [Guid]::NewGuid().ToString())
+$fixture = Join-Path $root ('.winlin-launcher-test-' + [Guid]::NewGuid().ToString())
 $fixtureLauncher = Join-Path $fixture 'run-server.ps1'
 
 # Isolate each launcher invocation because its explicit exit must not terminate this test host.
@@ -113,14 +113,14 @@ exit 0
 
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-StateDirectory', $state, '-BindAddress', '10.0.0.4',
-        '-Port', '9443', '-Workers', '3', '-MaxConnections', '64',
+        '-Port', '9443', '-HttpPort', '9444', '-HttpsPort', '9445', '-Workers', '3', '-MaxConnections', '64',
         '-Cipher', 'TLS_AES_256_GCM_SHA384', '-SessionFile', 'session with spaces',
         '-StopFile', 'stop with spaces'
     )
     if ($result.ExitCode -ne 0) { throw "Launcher fixture failed: $($result.Output)" }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
     $expected = @(
-        '--bind', '10.0.0.4', '--port', '9443', '--workers', '3',
+        '--bind', '10.0.0.4', '--port', '9443', '--http-port', '9444', '--https-port', '9445', '--workers', '3',
         '--max-connections', '64', '--cipher', 'TLS_AES_256_GCM_SHA384',
         '--session-file', 'session with spaces', '--stop-file', 'stop with spaces'
     )
@@ -137,7 +137,8 @@ exit 0
         throw "Default launch must need no credential files: $($result.Output)"
     }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
-    $expected = @('--bind', '127.0.0.1', '--port', '38443')
+    $expected = @('--bind', '127.0.0.1', '--port', '38443',
+        '--http-port', '38444', '--https-port', '38445')
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
         throw "Default launcher endpoint or authentication changed unexpectedly: $arguments"
     }

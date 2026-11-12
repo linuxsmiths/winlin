@@ -6,6 +6,8 @@ param(
     [string]$ServerExe = '',
     [string]$BindAddress = '127.0.0.1',
     [ValidateRange(1, 65535)][int]$Port = 38443,
+    [ValidateRange(1, 65535)][int]$HttpPort = 38444,
+    [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [ValidateRange(1, 256)][int]$Workers,
     [ValidateRange(1, 65536)][int]$MaxConnections,
     [string]$Cipher,
@@ -20,13 +22,16 @@ if ($Help) {
     @'
 Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-StateDirectory PATH] [-ServerExe PATH] [-BindAddress IP] [-Port N]
+    [-HttpPort N] [-HttpsPort N]
     [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-TokenFile PATH]
     [-SessionFile PATH] [-StopFile PATH]
 
-Defaults: build\Release\winlin-server.exe, no authentication, 127.0.0.1:38443.
+Defaults: build\Release\winlin-server.exe, no authentication, HTTPS control 127.0.0.1:38443,
+HTTP workload port 38444 and HTTPS workload port 38445.
 An explicit -TokenFile enables authentication. Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary
-discovery. Unspecified workload settings retain the native server defaults.
+discovery. Clients select per-run workload TLS/cipher/workers/limits remotely.
+The startup Workers, MaxConnections and Cipher options affect control only.
 
 Provision the matching HTTP.sys endpoint with scripts\setup-server.ps1 first.
 Run as the same account that owns its URL reservation and credential files.
@@ -55,7 +60,8 @@ try {
         throw "Server executable not found: $ServerExe. Run scripts\build.ps1 server first."
     }
 
-    $serverArguments = @('--bind', $BindAddress, '--port', "$Port")
+    $serverArguments = @('--bind', $BindAddress, '--port', "$Port",
+        '--http-port', "$HttpPort", '--https-port', "$HttpsPort")
     if ($TokenFile) {
         $TokenFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenFile)
         if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {

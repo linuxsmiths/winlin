@@ -1,4 +1,4 @@
-# HTTPS benchmark
+# HTTP/HTTPS benchmark
 
 This is a working starting point, not a fully tuned cross-OS benchmark.
 For Windows server provisioning, see the [Windows guide](windows.md).
@@ -8,14 +8,17 @@ For Windows server provisioning, see the [Windows guide](windows.md).
 - Linux OpenSSL userspace and explicitly requested OpenSSL+kTLS server backends.
 - Windows HTTP.sys/Schannel with the same control and workload API.
 - HTTP/1.1 over TLS 1.3, with one explicitly selected TLS cipher suite.
+- Plain HTTP workloads on both platforms, selected per run without changing control security.
+- Client-controlled server worker count, TLS/kTLS mode, cipher and connection limit.
 - Persistent GET, PUT, or mixed workloads with configurable object sizes,
   connections, worker threads, warmup, duration, request limit, and repetitions.
 - Interactive target selection and benchmark configuration, or noninteractive
   `pair`, `inspect`, and `run` commands.
 - Client/server process CPU time, peak resident memory, available context switches, server
-  operation counters, latency histograms, throughput, and saved JSON results.
+  operation counters, latency histograms, throughput, measured cycles per I/O when available,
+  and saved JSON results.
 
-The Linux server and client multiplex nonblocking TLS connections using epoll.
+The Linux server and client multiplex nonblocking TCP/TLS connections using epoll.
 Connections are distributed across a configurable number of worker threads,
 rather than creating one thread per connection. The server uses SO_REUSEPORT
 listeners. Windows uses HTTP.sys, Schannel and IOCP for asynchronous HTTP
@@ -70,11 +73,27 @@ without accepting connections. This guard is released automatically on exit,
 including crashes; an occupied guard port prevents startup with a clear error.
 Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
 
-The Linux HTTPS listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
+The Linux HTTPS control listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
 separate client machine can connect without an extra server argument. Use
 `--bind 127.0.0.1` for loopback-only testing, or specify an individual test-network
 IPv4 address. The instance guard remains loopback-only. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.
+
+The client always registers through HTTPS control; it never probes or falls back
+to plaintext control. Before each benchmark it starts a separate data endpoint:
+port **38444 for HTTP**, or **38445 for HTTPS/OpenSSL/kTLS**. The server advertises
+the effective port and settings; no client connection-transport option is needed.
+Only the selected workload endpoint is active during a run. Native server
+`--http-port` and `--https-port` override host-selected data ports, which must be
+distinct from control. Allow all three ports from the benchmark client only.
+
+One exclusive, automatically issued run lease owns the workload. Concurrent start
+requests receive HTTP 409. The client stops the workload after completion or a
+caught failure; an abandoned workload expires after its bounded lease. Lease
+credentials require no user interaction and are omitted from results. Plain HTTP
+provides no data confidentiality; use synthetic traffic on an isolated network.
+Server startup `--workers`, `--max-connections`, and `--cipher` configure control
+only; the client controls the workload's values separately.
 
 After upgrading from the old port 8443, rebuild and restart both programs and
 register the server at port 38443. Saved targets retain their previous port;
@@ -172,7 +191,19 @@ will correctly reject a different certificate.
   --method mixed --get-percent 70 --get-size 4KiB --put-size 16KiB \
   --connections 256 --requests 100000 --duration 30 \
   --output results/mixed.json
+
+# Change server tuning and disable workload TLS without restarting the server:
+./scripts/run-client.sh run --target .winlin-local/local.json \
+  --tls off --server-workers 32 --server-max-connections 32768 \
+  --workers 16 --connections 1024 --method get --get-size 4KiB
 ```
+
+Workload TLS defaults to `--tls on` (Linux userspace OpenSSL or Windows Schannel).
+`--tls off` selects plain HTTP; `--tls ktls` requests Linux kTLS. These are run
+settings sent over HTTPS control, not client connection options. Unsupported modes
+are rejected, never silently substituted. Server workers default to 8, configurable
+from 1 to 256; the workload connection limit defaults to 32768, up to 65536.
+The interactive benchmark menu exposes these same settings.
 
 `--get-percent` specifies the GET share by **issued request count**, not bytes.
 Mixed requests are interleaved deterministically and the ratio is exact for each
@@ -205,16 +236,18 @@ GET returns bytes from a pre-generated, reusable server buffer. PUT is
 acknowledged only after its complete body has been consumed and discarded.
 Payload generation happens outside the measured workload. There is no storage
 I/O, but encryption, buffering, memory copies, HTTP parsing, and authentication
-remain part of the measured stack. Credentials are checked on each request;
-control and workload endpoints currently share the HTTPS listener.
+remain part of the measured stack. An automatically supplied per-run lease is
+checked on each request in both HTTP and HTTPS modes. Control and workload traffic
+use different listeners in the same process, so telemetry still includes control
+overhead.
 
 ### Cipher selection and kTLS
 
-Both processes default to `TLS_AES_128_GCM_SHA256`. Start the server with
-`--cipher SUITE` and pair the client with the same option to choose a different
-OpenSSL-supported TLS 1.3 cipher. A run can override the saved client selection
-with `--cipher`, but must match the server's configured suite. Unsupported
-selections fail; there is no silent cipher substitution.
+Control and TLS workloads default to `TLS_AES_128_GCM_SHA256`. Client `run --cipher`
+selects the workload cipher on both ends without changing the saved control
+connection. Startup server `--cipher` and client `pair --cipher` configure control
+only. Cipher/TLS fields are `null` for plain HTTP. Unsupported selections fail;
+there is no silent cipher substitution.
 
 The Windows backend supports the Schannel TLS 1.3 AES-128-GCM/SHA-256 and
 AES-256-GCM/SHA-384 suites. It verifies negotiated protocol/algorithm/key size and
@@ -223,7 +256,8 @@ controlled by OS policy, not an OpenSSL-style per-process cipher list. The Linux
 client offers exactly its selected suite; setup never rewrites machine-wide
 Schannel cipher policy.
 
-Start a separate server with `--backend ktls` to request kTLS. Server capabilities
+Select client `run --tls ktls` or the interactive menu to request kTLS without a
+server restart. Server capabilities
 report actual transmit and receive activation on the discovery connection, and
 the server verifies the relevant direction on each workload connection. GET
 requires active kTLS TX; PUT requires active kTLS RX. Missing activation causes
@@ -240,6 +274,20 @@ The console shows throughput, p50/p99 latency, errors, and run-specific warnings
 such as load-generator CPU saturation or failed requests. General methodology
 caveats and backend measurement limitations appear once in the JSON report's
 top-level `notes` array, not in the console or each repetition's `warnings`.
+The final console summary includes the applied server settings and capabilities,
+client/server process telemetry, server CPU utilization, CPU seconds per completed
+I/O, cycles per completed I/O, and raw server counters. Report schema version 2
+also saves the control capabilities and the selected workload endpoint.
+
+CPU utilization uses **100% per CPU core**. CPU time per I/O and cycles per I/O
+use completed requests as the denominator; failed runs retain explicit warnings.
+Linux attempts an inherited `perf_event_open` hardware-cycle counter before
+creating worker threads; kernel permissions, VM support, or multiplexing can make
+it unavailable. Windows uses `QueryProcessCycleTime`, which excludes work charged
+to System. Counter sources and unavailability reasons accompany samples.
+There is **no CPU-frequency-based cycle estimate**. Unavailable cycles/CPIO remain
+`null` and are labelled unavailable in the summary. Cache misses, instructions,
+memory bandwidth and CPU profiling are not collected yet.
 JSON output defaults to a uniquely named file under `results/`; `--output`
 selects another path. Existing output files are not overwritten on startup.
 Completed repetitions are saved as the run progresses, and a caught run failure
@@ -258,8 +306,8 @@ Important limitations:
 
 - This is a closed-loop generator. It does not measure latency under a fixed
   external arrival rate and must not be used to claim a latency SLA.
-- Server telemetry is process-wide. Use one controller/run per server; exclusive
-  run leasing is not implemented. Sampling uses the control channel, so CPU and
+- Server telemetry is process-wide; the server enforces one active benchmark
+  lease. Unrelated control requests can still add overhead. Sampling uses the control channel, so CPU and
   counter boundaries slightly exceed the client load interval.
 - CPU utilization is reported as core equivalents, not a percentage of the entire
   machine. Peak RSS is the process-lifetime high-water mark, not a run-local peak.
@@ -270,11 +318,10 @@ Important limitations:
   comparison. Results include this scope and a report-level note. Windows context-switch
   and raw connection/handshake counters are currently unavailable and remain
   `null`, rather than zero.
-- NUMA placement, affinity, NIC/VM information, network counters, hardware cycles,
+- NUMA placement, affinity, NIC/VM information, network counters,
   instructions, cache misses, memory bandwidth, and kernel profiles are not
   collected yet. Unavailable metrics are listed in capabilities.
-- This version supports numeric IPv4 addresses only. The server defaults to
-  eight workers or the available logical CPU count, whichever is smaller.
+- This version supports numeric IPv4 addresses only.
 - TLS 1.2, handshake tests, paced load, automated comparative
   reports, and distributed load generators remain future work.
 

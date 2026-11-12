@@ -17,6 +17,8 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -134,20 +136,21 @@ inline bool equal_secret(std::string_view a, std::string_view b) {
 // normally; a client waiting for response bytes must still report this as a failed request.
 class PeerClosed : public std::runtime_error {
 public:
-    PeerClosed() : std::runtime_error("Peer closed TLS") {
+    PeerClosed() : std::runtime_error("Peer closed connection") {
     }
 };
 
-// Own a nonblocking socket and its OpenSSL session for the epoll client/server state machines.
+// Own a nonblocking TCP stream, with an OpenSSL session only when TLS was explicitly selected.
 // A zero read/write result means retry with want events, not EOF; terminal TLS errors throw.
 // One worker owns a session, and buffers must remain suitable for OpenSSL's retry requirements.
-struct TlsSocket {
+struct StreamSocket {
     Fd fd;
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl{nullptr, SSL_free};
     std::uint32_t want{EPOLLIN | EPOLLOUT};
 
-    TlsSocket(int socket, SSL_CTX* ctx) : fd(socket), ssl(SSL_new(ctx), SSL_free) {
-        if (!ssl || SSL_set_fd(ssl.get(), fd.value) != 1) {
+    StreamSocket(int socket, SSL_CTX* ctx)
+        : fd(socket), ssl(ctx ? SSL_new(ctx) : nullptr, SSL_free) {
+        if (ctx && (!ssl || SSL_set_fd(ssl.get(), fd.value) != 1)) {
             throw tls_error("SSL_set_fd");
         }
         int one = 1;
@@ -192,12 +195,40 @@ struct TlsSocket {
     }
 
     bool handshake(bool server) {
+        if (!ssl) {
+            if (server) {
+                return true;
+            }
+            pollfd ready{fd.value, POLLOUT, 0};
+            const auto result = poll(&ready, 1, 0);
+            if (result < 0 && errno != EINTR) {
+                throw system_error("poll TCP connection");
+            }
+            if (result <= 0) {
+                want = EPOLLOUT;
+                return false;
+            }
+            int error{};
+            socklen_t size = sizeof(error);
+            if (getsockopt(fd.value, SOL_SOCKET, SO_ERROR, &error, &size)) {
+                throw system_error("Inspect TCP connection");
+            }
+            if (error) {
+                errno = error;
+                throw system_error("TCP connection");
+            }
+            return true;
+        }
         ERR_clear_error();
         errno = 0;
         return outcome(server ? SSL_accept(ssl.get()) : SSL_connect(ssl.get()));
     }
 
     int read(char* buffer, std::size_t length) {
+        if (!ssl) {
+            return plain_result(::recv(fd.value, buffer, std::min<std::size_t>(length, 16384), 0),
+                                EPOLLIN);
+        }
         ERR_clear_error();
         errno = 0;
         const int result =
@@ -206,11 +237,31 @@ struct TlsSocket {
     }
 
     int write(const char* buffer, std::size_t length) {
+        if (!ssl) {
+            return plain_result(
+                ::send(fd.value, buffer, std::min<std::size_t>(length, 16384), MSG_NOSIGNAL),
+                EPOLLOUT);
+        }
         ERR_clear_error();
         errno = 0;
         const int result =
             SSL_write(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
         return outcome(result) ? result : 0;
+    }
+
+    // Keep retry and EOF semantics identical for HTTP and HTTPS state machines.
+    int plain_result(ssize_t result, std::uint32_t direction) {
+        if (result > 0) {
+            return static_cast<int>(result);
+        }
+        if (result == 0) {
+            throw PeerClosed();
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            want = direction;
+            return 0;
+        }
+        throw system_error("TCP stream I/O");
     }
 };
 
@@ -270,11 +321,11 @@ inline Fd connect_socket(const std::string& host, const std::string& port) {
     throw system_error("connect to " + host + ":" + port);
 }
 
-inline void wait_socket(TlsSocket& socket, Clock::time_point deadline) {
+inline void wait_socket(StreamSocket& socket, Clock::time_point deadline) {
     const auto remaining =
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
     if (remaining <= 0) {
-        throw std::runtime_error("TLS operation timed out");
+        throw std::runtime_error("Connection operation timed out");
     }
     pollfd event{socket.fd.value,
                  static_cast<short>((socket.want & EPOLLIN ? POLLIN : 0) |
@@ -286,14 +337,15 @@ inline void wait_socket(TlsSocket& socket, Clock::time_point deadline) {
     }
 }
 
-// Finish the handshake and verify a saved pin before a control request can send credentials.
-// An empty pin is allowed only for interactive discovery, before the user approves an identity.
-inline std::unique_ptr<TlsSocket> connect_tls(SSL_CTX* ctx, const std::string& host,
-                                              const std::string& port, const std::string& pin,
-                                              double timeout = 10) {
+// Finish the selected transport setup before sending bytes. A null context explicitly selects
+// plaintext for an advertised workload endpoint; HTTPS is never automatically downgraded.
+// TLS pins are checked before credentials; only interactive discovery may omit a TLS pin.
+inline std::unique_ptr<StreamSocket> connect_stream(SSL_CTX* ctx, const std::string& host,
+                                                    const std::string& port, const std::string& pin,
+                                                    double timeout = 10) {
     auto fd = connect_socket(host, port);
-    auto socket = std::make_unique<TlsSocket>(std::exchange(fd.value, -1), ctx);
-    if (SSL_set_tlsext_host_name(socket->ssl.get(), host.c_str()) != 1) {
+    auto socket = std::make_unique<StreamSocket>(std::exchange(fd.value, -1), ctx);
+    if (ctx && SSL_set_tlsext_host_name(socket->ssl.get(), host.c_str()) != 1) {
         throw tls_error("Cannot set TLS server name");
     }
     const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
@@ -303,14 +355,62 @@ inline std::unique_ptr<TlsSocket> connect_tls(SSL_CTX* ctx, const std::string& h
             wait_socket(*socket, deadline);
         }
     } catch (const std::exception& error) {
-        throw std::runtime_error("TLS connection to " + host + ":" + port +
-                                 " failed: " + error.what());
+        throw std::runtime_error(std::string(ctx ? "TLS" : "TCP") + " connection to " + host + ":" +
+                                 port + " failed: " + error.what());
     }
-    if (!pin.empty() && !equal_secret(fingerprint(socket->ssl.get()), pin)) {
+    if (ctx && !pin.empty() && !equal_secret(fingerprint(socket->ssl.get()), pin)) {
         throw std::runtime_error("Server certificate changed; refusing connection");
     }
     return socket;
 }
+
+// Start before creating server threads so perf inheritance covers control and workload workers.
+// Do not substitute CPU-time/frequency estimates when hardware counters are denied or multiplexed.
+class ProcessCycles {
+    Fd event_;
+    std::string unavailable_;
+
+public:
+    ProcessCycles() {
+        perf_event_attr settings{};
+        settings.size = sizeof(settings);
+        settings.type = PERF_TYPE_HARDWARE;
+        settings.config = PERF_COUNT_HW_CPU_CYCLES;
+        settings.inherit = 1;
+        settings.exclude_hv = 1;
+        settings.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+        event_ = Fd(static_cast<int>(
+            syscall(SYS_perf_event_open, &settings, 0, -1, -1, PERF_FLAG_FD_CLOEXEC)));
+        if (event_.value < 0) {
+            unavailable_ =
+                "perf_event_open hardware cycles unavailable: " + std::string(std::strerror(errno));
+        }
+    }
+
+    // Preserve the actual counter source and the reason for any unavailable sample.
+    Json sample() const {
+        Json result{
+            {"cpu_cycles", nullptr},
+            {"cpu_cycles_source", "perf_event_open; inherited process threads, user+kernel"},
+            {"cpu_cycles_unavailable_reason", nullptr}};
+        if (event_.value < 0) {
+            result["cpu_cycles_unavailable_reason"] = unavailable_;
+            return result;
+        }
+        std::array<std::uint64_t, 3> sample{};
+        if (::read(event_.value, sample.data(), sizeof(sample)) != sizeof(sample)) {
+            result["cpu_cycles_unavailable_reason"] = "Cannot read hardware cycle counter";
+        } else if (!sample[2] || sample[1] != sample[2]) {
+            result["cpu_cycles_unavailable_reason"] =
+                "Hardware cycle counter was not continuously scheduled; no estimate substituted";
+        } else {
+            result["cpu_cycles"] = sample[0];
+        }
+        return result;
+    }
+};
+
+inline std::unique_ptr<ProcessCycles> process_cycles;
 
 // Snapshot this process, not the whole host; Linux reports ru_maxrss in KiB.
 inline Json usage() {
@@ -318,11 +418,15 @@ inline Json usage() {
     if (getrusage(RUSAGE_SELF, &data) != 0) {
         throw system_error("getrusage");
     }
-    return {{"user_cpu_seconds", data.ru_utime.tv_sec + data.ru_utime.tv_usec / 1e6},
-            {"system_cpu_seconds", data.ru_stime.tv_sec + data.ru_stime.tv_usec / 1e6},
-            {"peak_rss_bytes", static_cast<std::uint64_t>(data.ru_maxrss) * 1024},
-            {"voluntary_context_switches", data.ru_nvcsw},
-            {"involuntary_context_switches", data.ru_nivcsw}};
+    Json result{{"user_cpu_seconds", data.ru_utime.tv_sec + data.ru_utime.tv_usec / 1e6},
+                {"system_cpu_seconds", data.ru_stime.tv_sec + data.ru_stime.tv_usec / 1e6},
+                {"peak_rss_bytes", static_cast<std::uint64_t>(data.ru_maxrss) * 1024},
+                {"voluntary_context_switches", data.ru_nvcsw},
+                {"involuntary_context_switches", data.ru_nivcsw}};
+    if (process_cycles) {
+        result.update(process_cycles->sample());
+    }
+    return result;
 }
 
 inline Json environment() {

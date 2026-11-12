@@ -200,6 +200,8 @@ inline HttpHead parse_head(std::string_view text) {
 // Describe one repeatable load configuration, shared by CLI/menu input and result serialization.
 // Call validate() before allocating workers or sockets; workers must not outnumber connections.
 struct RunConfig {
+    std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
+    unsigned server_workers{8}, server_max_connections{32768};
     std::string method{"get"};
     std::size_t get_size{4096};
     std::size_t put_size{4096};
@@ -213,6 +215,11 @@ struct RunConfig {
     double timeout{10};
 
     void validate() const {
+        if ((tls != "on" && tls != "off" && tls != "ktls") || !server_workers ||
+            server_workers > 256 || !server_max_connections || server_max_connections > 65536 ||
+            connections > server_max_connections) {
+            throw std::invalid_argument("Server benchmark settings are outside supported limits");
+        }
         if (method != "get" && method != "put" && method != "mixed") {
             throw std::invalid_argument("Method must be get, put or mixed");
         }
@@ -226,13 +233,23 @@ struct RunConfig {
     }
 
     Json json() const {
-        return {{"method", method},           {"get_size_bytes", get_size},
-                {"put_size_bytes", put_size}, {"get_percent", get_percent},
-                {"connections", connections}, {"workers", workers},
-                {"warmup_seconds", warmup},   {"duration_seconds", duration},
-                {"repetitions", repetitions}, {"request_limit", requests},
-                {"timeout_seconds", timeout}, {"load_mode", "closed_loop"},
-                {"tls_version", "TLSv1.3"}};
+        return {{"tls", tls},
+                {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
+                {"server_workers", server_workers},
+                {"server_max_connections", server_max_connections},
+                {"method", method},
+                {"get_size_bytes", get_size},
+                {"put_size_bytes", put_size},
+                {"get_percent", get_percent},
+                {"connections", connections},
+                {"workers", workers},
+                {"warmup_seconds", warmup},
+                {"duration_seconds", duration},
+                {"repetitions", repetitions},
+                {"request_limit", requests},
+                {"timeout_seconds", timeout},
+                {"load_mode", "closed_loop"},
+                {"tls_version", tls == "off" ? Json(nullptr) : Json("TLSv1.3")}};
     }
 };
 
@@ -250,9 +267,32 @@ inline Json usage_delta(const Json& before, const Json& after, double elapsed) {
         }
         return after.at(key).get<std::int64_t>() - before.at(key).get<std::int64_t>();
     };
+    const auto cycles = before.contains("cpu_cycles") && after.contains("cpu_cycles") &&
+                                !before.at("cpu_cycles").is_null() &&
+                                !after.at("cpu_cycles").is_null() &&
+                                after.at("cpu_cycles").get<std::uint64_t>() >=
+                                    before.at("cpu_cycles").get<std::uint64_t>()
+                            ? Json(after.at("cpu_cycles").get<std::uint64_t>() -
+                                   before.at("cpu_cycles").get<std::uint64_t>())
+                            : Json(nullptr);
+    Json cycles_reason = nullptr;
+    if (cycles.is_null()) {
+        cycles_reason = after.value("cpu_cycles_unavailable_reason", Json(nullptr));
+        if (cycles_reason.is_null()) {
+            cycles_reason = before.value("cpu_cycles_unavailable_reason", Json(nullptr));
+        }
+        if (cycles_reason.is_null()) {
+            cycles_reason =
+                "A valid, monotonic hardware-cycle counter is required at both boundaries";
+        }
+    }
     return {{"user_cpu_seconds", user},
             {"system_cpu_seconds", system},
             {"cpu_core_equivalents", (user + system) / elapsed},
+            {"cpu_utilization_percent", 100 * (user + system) / elapsed},
+            {"cpu_cycles", cycles},
+            {"cpu_cycles_source", after.value("cpu_cycles_source", Json(nullptr))},
+            {"cpu_cycles_unavailable_reason", cycles_reason},
             {"peak_rss_bytes", after.at("peak_rss_bytes")},
             {"voluntary_context_switches", difference("voluntary_context_switches")},
             {"involuntary_context_switches", difference("involuntary_context_switches")}};

@@ -2,6 +2,7 @@
 #include "winlin/agent.hpp"
 
 #include <iostream>
+#include <latch>
 #include <mutex>
 #include <unordered_map>
 
@@ -16,11 +17,27 @@ void on_signal(int) {
 
 AgentConfig linux_config(const Args& args) {
     const auto backend = args.get("--backend", "openssl");
-    if (backend != "openssl" && backend != "ktls") {
-        throw std::invalid_argument("Linux backend must be openssl or ktls");
+    if (backend != "openssl") {
+        throw std::invalid_argument(
+            "Select benchmark TLS/kTLS from the client; control uses OpenSSL");
     }
-    auto config = AgentConfig::from_args(args, backend == "ktls" ? "openssl-ktls" : "openssl");
+    auto config = AgentConfig::from_args(args, "openssl");
+    config.benchmark_tls_modes = {"on", "off", "ktls"};
     config.environment = environment();
+    return config;
+}
+
+// Apply requested tuning only to the per-run workload, leaving the control endpoint unchanged.
+AgentConfig workload_config(const Args& args, const BenchmarkOptions& options) {
+    auto config = linux_config(args);
+    config.role = AgentConfig::Role::workload;
+    config.tls = options.tls != "off";
+    config.backend = options.tls == "off"    ? "http"
+                     : options.tls == "ktls" ? "openssl-ktls"
+                                             : "openssl";
+    config.cipher = options.cipher;
+    config.workers = options.workers;
+    config.connection_limit = options.max_connections;
     return config;
 }
 
@@ -32,11 +49,15 @@ struct Server : Agent {
     bool ktls{};
     std::atomic<bool> stop{};
 
-    Server(const Args& args)
+    Server(const Args& args, const BenchmarkOptions* options = nullptr,
+           const std::string& run_id = {})
         : Agent(
-              linux_config(args),
-              args.get("--token-file").empty() ? "" : token_file(args.get("--token-file")),
-              args.get("--token-file").empty()
+              options ? workload_config(args, *options) : linux_config(args),
+              options                            ? "workload"
+              : args.get("--token-file").empty() ? ""
+                                                 : token_file(args.get("--token-file")),
+              options ? std::optional<std::string>(run_id)
+              : args.get("--token-file").empty()
                   ? std::nullopt
                   : optional_token_file(
                         args.get("--session-file", args.get("--token-file") + ".session")),
@@ -44,19 +65,25 @@ struct Server : Agent {
                   return issue_token_file(path);
               },
               equal_secret, usage),
-          tls(context(true, args.get("--cipher", "TLS_AES_128_GCM_SHA256"),
-                      args.get("--backend", "openssl") == "ktls")),
-          payload(max_object_size), ktls(args.get("--backend", "openssl") == "ktls") {
-        if (args.get("--token-file").empty()) {
+          tls(options && options->tls == "off"
+                  ? Context(nullptr, SSL_CTX_free)
+                  : context(true,
+                            options ? options->cipher
+                                    : args.get("--cipher", "TLS_AES_128_GCM_SHA256"),
+                            options && options->tls == "ktls")),
+          payload(options ? max_object_size : 0), ktls(options && options->tls == "ktls") {
+        if (!options && args.get("--token-file").empty()) {
             log_warning("Authentication disabled; use only on an isolated benchmark network");
         }
-        if (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
-            SSL_CTX_use_PrivateKey_file(tls.get(), args.require("--key").c_str(),
-                                        SSL_FILETYPE_PEM) != 1 ||
-            SSL_CTX_check_private_key(tls.get()) != 1) {
+        if (tls &&
+            (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
+             SSL_CTX_use_PrivateKey_file(tls.get(), args.require("--key").c_str(),
+                                         SSL_FILETYPE_PEM) != 1 ||
+             SSL_CTX_check_private_key(tls.get()) != 1)) {
             throw tls_error("Cannot load matching certificate/private key");
         }
-        if (RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
+        if (!payload.empty() &&
+            RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
             throw tls_error("Cannot generate reusable payload");
         }
     }
@@ -67,13 +94,22 @@ struct Server : Agent {
 // The accept loop reserves an active slot before construction, released by this session's
 // destructor.
 struct Session {
-    TlsSocket socket;
+    StreamSocket socket;
     Server& server;
-    enum class State { handshake, header, body, send_header, send_body } state{State::handshake};
+    enum class State {
+        handshake,
+        header,
+        body,
+        control_body,
+        send_header,
+        send_body
+    } state{State::handshake};
     std::string input, output, text_body;
     std::array<char, 16384> buffer{};
     std::size_t offset{}, body_remaining{}, body_size{};
     bool close{}, object_response{}, get{}, put{}, tx{}, rx{};
+    std::optional<HttpHead> control_head;
+    std::string control_body;
     Clock::time_point activity{Clock::now()};
 
     Session(int fd, Server& owner) : socket(fd, owner.tls.get()), server(owner) {
@@ -100,13 +136,19 @@ struct Session {
     // Translate shared dispatch into transport states; a PUT must be drained before responding.
     void request(const HttpHead& head) {
         body_remaining = 0;
-        const auto reply =
-            server.Agent::request(head, {SSL_get_version(socket.ssl.get()),
-                                         SSL_get_cipher_name(socket.ssl.get()), tx, rx});
+        const ConnectionInfo connection{socket.ssl ? SSL_get_version(socket.ssl.get()) : "",
+                                        socket.ssl ? SSL_get_cipher_name(socket.ssl.get()) : "", tx,
+                                        rx};
+        const auto reply = server.Agent::request(head, connection);
         close = reply.close;
         get = reply.kind == AgentReply::Kind::object;
         put = reply.kind == AgentReply::Kind::consume_put;
-        if (put) {
+        if (reply.kind == AgentReply::Kind::consume_control) {
+            control_head = head;
+            control_body.clear();
+            body_remaining = reply.size;
+            state = State::control_body;
+        } else if (put) {
             body_size = body_remaining = reply.size;
             state = State::body;
         } else {
@@ -122,9 +164,11 @@ struct Session {
                 if (!socket.handshake(true)) {
                     return true;
                 }
-                tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
-                rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
-                ++server.handshakes;
+                if (socket.ssl) {
+                    tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
+                    rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
+                    ++server.handshakes;
+                }
                 if (tx) {
                     ++server.tx_ktls;
                 }
@@ -152,6 +196,28 @@ struct Session {
                         return false;
                     }
                     const int count = socket.read(buffer.data(), buffer.size());
+                    if (!count) {
+                        return true;
+                    }
+                    input.append(buffer.data(), count);
+                }
+            } else if (state == State::control_body) {
+                const auto count = std::min(body_remaining, input.size());
+                control_body.append(input.data(), count);
+                input.erase(0, count);
+                body_remaining -= count;
+                if (!body_remaining) {
+                    const auto reply = server.Agent::request(
+                        *control_head,
+                        {SSL_get_version(socket.ssl.get()), SSL_get_cipher_name(socket.ssl.get())},
+                        control_body);
+                    control_head.reset();
+                    control_body.clear();
+                    close = reply.close;
+                    respond(reply.status, reply.text);
+                } else {
+                    const auto count =
+                        socket.read(buffer.data(), std::min(buffer.size(), body_remaining));
                     if (!count) {
                         return true;
                     }
@@ -260,9 +326,12 @@ Fd listener(const std::string& bind_address, unsigned& port) {
 
 // Own all sessions for one listener. Per-connection errors are recoverable; listener/epoll failures
 // escape to main so a partial worker pool cannot masquerade as a successful server.
-void serve(Server& server, Fd listener_fd) {
+void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = {}) {
     Epoll poller;
     poller.set(listener_fd.value, EPOLLIN, true);
+    if (ready) {
+        ready();
+    }
     std::unordered_map<int, std::unique_ptr<Session>> sessions;
     std::array<epoll_event, 256> events{};
     auto sweep = Clock::now();
@@ -312,12 +381,12 @@ void serve(Server& server, Fd listener_fd) {
                     if (it->second->state == Session::State::header && !it->second->input.empty()) {
                         log_warning("Peer closed an incomplete HTTP header");
                     } else if (it->second->state != Session::State::header) {
-                        log_warning(std::string("Peer closed an unfinished TLS request: ") +
+                        log_warning(std::string("Peer closed an unfinished request: ") +
                                     error.what());
                     }
                     sessions.erase(fd);
                 } catch (const std::exception& error) {
-                    log_warning(std::string("Closing failed TLS session: ") + error.what());
+                    log_warning(std::string("Closing failed connection: ") + error.what());
                     sessions.erase(fd);
                 }
             }
@@ -336,6 +405,78 @@ void serve(Server& server, Fd listener_fd) {
         }
     }
 }
+
+// Reuse exactly the native epoll/HTTP engine for all workload modes. Only TLS record processing
+// differs; listeners and worker counts are replaced between exclusive runs, never during a run.
+class LinuxBenchmark final : public BenchmarkInstance {
+    Server server_;
+    unsigned port_;
+    mutable std::mutex failure_mutex_;
+    std::string failure_;
+    std::vector<std::jthread> workers_;
+
+public:
+    LinuxBenchmark(const Args& args, const BenchmarkOptions& options, const std::string& id)
+        : server_(args, &options, id),
+          port_(static_cast<unsigned>(
+              number(args.get(options.tls == "off" ? "--http-port" : "--https-port",
+                              options.tls == "off" ? "38444" : "38445"),
+                     65535))) {
+        std::vector<Fd> listeners;
+        auto ready = std::make_shared<std::latch>(options.workers);
+        try {
+            for (unsigned index = 0; index < options.workers; ++index) {
+                listeners.push_back(listener(args.get("--bind", "0.0.0.0"), port_));
+            }
+            for (auto& fd : listeners) {
+                workers_.emplace_back([this, ready, owned = std::move(fd)]() mutable {
+                    bool announced = false;
+                    try {
+                        serve(server_, std::move(owned), [&] {
+                            announced = true;
+                            ready->count_down();
+                        });
+                    } catch (const std::exception& error) {
+                        std::lock_guard lock(failure_mutex_);
+                        failure_ = error.what();
+                        server_.stop = true;
+                        if (!announced) {
+                            ready->count_down();
+                        }
+                    }
+                });
+            }
+            ready->wait();
+            std::lock_guard lock(failure_mutex_);
+            if (!failure_.empty()) {
+                throw std::runtime_error(failure_);
+            }
+        } catch (...) {
+            server_.stop = true;
+            workers_.clear();
+            throw;
+        }
+    }
+
+    ~LinuxBenchmark() override {
+        server_.stop = true;
+        workers_.clear();
+    }
+
+    Json describe() const override {
+        return {{"port", port_},
+                {"transport", server_.config.tls ? "https" : "http"},
+                {"backend", server_.config.backend}};
+    }
+
+    Json telemetry() const override {
+        std::lock_guard lock(failure_mutex_);
+        if (!failure_.empty()) {
+            throw BenchmarkError(503, "Workload worker failed: " + failure_);
+        }
+        return server_.telemetry();
+    }
+};
 }
 
 int main(int argc, char** argv) {
@@ -343,7 +484,9 @@ int main(int argc, char** argv) {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout
             << "winlin-server --cert certificate.pem --key private.key\n"
-               "  [--bind 0.0.0.0] [--port 38443] [--workers 8] [--backend openssl|ktls]\n"
+               "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
+               "  [--http-port 38444] [--https-port 38445]\n"
+               "  Benchmark workers/TLS/kTLS are selected by the client per run.\n"
                "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n"
                "  [--token-file path] (optional authentication; default: none)\n"
                "  [--session-file path] (requires --token-file; default: TOKEN-FILE.session)\n";
@@ -355,9 +498,37 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
         args.allow({"--cert", "--key", "--token-file", "--bind", "--port", "--workers", "--backend",
-                    "--cipher", "--max-connections", "--session-file"});
+                    "--cipher", "--max-connections", "--session-file", "--http-port",
+                    "--https-port"});
+        const auto control_port = number(args.get("--port", "38443"), 65535);
+        const auto http_port = number(args.get("--http-port", "38444"), 65535);
+        const auto https_port = number(args.get("--https-port", "38445"), 65535);
+        if ((control_port && (control_port == http_port || control_port == https_port)) ||
+            (http_port && http_port == https_port)) {
+            throw std::invalid_argument("Control, HTTP and HTTPS workload ports must be distinct");
+        }
         const auto instance_guard = server_guard();
+        process_cycles = std::make_unique<ProcessCycles>();
+        BenchmarkController controller(
+            [] {
+                std::array<unsigned char, 32> bytes{};
+                if (RAND_bytes(bytes.data(), bytes.size()) != 1) {
+                    throw tls_error("Cannot generate benchmark lease");
+                }
+                std::string id;
+                constexpr char hex[] = "0123456789abcdef";
+                for (auto byte : bytes) {
+                    id += hex[byte >> 4];
+                    id += hex[byte & 15];
+                }
+                return id;
+            },
+            [&](const BenchmarkOptions& options, const std::string& id) {
+                return std::make_unique<LinuxBenchmark>(args, options, id);
+            });
         Server server(args);
+        server.config.role = AgentConfig::Role::control;
+        server.controller = &controller;
         const auto bind_address = args.get("--bind", "0.0.0.0");
         auto port = static_cast<unsigned>(number(args.get("--port", "38443"), 65535));
         const auto workers = server.config.workers;

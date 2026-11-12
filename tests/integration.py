@@ -1,471 +1,340 @@
-"""Loopback integration tests; all credentials and results live in a temporary directory."""
+"""Exercise the actual HTTPS controller and per-run Linux workload engines on temporary ports."""
 
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
-import secrets
 import select
-import signal
 import socket
 import ssl
 import subprocess
 import sys
 import tempfile
-from https_contract import exercise_contract, exercise_single_instance, tls_context
+import time
+
+from https_contract import exercise_single_instance, tls_context
 
 
 SERVER, CLIENT = sys.argv[1:3]
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def command(*args, expected=0, input_text=None, env=None):
-    # Keep the existing end-to-end cases while exercising the launcher's stdin/argv/exit forwarding.
-    arguments = [str(arg) for arg in args]
-    if arguments[0] == CLIENT:
-        arguments = [
-            str(SCRIPTS / "run-client.sh"), "--build-dir", str(Path(CLIENT).parent),
-            "--", *arguments[1:],
-        ]
+def command(*arguments, expected=0, **kwargs):
     result = subprocess.run(
-        arguments,
-        capture_output=True,
-        text=True,
-        input=input_text,
-        env=env,
-        timeout=20,
+        [str(argument) for argument in arguments],
+        capture_output=True, text=True, timeout=30, **kwargs,
     )
-    if result.returncode != expected:
-        raise AssertionError(
-            f"{args[0]} returned {result.returncode}, expected {expected}\n"
-            f"{result.stdout}\n{result.stderr}"
-        )
+    assert result.returncode == expected, result.stdout + result.stderr
     return result
 
 
-def private_file(path, text):
-    path.write_text(text)
-    path.chmod(0o600)
+class Controller:
+    """Own only test-created processes; keep their guard, credentials and diagnostics isolated."""
 
-
-class Agent:
-    """Own a Linux server and loopback control connection; always reap it and retain diagnostics."""
-
-    def __init__(self, directory, backend="openssl", bundled=False, bind_address="127.0.0.1"):
+    def __init__(self, directory, bind=None, extra=()):
         self.directory = directory
         arguments = [
-            str(SCRIPTS / "run-server.sh"), "--build-dir", str(Path(SERVER).parent),
-            "--state-dir", str(directory), "--",
-            "--port", "0", "--workers", "2", "--backend", backend,
+            str(ROOT / "scripts/run-server.sh"), "--build-dir", str(Path(SERVER).parent),
+            "--state-dir", str(directory), "--port", "0", "--http-port", "0",
+            "--https-port", "0", "--workers", "2", *extra,
         ]
-        if not bundled:
-            arguments += [
-                "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
-                "--token-file", str(directory / "pairing"),
-                "--session-file", str(directory / f"{backend}.session"),
-            ]
-        if bind_address is not None:
-            arguments += ["--bind", bind_address]
+        if bind is not None:
+            arguments += ["--bind", bind]
         self.process = subprocess.Popen(
-            arguments,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
-            readable, _, _ = select.select([self.process.stdout], [], [], 10)
-            if not readable:
-                raise AssertionError("Server startup timed out")
+            assert select.select([self.process.stdout], [], [], 10)[0], "Controller startup timed out"
             line = self.process.stdout.readline()
-            if not line:
-                raise AssertionError(f"Server failed: {self.process.stderr.read()}")
-            ready = json.loads(line)
-            self.port = ready["port"]
-            self.bind_address = ready["bind"]
-            self.connection = http.client.HTTPSConnection(
-                "127.0.0.1", self.port, context=tls_context(), timeout=3
-            )
+            assert line, self.process.stderr.read()
+            self.ready = json.loads(line)
+            self.port = self.ready["port"]
+            self.token = None
         except BaseException:
             self.stop()
             raise
 
     def stop(self):
-        if hasattr(self, "connection"):
-            self.connection.close()
         if self.process.poll() is None:
             self.process.terminate()
         try:
-            _, stderr = self.process.communicate(timeout=5)
+            _, stderr = self.process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.communicate()
-            raise AssertionError("Server did not stop gracefully")
-        if self.process.returncode != 0:
-            raise AssertionError(f"Server failed: {stderr}")
-        self.stderr = stderr
+            raise AssertionError("Controller or workload workers failed to stop")
+        assert self.process.returncode == 0, stderr
 
-    def request(self, method, path, token=None, body=None):
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+    def request(self, method, path, body=None, host="127.0.0.1"):
+        connection = http.client.HTTPSConnection(
+            host, self.port, context=tls_context(), timeout=10,
+        )
+        try:
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            payload = response.read()
+            return response.status, json.loads(payload)
+        finally:
+            connection.close()
+
+    def start(self, **settings):
+        status, payload = self.request("POST", "/v1/benchmark/start", json.dumps(settings))
+        assert status == 200, payload
+        return payload
+
+    def telemetry(self, lease):
+        status, payload = self.request("GET", "/v1/benchmark/telemetry?run_id=" + lease["run_id"])
+        assert status == 200, payload
+        return payload
+
+    def finish(self, lease):
+        status, payload = self.request("POST", "/v1/benchmark/stop?run_id=" + lease["run_id"])
+        assert status == 200, payload
+        return payload
+
+
+class Workload:
+    """Connect only to the endpoint and automatic lease returned by the HTTPS controller."""
+
+    def __init__(self, lease):
+        self.lease = lease
+        connection_type = (http.client.HTTPConnection if lease["transport"] == "http"
+                           else http.client.HTTPSConnection)
+        options = {} if lease["transport"] == "http" else {"context": tls_context()}
+        self.connection = connection_type("127.0.0.1", lease["port"], timeout=10, **options)
+
+    def request(self, method, path, body=None, authorized=True):
+        headers = {"Authorization": f"Bearer {self.lease['run_id']}"} if authorized else {}
         self.connection.request(method, path, body=body, headers=headers)
         response = self.connection.getresponse()
         return response.status, response.read()
 
 
-def exercise_invalid_request_accounting(agent, token):
-    """A parser rejection after a persistent GET must not inherit successful-workload accounting."""
-    status, payload = agent.request("GET", "/v1/telemetry", token)
-    assert status == 200
-    before = json.loads(payload)
-    with tls_context().wrap_socket(
-        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
-        server_hostname="127.0.0.1",
-    ) as raw:
-        raw.sendall(
-            (f"GET /v1/object?size=512 HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
-             f"Authorization: Bearer {token}\r\n\r\n").encode()
-        )
-        response = http.client.HTTPResponse(raw)
-        response.begin()
-        assert response.status == 200 and len(response.read()) == 512
-        raw.sendall(
-            (f"PUT /v1/object HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
-             f"Authorization: Bearer {token}\r\n"
-             "Content-Length: 1\r\ncontent-length: 2\r\n\r\n").encode()
-        )
-        response = http.client.HTTPResponse(raw)
-        response.begin()
-        assert response.status == 400
-        response.read()
-        # EOF guarantees the server finished its close/accounting path before telemetry is sampled.
-        assert raw.recv(1) == b""
-
-    # Unlike an idle disconnect, EOF halfway through a declared PUT body must be diagnosed.
-    with tls_context().wrap_socket(
-        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
-        server_hostname="127.0.0.1",
-    ) as raw:
-        raw.sendall(
-            (f"PUT /v1/object HTTP/1.1\r\nHost: 127.0.0.1:{agent.port}\r\n"
-             f"Authorization: Bearer {token}\r\nContent-Length: 512\r\n\r\n").encode()
-            + b"x" * 256
-        )
-
-    # Header reception is also active work once any bytes have arrived, even before framing completes.
-    with tls_context().wrap_socket(
-        socket.create_connection(("127.0.0.1", agent.port), timeout=3),
-        server_hostname="127.0.0.1",
-    ) as raw:
-        raw.sendall(b"GET /v1/object?size=512 HTTP/1.1\r\n")
-    status, payload = agent.request("GET", "/v1/telemetry", token)
-    assert status == 200
-    after = json.loads(payload)
-    assert after["get_completed"] == before["get_completed"] + 1, after
-    assert after["get_bytes"] == before["get_bytes"] + 512, after
-    assert after["put_completed"] == before["put_completed"], after
-    assert after["put_bytes"] == before["put_bytes"], after
-
-
-def run_case(directory, target, name, *options):
-    """Verify a persisted real-client repetition, including operation/latency/byte consistency."""
-    output = directory / f"{name}.json"
-    configuration = {
-        "--connections": "4", "--workers": "2", "--warmup": "0.02",
-        "--duration": "1", "--repetitions": "1", "--requests": "100",
-    }
-    # Merge overrides rather than repeating CLI flags, which the strict argument parser rejects.
-    configuration.update(zip(options[::2], options[1::2]))
-    arguments = [item for pair in configuration.items() for item in pair]
-    invocation = command(
-        CLIENT, "run", "--target", target,
-        "--output", output, *arguments,
-    )
-    report = json.loads(output.read_text())
-    assert report["status"] == "completed", report
-    for note in report["notes"]:
-        assert note not in invocation.stdout + invocation.stderr
-        assert all(note not in item["warnings"] for item in report["results"])
-    result = report["results"][0]
-    assert result["errors"] == 0
-    assert result["completed"] == result["issued"]
-    assert result["latency"]["samples"] == result["completed"]
-    assert result["latency_by_method"]["get"]["samples"] == result["get_completed"]
-    assert result["latency_by_method"]["put"]["samples"] == result["put_completed"]
-    assert sum(bucket["count"] for bucket in result["latency"]["histogram"]) == result["completed"]
-    assert result["latency"]["p50_us"] <= result["latency"]["p99_us"]
-    assert result["elapsed_seconds"] > 0
-    assert result["requests_per_second"] > 0
-    assert result["server_process"]["user_cpu_seconds"] >= 0
-    assert result["client_process"]["system_cpu_seconds"] >= 0
-    assert "access_token" not in output.read_text()
-    return report, result
-
-
-with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
+with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     directory = Path(temporary)
-    command(
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", directory / "private.key", "-out", directory / "cert.pem",
-        "-days", "1", "-subj", "/CN=winlin-test",
-        "-addext", "subjectAltName=IP:127.0.0.1",
-    )
-    bootstrap = secrets.token_hex(32)
-    private_file(directory / "pairing", bootstrap + "\n")
-    certificate = ssl.PEM_cert_to_DER_cert((directory / "cert.pem").read_text())
-    fingerprint = hashlib.sha256(certificate).hexdigest()
-    server_arguments = [
-        SERVER, "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
-        "--token-file", str(directory / "pairing"),
-    ]
-    # Omit --bind to exercise the actual default, not a wrapper-supplied wildcard argument.
-    agent = Agent(directory, bind_address=None)
+    controller = Controller(directory)
     try:
-        assert agent.bind_address == "0.0.0.0"
-        alternate = http.client.HTTPSConnection(
-            "127.0.0.2", agent.port, context=tls_context(), timeout=3,
-        )
-        try:
-            alternate.request("GET", "/v1/capabilities")
-            response = alternate.getresponse()
-            assert response.status == 401
-            response.read()
-        finally:
-            alternate.close()
-    finally:
-        agent.stop()
+        assert controller.ready["bind"] == "0.0.0.0"
+        assert controller.request("GET", "/v1/capabilities", host="127.0.0.2")[0] == 200
+        status, capabilities = controller.request("GET", "/v1/capabilities")
+        assert status == 200 and capabilities["benchmark_control"]
+        assert capabilities["benchmark_tls_modes"] == ["on", "off", "ktls"]
+        assert controller.request("GET", "/v1/object?size=512")[0] == 404
+        exercise_single_instance([SERVER], controller.port)
 
-    agent = Agent(directory)
-    try:
-        assert agent.bind_address == "127.0.0.1"
-        # An explicit loopback override must not accept connections addressed to another local IP.
-        try:
-            with socket.create_connection(("127.0.0.2", agent.port), timeout=3):
-                raise AssertionError("Explicit loopback listener accepted another IPv4 address")
-        except ConnectionRefusedError:
-            pass
-        exercise_single_instance(server_arguments, agent.port)
-        assert agent.request("GET", "/v1/capabilities")[0] == 401
-        assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401
-        target = directory / "target.json"
-        pairing = (
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", str(agent.port),
-            "--token-file", directory / "pairing", "--target", target,
-        )
-        result = command(*pairing, "--fingerprint", "0" * 64, expected=1)
-        assert "certificate changed" in result.stderr
-        assert not target.exists()
-        # Omitting a custom pin must not mean trust-any-certificate or consume its bootstrap token.
-        result = command(*pairing, expected=1)
-        assert "certificate changed" in result.stderr
-        assert not target.exists()
-        custom_menu = command(
-            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\nno\n0\n",
-            env=dict(os.environ, XDG_STATE_HOME=str(directory / "custom-menu-state")),
-        )
-        assert "Trust this certificate?" in custom_menu.stdout
-        assert "Paired target saved" not in custom_menu.stdout
-        paired = command(*pairing, "--fingerprint", fingerprint)
-        target_json = json.loads(target.read_text())
-        token = target_json["access_token"]
-        assert bootstrap not in paired.stdout and token not in paired.stdout
-        assert target.stat().st_mode & 0o777 == 0o600
-        assert (directory / "openssl.session").stat().st_mode & 0o777 == 0o600
-        assert agent.request("POST", "/v1/pair", bootstrap)[0] == 409
-        assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401
-        inspected = command(CLIENT, "inspect", "--target", target)
-        assert json.loads(inspected.stdout)["backend"] == "openssl"
-        assert json.loads(inspected.stdout)["cipher"] == "TLS_AES_128_GCM_SHA256"
-        assert json.loads(inspected.stdout)["ktls_tx"] is False
-        target.chmod(0o644)
-        command(CLIENT, "inspect", "--target", target, expected=1)
-        target.chmod(0o600)
-
-        exercise_contract(agent, bootstrap, token, "openssl", "TLS_AES_128_GCM_SHA256")
-        exercise_invalid_request_accounting(agent, token)
-
-        _, result = run_case(directory, target, "get")
-        assert result["completed"] == 100
-        assert result["received_object_bytes"] == 100 * 4096
-        assert result["put_completed"] == 0
-        _, result = run_case(directory, target, "put", "--method", "put", "--put-size", "512")
-        assert result["sent_object_bytes"] == 100 * 512
-        assert result["get_completed"] == 0
-        _, result = run_case(
-            directory, target, "mixed", "--method", "mixed",
-            "--get-percent", "30", "--get-size", "512", "--put-size", "1KiB",
-        )
-        assert result["get_completed"] == 30 and result["put_completed"] == 70
-        for method in ("get", "put"):
-            for size in ("0", "4MiB"):
-                _, result = run_case(
-                    directory, target, f"{method}-{size}", "--method", method,
-                    f"--{method}-size", size,
-                )
-                assert result["completed"] == 100
-        report, result = run_case(directory, target, "repeated", "--repetitions", "2")
-        assert len(report["results"]) == 2
-        assert all(item["completed"] == 100 for item in report["results"])
-        _, result = run_case(
-            directory, target, "duration", "--duration", "0.1", "--requests", "0",
-        )
-        assert result["elapsed_seconds"] >= 0.1
-        _, result = run_case(
-            directory, target, "small-limit", "--connections", "64", "--requests", "7",
-        )
-        assert result["issued"] == result["completed"] == 7
-        failed_output = directory / "failed-run.json"
+        target = directory / "client/target.json"
         command(
-            CLIENT, "run", "--target", target, "--connections", "4", "--workers", "2",
-            "--timeout", "0.000000001", "--output", failed_output, expected=1,
-        )
-        failed = json.loads(failed_output.read_text())
-        assert failed["status"] == "failed" and "timed out" in failed["failure"]
-        original = (directory / "get.json").read_text()
-        command(
-            CLIENT, "run", "--target", target, "--output", directory / "get.json", expected=1,
-        )
-        assert (directory / "get.json").read_text() == original
-        assert not list(directory.glob("*.tmp.*"))
-        for option, value in (("--connections", "16385"), ("--duration", "nan"),
-                              ("--get-percent", "101"), ("--get-size", "65MiB"),
-                              ("--method", "invalid"), ("--workers", "0"),
-                              ("--rate", "100")):
-            rejected = command(CLIENT, "run", "--target", target, option, value, expected=1)
-            assert "FATAL:" in rejected.stderr
-        command(
-            CLIENT, "run", "--target", target, "--cipher", "TLS_CHACHA20_POLY1305_SHA256",
-            expected=1,
-        )
-        altered = dict(target_json, certificate_sha256="0" * 64)
-        private_file(directory / "wrong-pin.json", json.dumps(altered))
-        command(CLIENT, "inspect", "--target", directory / "wrong-pin.json", expected=1)
-        menu = command(CLIENT, input_text="0\n")
-        assert "Run HTTPS benchmark" in menu.stdout
-        state = directory / "state"
-        (state / "winlin").mkdir(parents=True)
-        private_file(state / "winlin/test.json", json.dumps(target_json))
-        menu_output = directory / "menu-result.json"
-        menu_input = (
-            "2\n1\n3\n1\nmixed\n512\n1KiB\n30\n4\n2\n0\n0.1\n20\n1\n"
-            f"{menu_output}\n0\n"
-        )
-        command(CLIENT, input_text=menu_input, env=dict(os.environ, XDG_STATE_HOME=str(state)))
-        assert json.loads(menu_output.read_text())["results"][0]["completed"] == 20
-    finally:
-        agent.stop()
-
-    assert "WARNING: Rejected malformed HTTP header" in agent.stderr
-    assert "WARNING: Peer closed an unfinished TLS request" in agent.stderr
-    assert "WARNING: Peer closed an incomplete HTTP header" in agent.stderr
-    assert bootstrap not in agent.stderr and token not in agent.stderr
-
-    agent = Agent(directory)
-    try:
-        # A healthy persistent client may disconnect between requests without sending close_notify.
-        assert agent.request("GET", "/v1/capabilities", token)[0] == 200
-        agent.connection.close()
-        target_json["port"] = str(agent.port)
-        private_file(target, json.dumps(target_json))
-        command(CLIENT, "inspect", "--target", target)
-        assert agent.request("POST", "/v1/pair", bootstrap)[0] == 409
-    finally:
-        agent.stop()
-
-    assert "Closing failed TLS session" not in agent.stderr, agent.stderr
-    assert "Peer closed an unfinished TLS request" not in agent.stderr, agent.stderr
-
-    # A forced process exit must release the guard without deleting state or cleaning a PID file.
-    agent = Agent(directory)
-    try:
-        agent.connection.close()
-        agent.process.kill()
-        _, stderr = agent.process.communicate(timeout=5)
-        assert agent.process.returncode == -signal.SIGKILL, stderr
-    finally:
-        if agent.process.poll() is None:
-            agent.stop()
-
-    agent = Agent(directory, "ktls")
-    try:
-        ktls_target = directory / "ktls-target.json"
-        command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
-            "--token-file", directory / "pairing", "--fingerprint", fingerprint,
-            "--target", ktls_target,
-        )
-        capabilities = json.loads(command(CLIENT, "inspect", "--target", ktls_target).stdout)
-        assert capabilities["backend"] == "openssl-ktls"
-        print(f"Verified kTLS capability: TX={capabilities['ktls_tx']}, RX={capabilities['ktls_rx']}")
-        for method, direction in (("get", "tx"), ("put", "rx")):
-            if capabilities[f"ktls_{direction}"]:
-                run_case(directory, ktls_target, f"ktls-{method}", "--method", method)
-            else:
-                result = command(
-                    CLIENT, "run", "--target", ktls_target, "--method", method, expected=1,
-                )
-                assert "refusing userspace fallback" in result.stderr
-    finally:
-        agent.stop()
-
-    # A non-Winlin listener occupying the reservation must also cause a clear startup failure.
-    with socket.socket() as guard_owner:
-        guard_owner.bind(("127.0.0.1", 8444))
-        guard_owner.listen(1)
-        exercise_single_instance(server_arguments, 38443)
-
-    # Default launch/pair needs no certificates, fingerprint entry, or token files.
-    bundled = directory / "bundled-cli"
-    agent = Agent(bundled, bundled=True)
-    try:
-        target = bundled / "new-client-state/target.json"
-        paired = command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
+            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
             "--target", target,
         )
-        assert "public benchmark certificate" in paired.stderr
-        fixture = SCRIPTS.parent / "certs/benchmark"
-        certificate = ssl.PEM_cert_to_DER_cert((fixture / "server.pem").read_text())
-        assert certificate == (fixture / "server.der").read_bytes()
-        assert json.loads(target.read_text())["certificate_sha256"] == hashlib.sha256(certificate).hexdigest()
-        assert not (bundled / "pairing-token").exists()
         assert json.loads(target.read_text())["access_token"] == ""
-        command(CLIENT, "inspect", "--target", target)
-        command(
-            CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
-            "--target", bundled / "second-client.json",
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert not (directory / "pairing-token").exists()
+        bad_target = directory / "wrong-pin.json"
+        refused = command(
+            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+            "--target", bad_target, "--fingerprint", "00" * 32, expected=1,
         )
-        command(
-            CLIENT, "run", "--target", target, "--method", "mixed",
-            "--connections", "2", "--workers", "1", "--warmup", "0", "--duration", "1",
-            "--requests", "10", "--repetitions", "1", "--output", bundled / "result.json",
+        assert "certificate changed" in refused.stderr and not bad_target.exists()
+        for invalid in ({"workers": 0}, {"workers": 1.5}, {"tls": "invalid"}, {"unknown": 1}):
+            assert controller.request("POST", "/v1/benchmark/start", json.dumps(invalid))[0] == 400
+        body = json.dumps({"tls": "off", "workers": 1})
+        fragmented = http.client.HTTPSConnection(
+            "127.0.0.1", controller.port, context=tls_context(), timeout=5,
         )
-    finally:
-        agent.stop()
-    agent = Agent(bundled, bundled=True)
-    try:
-        assert not (bundled / "pairing-token").exists()
-        saved = json.loads(target.read_text())
-        saved["port"] = str(agent.port)
-        private_file(target, json.dumps(saved))
-        command(CLIENT, "inspect", "--target", target)
-    finally:
-        agent.stop()
+        try:
+            fragmented.putrequest("POST", "/v1/benchmark/start")
+            fragmented.putheader("Content-Length", str(len(body)))
+            fragmented.endheaders()
+            fragmented.send(body[:5].encode())
+            fragmented.sock.settimeout(.1)
+            try:
+                fragmented.sock.recv(1)
+                raise AssertionError("Server started a workload before settings were complete")
+            except socket.timeout:
+                pass
+            fragmented.sock.settimeout(5)
+            fragmented.send(body[5:].encode())
+            response = fragmented.getresponse()
+            started = json.loads(response.read())
+            assert response.status == 200, started
+            controller.finish(started)
+        finally:
+            fragmented.close()
 
-    # Interactive onboarding recognizes only the bundled certificate without a trust prompt.
-    bundled = directory / "bundled-menu"
-    agent = Agent(bundled, bundled=True)
+        lease = controller.start(tls="off", workers=3, max_connections=32)
+        assert lease["transport"] == "http"
+        assert controller.request("POST", "/v1/benchmark/start", "{}")[0] == 409
+        assert controller.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
+        data = Workload(lease)
+        try:
+            status, payload = data.request("GET", "/v1/capabilities")
+            metadata = json.loads(payload)
+            assert status == 200 and metadata["transport"] == "http"
+            assert metadata["tls_version"] is None and metadata["cipher"] is None
+            assert metadata["workers"] == 3 and metadata["max_connections"] == 32
+            assert data.request("GET", "/v1/object?size=256", authorized=False)[0] == 401
+            for size in (0, 256, 4096, 65536, 4194304):
+                status, payload = data.request("GET", f"/v1/object?size={size}")
+                assert status == 200 and len(payload) == size
+                assert data.request("PUT", "/v1/object", body=b"x" * size) == (200, b"")
+            before = controller.telemetry(lease)
+            # A parser error after a GET must never reuse that GET's accounting state.
+            with socket.create_connection(("127.0.0.1", lease["port"]), timeout=5) as raw:
+                raw.sendall(
+                    (f"GET /v1/object?size=512 HTTP/1.1\r\nHost: localhost\r\n"
+                     f"Authorization: Bearer {lease['run_id']}\r\n\r\n").encode()
+                )
+                response = http.client.HTTPResponse(raw)
+                response.begin()
+                assert response.status == 200 and len(response.read()) == 512
+                raw.sendall(
+                    b"GET /v1/object?size=512 HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Content-Length: invalid\r\n\r\n"
+                )
+                response = http.client.HTTPResponse(raw)
+                response.begin()
+                assert response.status == 400
+                response.read()
+            after = controller.telemetry(lease)
+            assert after["get_completed"] == before["get_completed"] + 1
+            assert after["get_bytes"] == before["get_bytes"] + 512
+            assert after["put_completed"] == 5
+            assert after["tls_handshakes"] == 0
+        finally:
+            data.connection.close()
+            controller.finish(lease)
+        assert controller.request("GET", "/v1/benchmark/telemetry?run_id=" + lease["run_id"])[0] == 409
+
+        for mode, workers in (("on", 1), ("off", 4), ("on", 2)):
+            output = directory / f"{mode}-{workers}.json"
+            invocation = command(
+                CLIENT, "run", "--target", target, "--tls", mode, "--server-workers", workers,
+                "--server-max-connections", "32", "--method", "mixed",
+                "--get-size", "512", "--put-size", "256", "--connections", "4", "--workers", "2",
+                "--warmup", "0.02", "--duration", "1", "--requests", "100", "--repetitions", "2",
+                "--output", output,
+            )
+            report = json.loads(output.read_text())
+            assert report["status"] == "completed" and len(report["results"]) == 2
+            assert report["server_configuration"]["workers"] == workers
+            assert report["server_capabilities"]["transport"] == ("http" if mode == "off" else "https")
+            assert report["benchmark"] == ("http" if mode == "off" else "https")
+            assert "Final telemetry summary" in invocation.stdout
+            assert '"server_cpu_percent"' in invocation.stdout
+            assert '"server_cycles_per_io"' in invocation.stdout
+            assert "run_id" not in output.read_text() and "access_token" not in output.read_text()
+            for repetition in report["results"]:
+                assert repetition["completed"] == repetition["issued"] == 100
+                assert repetition["errors"] == 0
+                assert repetition["latency"]["samples"] == 100
+                assert repetition["get_completed"] == repetition["put_completed"] == 50
+                cpu = repetition["server_process"]
+                if cpu["cpu_cycles"] is None:
+                    assert repetition["server_cycles_per_request"] is None
+                    assert cpu["cpu_cycles_unavailable_reason"]
+                else:
+                    assert repetition["server_cycles_per_request"] == cpu["cpu_cycles"] / 100
+                for note in report["notes"]:
+                    assert note not in invocation.stdout + invocation.stderr
+                    assert note not in repetition["warnings"]
+            # The next start also proves that the client relinquished ownership after completion.
+            short = controller.start(tls="off", workers=1)
+            controller.finish(short)
+
+        output = directory / "ktls.json"
+        ktls = subprocess.run(
+            [CLIENT, "run", "--target", str(target), "--tls", "ktls", "--server-workers", "2",
+             "--method", "get", "--get-size", "64KiB", "--connections", "2", "--workers", "1",
+             "--warmup", "0", "--duration", "1", "--requests", "10", "--repetitions", "1",
+             "--output", str(output)],
+            capture_output=True, text=True, timeout=30,
+        )
+        report = json.loads(output.read_text())
+        if ktls.returncode == 0:
+            assert report["server_capabilities"]["backend"] == "openssl-ktls"
+            assert report["server_capabilities"]["ktls_tx"]
+        else:
+            assert report["status"] == "failed"
+            assert "kTLS" in ktls.stderr or "kTLS" in report["failure"]
+        abandoned = controller.start(tls="off", workers=1, lease_seconds=1)
+        time.sleep(2.2)
+        assert controller.request("GET", "/v1/benchmark/telemetry?run_id=" + abandoned["run_id"])[0] == 409
+        short = controller.start(tls="off", workers=2)
+        controller.finish(short)
+    finally:
+        controller.stop()
+
+    controller = Controller(directory, bind="127.0.0.1")
     try:
-        state = bundled / "client-state"
+        try:
+            with socket.create_connection(("127.0.0.2", controller.port), timeout=3):
+                raise AssertionError("Explicit loopback override accepted another IPv4 address")
+        except ConnectionRefusedError:
+            pass
+        # A fresh menu still needs no token, transport option, or certificate confirmation.
+        menu_output = directory / "menu-result.json"
         menu = command(
-            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\n2\n1\n0\n",
-            env=dict(os.environ, XDG_STATE_HOME=str(state)),
+            CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n\n2\n1\n"
+                           f"3\n1\noff\n2\n32\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
+            env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
-        assert "Paired target saved" in menu.stdout, menu.stdout + menu.stderr
-        assert "Trust this certificate?" not in menu.stdout
-        assert "pairing-token" not in menu.stdout
-        assert '"authentication": "none"' in menu.stdout
-        assert "public benchmark certificate" in menu.stderr
+        assert "Paired target saved" in menu.stdout
+        assert "pairing-token" not in menu.stdout and "Trust this certificate?" not in menu.stdout
+        menu_report = json.loads(menu_output.read_text())
+        assert menu_report["benchmark"] == "http"
+        assert menu_report["server_configuration"]["workers"] == 2
     finally:
-        agent.stop()
+        controller.stop()
 
-print("HTTPS integration tests passed")
+    # Optional host authentication must protect control without leaking its credential to data.
+    authenticated = directory / "authenticated"
+    authenticated.mkdir()
+    token_file = authenticated / "bootstrap"
+    token_file.write_text("ab" * 32 + "\n")
+    token_file.chmod(0o600)
+    controller = Controller(authenticated, extra=("--token-file", str(token_file)))
+    try:
+        assert controller.request("GET", "/v1/capabilities")[0] == 401
+        target = authenticated / "target.json"
+        command(CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+                "--target", target, "--token-file", token_file)
+        command(CLIENT, "inspect", "--target", target)
+        command(CLIENT, "run", "--target", target, "--tls", "off",
+                "--connections", "1", "--workers", "1", "--warmup", "0", "--duration", "1",
+                "--requests", "2", "--repetitions", "1", "--output", authenticated / "result.json")
+    finally:
+        controller.stop()
+    controller = Controller(authenticated, extra=("--token-file", str(token_file)))
+    try:
+        saved = json.loads(target.read_text())
+        saved["port"] = str(controller.port)
+        target.write_text(json.dumps(saved))
+        command(CLIENT, "inspect", "--target", target)
+    finally:
+        controller.stop()
+
+    custom = directory / "custom"
+    custom.mkdir()
+    command(
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        "-subj", "/CN=winlin-test", "-keyout", custom / "server.key", "-out", custom / "server.pem",
+    )
+    controller = Controller(custom)
+    try:
+        target = custom / "target.json"
+        refused = command(
+            CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+            "--target", target, expected=1,
+        )
+        assert "certificate changed" in refused.stderr and not target.exists()
+        pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(
+            (custom / "server.pem").read_text())).hexdigest()
+        command(CLIENT, "pair", "--host", "127.0.0.1", "--port", controller.port,
+                "--target", target, "--fingerprint", pin)
+    finally:
+        controller.stop()
+
+print("HTTPS control, HTTP/TLS/kTLS workloads, exclusive leases, runtime tuning and telemetry passed.")
