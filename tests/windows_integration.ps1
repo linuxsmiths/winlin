@@ -15,7 +15,7 @@ $listener.Stop()
 $primaryFailure = $null
 try {
     $configuration = & (Join-Path $PSScriptRoot '../scripts/setup-server.ps1') `
-        -Port $port -StateDirectory (Join-Path $directory 'state')
+        -Port $port -StateDirectory (Join-Path $directory 'state') -RequireAuthentication
     Invoke-WinlinNative -File $PythonExe -Arguments @(
         (Join-Path $PSScriptRoot 'windows_https.py'),
         $ServerExe, "$port", $configuration.TokenFile, $configuration.CertificateSha256,

@@ -63,8 +63,10 @@ $setup | Format-List
 
 This imports the bundled **deliberately public** RSA test certificate/key into
 `LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
-SSL binding, a URL reservation for the current user, and a private
-bootstrap credential in `.winlin-local\pairing-token`. Only the owner, SYSTEM and
+SSL binding and a URL reservation for the current user. Authentication is disabled
+by default; no pairing-token file is needed. Optional setup
+`-RequireAuthentication` creates a bootstrap credential in
+`.winlin-local\pairing-token`. Only the owner, SYSTEM and
 Administrators may access credential files. The current user owns the state;
 run the server as that same account. Service-account provisioning is not automated.
 
@@ -97,16 +99,17 @@ Start the server (the same user can do this without elevation after setup):
 .\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443 -Workers 8
 ```
 
-The launcher defaults to the repository's `build\Release\winlin-server.exe` and
-`.winlin-local\pairing-token`. Match `-BindAddress` and `-Port` to the provisioned
+The launcher defaults to the repository's `build\Release\winlin-server.exe` with
+no authentication. Match `-BindAddress` and `-Port` to the provisioned
 endpoint. It never builds, provisions certificates, resets pairing, elevates, or
 changes firewall/Schannel policies.
 
 Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
-CMake builds. `-TokenFile` and `-SessionFile` override individual credential
-paths; unspecified tuning options retain native defaults. `-Help` lists options
+CMake builds. Explicit `-TokenFile FILE` enables authentication, with optional
+`-SessionFile FILE` for credential persistence; unspecified tuning options retain
+native defaults. Existing credential files are otherwise ignored. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 
@@ -137,14 +140,12 @@ must not already exist at startup, and remains the caller's responsibility to re
 
 ## Pair and run from Linux
 
-Securely transfer the bootstrap file to the Linux client, and verify
-the certificate fingerprint through an independent trusted channel if using a
-custom certificate. The bundled public certificate needs no fingerprint entry:
+No authentication setup or file transfer is needed. Verify the certificate
+fingerprint through an independent trusted channel if using a custom certificate.
+The bundled public certificate needs no fingerprint entry:
 
 ```sh
-chmod 600 /path/to/windows-pairing-token
 ./scripts/run-client.sh pair --host 10.0.0.4 --port 8443 \
-  --token-file /path/to/windows-pairing-token \
   --target .winlin-local/windows.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
@@ -153,7 +154,10 @@ chmod 600 /path/to/windows-pairing-token
   --connections 256 --warmup 10 --duration 30 --repetitions 3
 ```
 
-Pairing consumes the bootstrap credential and creates
+To opt into authentication, provision with `-RequireAuthentication`, launch with
+`-TokenFile .winlin-local\pairing-token`, securely copy that file to the client
+(mode `0600`), and pass `--token-file FILE` to CLI `pair`.
+Only this explicit token mode consumes the bootstrap credential and creates
 `PAIRING-TOKEN-FILE.session` on the server, or the path selected by
 `--session-file`. Preserve it across restarts. To reset pairing deliberately,
 stop the server, remove that exact session file and the matching Linux target

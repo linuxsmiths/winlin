@@ -29,6 +29,9 @@ struct AgentConfig {
     std::string process_cpu_scope{"server process only"};
 
     static AgentConfig from_args(const Args& args, std::string backend) {
+        if (!args.get("--session-file").empty() && args.get("--token-file").empty()) {
+            throw std::invalid_argument("--session-file requires --token-file");
+        }
         AgentConfig result;
         result.backend = std::move(backend);
         result.cipher = args.get("--cipher", result.cipher);
@@ -71,6 +74,7 @@ struct AgentReply {
 // Keep authentication, routes and result schemas identical across Linux and Windows. Native worker
 // threads share this instance; pairing is serialized and published credentials/counters are atomic.
 // Platform callbacks must persist credentials before publication and must never log their contents.
+// An empty bootstrap disables authentication and credential persistence for isolated benchmarks.
 class Agent {
     std::string bootstrap_;
     std::atomic<std::shared_ptr<const std::string>> credential_;
@@ -118,6 +122,7 @@ public:
         return {{"protocol_version", 1},
                 {"environment", config.environment},
                 {"backend", config.backend},
+                {"authentication", bootstrap_.empty() ? "none" : "token"},
                 {"tls_version", connection.tls_version},
                 {"cipher", connection.cipher},
                 {"http_version", "1.1"},
@@ -133,8 +138,7 @@ public:
                 {"telemetry_scope", "whole server process; use an exclusive test target"}};
     }
 
-    // Authenticate before dispatching and return an explicit error instead of changing the
-    // workload.
+    // Enforce optional authentication before dispatching without changing the requested workload.
     AgentReply request(const HttpHead& head, const ConnectionInfo& connection) {
         try {
             const auto first_space = head.first.find(' ');
@@ -151,18 +155,20 @@ public:
             const auto method = head.first.substr(0, first_space);
             const auto path = head.first.substr(first_space + 1, last_space - first_space - 1);
             const bool pairing = method == "POST" && path == "/v1/pair";
-            const auto credential = credential_.load();
-            const auto auth = head.fields.find("authorization");
-            const std::string_view supplied =
-                auth == head.fields.end() ? std::string_view{} : auth->second;
-            std::string expected = "Bearer ";
-            if (pairing) {
-                expected += bootstrap_;
-            } else if (credential) {
-                expected += *credential;
-            }
-            if ((!pairing && !credential) || !equal_(supplied, expected)) {
-                return AgentReply::error(401, "unauthorized");
+            if (!bootstrap_.empty()) {
+                const auto credential = credential_.load();
+                const auto auth = head.fields.find("authorization");
+                const std::string_view supplied =
+                    auth == head.fields.end() ? std::string_view{} : auth->second;
+                std::string expected = "Bearer ";
+                if (pairing) {
+                    expected += bootstrap_;
+                } else if (credential) {
+                    expected += *credential;
+                }
+                if ((!pairing && !credential) || !equal_(supplied, expected)) {
+                    return AgentReply::error(401, "unauthorized");
+                }
             }
             AgentReply reply;
             reply.close = head.close;
@@ -170,15 +176,20 @@ public:
                 if (head.length) {
                     return AgentReply::error(400, "Pairing body must be empty");
                 }
-                std::lock_guard lock(pairing_mutex_);
-                // A concurrent pairing may have won after the earlier authentication snapshot.
-                if (credential_.load()) {
-                    return AgentReply::error(409, "already paired");
+                if (bootstrap_.empty()) {
+                    // Default registration has no credential or exclusive controller ownership.
+                    reply.text = Json{{"access_token", ""}}.dump();
+                } else {
+                    std::lock_guard lock(pairing_mutex_);
+                    // A concurrent pairing may have won after the earlier authentication snapshot.
+                    if (credential_.load()) {
+                        return AgentReply::error(409, "already paired");
+                    }
+                    const auto token = issue_credential_();
+                    credential_.store(std::make_shared<const std::string>(token));
+                    reply.text = Json{{"access_token", token}}.dump();
                 }
-                const auto token = issue_credential_();
-                credential_.store(std::make_shared<const std::string>(token));
                 reply.close = true;
-                reply.text = Json{{"access_token", token}}.dump();
             } else if (method == "GET" && path == "/v1/capabilities" && !head.length) {
                 reply.text = capabilities(connection).dump();
             } else if (method == "GET" && path == "/v1/telemetry" && !head.length) {

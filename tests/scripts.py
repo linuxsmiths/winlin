@@ -204,7 +204,7 @@ class Scripts(unittest.TestCase):
         state = self.checkout / ".winlin-local"
         self.assertEqual(arguments, [
             "--cert", str(state / "server.pem"), "--key", str(state / "server.key"),
-            "--token-file", str(state / "pairing-token"), "--bind", "10.0.0.4",
+            "--bind", "10.0.0.4",
         ])
         custom = self.directory / "private state"
         shutil.copytree(state, custom)
@@ -212,7 +212,7 @@ class Scripts(unittest.TestCase):
             "run-server.sh", "--state-dir", "private state", "--cert", str(custom / "server.pem"),
         )
         self.assertEqual(json.loads(result.stdout)["arguments"], [
-            "--key", "private state/server.key", "--token-file", "private state/pairing-token",
+            "--key", "private state/server.key",
             "--cert", str(custom / "server.pem"),
         ])
         result = self.run_script(
@@ -280,8 +280,8 @@ class Scripts(unittest.TestCase):
                     result = self.run_script(script, fd_limits=(524289, hard))
                     self.assertEqual(json.loads(result.stdout)["soft_fd_limit"], 524289)
 
-    def test_server_launcher_public_identity_and_private_bootstrap(self):
-        """A fresh checkout needs no manual TLS setup, but real pairing tokens stay local/private."""
+    def test_server_launcher_public_identity_without_authentication(self):
+        """A fresh checkout needs no manual TLS setup or token files, even with old state."""
         state = self.directory / "fresh state"
         result = self.run_script("run-server.sh", "--state-dir", str(state))
         arguments = json.loads(result.stdout)["arguments"]
@@ -291,12 +291,12 @@ class Scripts(unittest.TestCase):
         ])
         self.assertIn("PUBLIC benchmark certificate", result.stderr)
         token = state / "pairing-token"
-        original = token.read_text()
-        self.assertRegex(original, r"^[0-9a-f]{64}\n$")
-        self.assertEqual(token.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn(original.strip(), result.stdout + result.stderr)
+        self.assertFalse(token.exists())
+        self.assertNotIn("--token-file", arguments)
+        state.mkdir()
+        token.write_text("existing optional token\n")
         self.run_script("run-server.sh", "--state-dir", str(state))
-        self.assertEqual(token.read_text(), original)
+        self.assertEqual(token.read_text(), "existing optional token\n")
         missing = state / "explicitly missing token"
         self.run_script(
             "run-server.sh", "--state-dir", str(state), "--token-file", str(missing), expected=1,

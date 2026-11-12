@@ -23,12 +23,17 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-server.ps1"
 class Agent:
     """Own one native process while reusing the provisioned endpoint and persisted pairing state."""
 
-    def __init__(self, cipher="TLS_AES_128_GCM_SHA256"):
+    def __init__(self, cipher="TLS_AES_128_GCM_SHA256", authenticated=True):
         self.port = PORT
+        arguments = [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
+            "-ServerExe", SERVER, "-Port", str(PORT), "-Workers", "2",
+            "-MaxConnections", "128", "-Cipher", cipher, "-StopFile", STOP_FILE,
+        ]
+        if authenticated:
+            arguments += ["-TokenFile", TOKEN_FILE]
         self.process = subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
-             "-ServerExe", SERVER, "-TokenFile", TOKEN_FILE, "-Port", str(PORT),
-             "-Workers", "2", "-MaxConnections", "128", "-Cipher", cipher, "-StopFile", STOP_FILE],
+            arguments,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         lines = queue.Queue()
@@ -149,6 +154,18 @@ agent = Agent(other)
 try:
     status, payload = agent.request("GET", "/v1/capabilities", token)
     assert status == 400 and b"cipher" in payload, payload
+finally:
+    agent.stop()
+
+agent = Agent(cipher, authenticated=False)
+try:
+    status, payload = agent.request("GET", "/v1/capabilities")
+    assert status == 200 and json.loads(payload)["authentication"] == "none", payload
+    for _ in range(2):
+        status, payload = agent.request("POST", "/v1/pair")
+        assert status == 200 and json.loads(payload)["access_token"] == "", payload
+    assert agent.request("GET", "/v1/object?size=512")[0] == 200
+    assert agent.request("PUT", "/v1/object", body=b"x" * 512)[0] == 200
 finally:
     agent.stop()
 

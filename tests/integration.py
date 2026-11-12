@@ -56,13 +56,14 @@ class Agent:
         self.directory = directory
         arguments = [
             str(SCRIPTS / "run-server.sh"), "--build-dir", str(Path(SERVER).parent),
-            "--state-dir", str(directory), "--", "--session-file", str(directory / f"{backend}.session"),
+            "--state-dir", str(directory), "--",
             "--port", "0", "--workers", "2", "--backend", backend,
         ]
         if not bundled:
             arguments += [
                 "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
                 "--token-file", str(directory / "pairing"),
+                "--session-file", str(directory / f"{backend}.session"),
             ]
         if bind_address is not None:
             arguments += ["--bind", bind_address]
@@ -409,27 +410,37 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
         guard_owner.listen(1)
         exercise_single_instance(server_arguments, 8443)
 
-    # Default launch/pair needs neither user-created certificates nor fingerprint entry.
+    # Default launch/pair needs no certificates, fingerprint entry, or token files.
     bundled = directory / "bundled-cli"
     agent = Agent(bundled, bundled=True)
     try:
         target = bundled / "new-client-state/target.json"
         paired = command(
             CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
-            "--token-file", bundled / "pairing-token", "--target", target,
+            "--target", target,
         )
         assert "public benchmark certificate" in paired.stderr
         fixture = SCRIPTS.parent / "certs/benchmark"
         certificate = ssl.PEM_cert_to_DER_cert((fixture / "server.pem").read_text())
         assert certificate == (fixture / "server.der").read_bytes()
         assert json.loads(target.read_text())["certificate_sha256"] == hashlib.sha256(certificate).hexdigest()
-        bootstrap = (bundled / "pairing-token").read_text()
+        assert not (bundled / "pairing-token").exists()
+        assert json.loads(target.read_text())["access_token"] == ""
         command(CLIENT, "inspect", "--target", target)
+        command(
+            CLIENT, "pair", "--host", "127.0.0.1", "--port", agent.port,
+            "--target", bundled / "second-client.json",
+        )
+        command(
+            CLIENT, "run", "--target", target, "--method", "mixed",
+            "--connections", "2", "--workers", "1", "--warmup", "0", "--duration", "1",
+            "--requests", "10", "--repetitions", "1", "--output", bundled / "result.json",
+        )
     finally:
         agent.stop()
     agent = Agent(bundled, bundled=True)
     try:
-        assert (bundled / "pairing-token").read_text() == bootstrap
+        assert not (bundled / "pairing-token").exists()
         saved = json.loads(target.read_text())
         saved["port"] = str(agent.port)
         private_file(target, json.dumps(saved))
@@ -443,11 +454,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
     try:
         state = bundled / "client-state"
         menu = command(
-            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\n{bundled / 'pairing-token'}\n0\n",
+            CLIENT, input_text=f"1\n127.0.0.1\n{agent.port}\n\n2\n1\n0\n",
             env=dict(os.environ, XDG_STATE_HOME=str(state)),
         )
         assert "Paired target saved" in menu.stdout, menu.stdout + menu.stderr
         assert "Trust this certificate?" not in menu.stdout
+        assert "pairing-token" not in menu.stdout
+        assert '"authentication": "none"' in menu.stdout
         assert "public benchmark certificate" in menu.stderr
     finally:
         agent.stop()

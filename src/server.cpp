@@ -34,16 +34,22 @@ struct Server : Agent {
 
     Server(const Args& args)
         : Agent(
-              linux_config(args), token_file(args.require("--token-file")),
-              optional_token_file(
-                  args.get("--session-file", args.require("--token-file") + ".session")),
-              [path = args.get("--session-file", args.require("--token-file") + ".session")] {
+              linux_config(args),
+              args.get("--token-file").empty() ? "" : token_file(args.get("--token-file")),
+              args.get("--token-file").empty()
+                  ? std::nullopt
+                  : optional_token_file(
+                        args.get("--session-file", args.get("--token-file") + ".session")),
+              [path = args.get("--session-file", args.get("--token-file") + ".session")] {
                   return issue_token_file(path);
               },
               equal_secret, usage),
           tls(context(true, args.get("--cipher", "TLS_AES_128_GCM_SHA256"),
                       args.get("--backend", "openssl") == "ktls")),
           payload(max_object_size), ktls(args.get("--backend", "openssl") == "ktls") {
+        if (args.get("--token-file").empty()) {
+            log_warning("Authentication disabled; use only on an isolated benchmark network");
+        }
         if (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
             SSL_CTX_use_PrivateKey_file(tls.get(), args.require("--key").c_str(),
                                         SSL_FILETYPE_PEM) != 1 ||
@@ -336,10 +342,11 @@ int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout
-            << "winlin-server --cert certificate.pem --key private.key --token-file pairing-token\n"
+            << "winlin-server --cert certificate.pem --key private.key\n"
                "  [--bind 0.0.0.0] [--port 8443] [--workers 8] [--backend openssl|ktls]\n"
                "  [--cipher TLS_AES_128_GCM_SHA256] [--max-connections 32768]\n"
-               "  [--session-file path] (default: TOKEN-FILE.session)\n";
+               "  [--token-file path] (optional authentication; default: none)\n"
+               "  [--session-file path] (requires --token-file; default: TOKEN-FILE.session)\n";
         return 0;
     }
     try {

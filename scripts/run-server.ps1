@@ -23,8 +23,8 @@ Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-Workers N] [-MaxConnections N] [-Cipher SUITE] [-TokenFile PATH]
     [-SessionFile PATH] [-StopFile PATH]
 
-Defaults: build\Release\winlin-server.exe, .winlin-local\pairing-token,
-127.0.0.1:8443. Default directories are relative to the repository; supplied
+Defaults: build\Release\winlin-server.exe, no authentication, 127.0.0.1:8443.
+An explicit -TokenFile enables authentication. Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary
 discovery. Unspecified workload settings retain the native server defaults.
 
@@ -55,15 +55,14 @@ try {
         throw "Server executable not found: $ServerExe. Run scripts\build.ps1 server first."
     }
 
-    if (-not $TokenFile) {
-        $TokenFile = Join-Path $StateDirectory 'pairing-token'
+    $serverArguments = @('--bind', $BindAddress, '--port', "$Port")
+    if ($TokenFile) {
+        $TokenFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenFile)
+        if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
+            throw "Pairing-token file not found: $TokenFile."
+        }
+        $serverArguments += @('--token-file', $TokenFile)
     }
-    $TokenFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenFile)
-    if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
-        throw "Pairing-token file not found: $TokenFile. Provision the endpoint with scripts\setup-server.ps1 first."
-    }
-
-    $serverArguments = @('--bind', $BindAddress, '--port', "$Port", '--token-file', $TokenFile)
 
     # Do not duplicate native default policy here; forward optional settings only when supplied.
     $optionalOptions = [ordered]@{

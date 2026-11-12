@@ -120,7 +120,7 @@ exit 0
     if ($result.ExitCode -ne 0) { throw "Launcher fixture failed: $($result.Output)" }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
     $expected = @(
-        '--bind', '10.0.0.4', '--port', '9443', '--token-file', $token, '--workers', '3',
+        '--bind', '10.0.0.4', '--port', '9443', '--workers', '3',
         '--max-connections', '64', '--cipher', 'TLS_AES_256_GCM_SHA384',
         '--session-file', 'session with spaces', '--stop-file', 'stop with spaces'
     )
@@ -129,6 +129,12 @@ exit 0
     }
     if (($result.Output -join "`n") -notmatch 'fixture diagnostic') {
         throw 'Launcher lost application stderr.'
+    }
+    $result = Invoke-LauncherFixture -Arguments @(
+        '-ServerExe', $fakeServer, '-StateDirectory', (Join-Path $fixture 'no state')
+    )
+    if ($result.ExitCode -ne 0 -or ($result.Output -join "`n") -match '--token-file') {
+        throw "Default launch must need no credential files: $($result.Output)"
     }
 
     $result = Invoke-LauncherFixture -Arguments @(

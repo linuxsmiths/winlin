@@ -34,8 +34,8 @@ No manual certificate setup is needed. In one terminal, start the server:
 ```
 
 The launcher uses `build/winlin-server`, the **deliberately public** certificate/key
-in `certs/benchmark/`, and a private pairing token created automatically under
-`.winlin-local/` on first use. Later launches reuse the token and session state.
+in `certs/benchmark/`. Authentication is disabled by default on both OSes:
+no token files, credential transfer, or authentication prompts are needed.
 The bundled identity provides **no trustworthy server authentication**: anyone
 can impersonate it. Use only on isolated synthetic benchmark networks.
 
@@ -43,7 +43,9 @@ Existing `server.pem`/`server.key` files in the state directory retain precedenc
 a partial custom pair is an error, not a reason to fall back to the public pair.
 Override directories with
 `--build-dir PATH` and `--state-dir PATH` before native server options.
-Individual `--cert`, `--key`, and `--token-file` options override those defaults.
+Individual `--cert` and `--key` options override the TLS defaults.
+Explicit `--token-file FILE` enables optional authentication; existing token and
+session files are otherwise ignored, not deleted.
 For example:
 
 ```sh
@@ -79,21 +81,30 @@ The client already knows the bundled certificate, so no fingerprint entry is nee
 ```sh
 ./scripts/run-client.sh pair \
   --host 127.0.0.1 \
-  --token-file .winlin-local/pairing-token \
   --target .winlin-local/local.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
-For remote testing, transfer the pairing credential to the client through a
-trusted channel. The client checks the certificate pin **before sending
-credentials**, but the bundled public key provides no protection against server
-impersonation. Custom identities require `--fingerprint SHA256`; their fingerprint
+Remote testing uses the same command with the server's IP; no files need copying.
+Any reachable client can run benchmarks in this default mode. Use only an isolated
+test network and restrict the port with firewall/VNet rules. Custom identities
+require `--fingerprint SHA256`; their fingerprint
 must be verified independently. This implementation uses exact certificate
 pinning, not CA-chain or certificate-expiry validation; a different certificate
 is rejected, even when no `--fingerprint` was provided.
 
-Pairing consumes the bootstrap credential for that server state and exchanges it
+Default registration is repeatable and stores the endpoint, certificate pin, and
+cipher locally, without an access credential. Existing unauthenticated targets
+remain usable across server restarts.
+
+For optional authenticated mode, create a private token with
+`(umask 077; openssl rand -hex 32 > /path/to/new-pairing-token)` at a new path and
+start the server with `--token-file /path/to/new-pairing-token`. Transfer that file
+privately to the client and pass `--token-file FILE` to CLI `pair`. The client checks
+the pin before sending credentials, but the public fixture still cannot establish
+a trustworthy identity. Use a custom identity when authentication matters.
+Explicit token pairing consumes the bootstrap credential and exchanges it
 for a persistent access credential. The server saves this in
 `PAIRING-TOKEN-FILE.session` by default; `--session-file` overrides the location.
 The client saves its credential and certificate pin in the target JSON file.
@@ -109,7 +120,7 @@ credential file and the corresponding client target file, generate a fresh
 bootstrap credential, and restart. Do not delete these files during a run.
 
 Alternatively, run `./scripts/run-client.sh` and select **Add server**. It prompts
-for the IP address, port, cipher, and pairing-token file. The bundled certificate
+only for the IP address, port, and cipher. The bundled certificate
 is accepted automatically with a warning; custom certificates still require
 fingerprint confirmation.
 Interactive targets are saved under `$XDG_STATE_HOME/winlin`, or

@@ -78,6 +78,33 @@ int main() {
         require(ktls.request(head("PUT", "/v1/object", access, 256), tls).status == 501,
                 "kTLS RX cannot silently fall back");
         require(parse_token(bootstrap + "\r\n") == bootstrap, "CRLF credential portability");
+
+        config.backend = "openssl";
+        Agent open(config, "", std::nullopt, issue, equal, process);
+        const auto anonymous = parse_head(
+            "GET /v1/capabilities HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        const auto capabilities = open.request(anonymous, tls);
+        require(capabilities.status == 200 &&
+                    Json::parse(capabilities.text).at("authentication") == "none",
+                "Default capabilities need no authentication");
+        const auto before_registration = writes;
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const auto registration = open.request(head("POST", "/v1/pair", ""), tls);
+            require(registration.status == 200 &&
+                        Json::parse(registration.text).at("access_token") == "",
+                    "Default registration is repeatable and has no credential");
+        }
+        require(writes == before_registration, "Default registration never writes credentials");
+        require(open.request(head("GET", "/v1/object?size=512", ""), tls).kind ==
+                    AgentReply::Kind::object,
+                "Default GET needs no credential");
+        require(open.request(head("PUT", "/v1/object", "", 512), tls).kind ==
+                    AgentReply::Kind::consume_put,
+                "Default PUT needs no credential");
+        require(open.request(head("GET", "/v1/telemetry", ""), tls).status == 200,
+                "Default telemetry needs no credential");
+        require(open.request(anonymous, {"TLSv1.2", config.cipher}).status == 400,
+                "No-auth mode still enforces the benchmark TLS contract");
         std::cout << "Shared agent tests passed\n";
         return 0;
     } catch (const std::exception& failure) {

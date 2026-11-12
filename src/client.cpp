@@ -91,10 +91,11 @@ Target load_target(const std::string& path) {
             throw std::invalid_argument("Invalid port");
         }
         result.pin = checked_pin(result.pin);
-        if (result.token.size() != 64 ||
-            !std::all_of(result.token.begin(), result.token.end(), [](unsigned char ch) {
-                return std::isxdigit(ch);
-            })) {
+        if (!result.token.empty() &&
+            (result.token.size() != 64 ||
+             !std::all_of(result.token.begin(), result.token.end(), [](unsigned char ch) {
+                 return std::isxdigit(ch);
+             }))) {
             throw std::invalid_argument("Invalid token");
         }
         return result;
@@ -117,9 +118,10 @@ Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
                   const std::string& path) {
     auto socket = connect_tls(ctx, target.host, target.port, target.pin);
     const auto deadline = Clock::now() + std::chrono::seconds(10);
-    const std::string request = method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" +
-                                target.port + "\r\nAuthorization: Bearer " + target.token +
-                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const std::string request =
+        method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
+        (target.token.empty() ? "" : "\r\nAuthorization: Bearer " + target.token) +
+        "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     std::size_t sent{};
     while (sent < request.size()) {
         const int count = socket->write(request.data() + sent, request.size() - sent);
@@ -203,14 +205,16 @@ fs::path state_directory() {
     return directory;
 }
 
-// Reserve the local target file before consuming the one-time remote bootstrap token.
+// Register a target without credentials by default; an explicit token opts into authenticated
+// pairing.
 void pair_target(const std::string& host, const std::string& port, const std::string& token_path,
                  const std::string& pin, const fs::path& output, const std::string& cipher) {
     check_host(host);
     if (!number(port, 65535)) {
         throw std::invalid_argument("Port must be positive");
     }
-    Target target{host, port, checked_pin(pin), token_file(token_path), cipher};
+    Target target{host, port, checked_pin(pin), token_path.empty() ? "" : token_file(token_path),
+                  cipher};
     if (target.pin == benchmark_certificate_sha256) {
         log_warning(
             "Using the public benchmark certificate; this does not authenticate server identity");
@@ -224,10 +228,19 @@ void pair_target(const std::string& host, const std::string& port, const std::st
     try {
         const auto response = exchange(ctx.get(), target, "POST", "/v1/pair");
         if (response.status != 200) {
+            if (response.status == 401 && token_path.empty()) {
+                throw std::runtime_error(
+                    "Server requires authentication. Restart it without --token-file for automatic "
+                    "benchmark registration, or use CLI pair --token-file FILE");
+            }
             throw std::runtime_error("Pairing rejected (HTTP " + std::to_string(response.status) +
                                      ")");
         }
         target.token = Json::parse(response.body).at("access_token");
+        if (!token_path.empty() && target.token.empty()) {
+            throw std::runtime_error(
+                "Server authentication is disabled; omit --token-file for default registration");
+        }
         write_private(output,
                       {{"host", host},
                        {"port", port},
@@ -309,7 +322,8 @@ struct LoadConnection {
                ((index % 100) * config.get_percent) % 100 < config.get_percent);
         const auto path = get ? "/v1/object?size=" + std::to_string(config.get_size) : "/v1/object";
         header = std::string(get ? "GET " : "PUT ") + path + " HTTP/1.1\r\nHost: " + target.host +
-                 ":" + target.port + "\r\nAuthorization: Bearer " + target.token +
+                 ":" + target.port +
+                 (target.token.empty() ? "" : "\r\nAuthorization: Bearer " + target.token) +
                  "\r\nContent-Length: " + std::to_string(get ? 0 : config.put_size) + "\r\n\r\n";
         offset = 0;
         input.clear();
@@ -842,9 +856,8 @@ void interactive() {
                         continue;
                     }
                 }
-                const auto token = prompt("Path to private pairing-token file");
-                pair_target(host, port, token, pin,
-                            state_directory() / (host + "-" + port + ".json"), cipher);
+                pair_target(host, port, "", pin, state_directory() / (host + "-" + port + ".json"),
+                            cipher);
             } else if (action == "2") {
                 const auto target = load_target(select_target());
                 auto ctx = context(false, target.cipher);
@@ -896,7 +909,8 @@ int main(int argc, char** argv) {
         if (command == "--help" || command == "help") {
             std::cout
                 << "winlin                         Interactive console\n"
-                   "winlin pair --host IP --token-file FILE --target FILE [--fingerprint SHA256]\n"
+                   "winlin pair --host IP --target FILE [--token-file FILE] [--fingerprint "
+                   "SHA256]\n"
                    "            [--port 8443] [--cipher TLS_AES_128_GCM_SHA256]\n"
                    "            Default: bundled PUBLIC benchmark certificate (no trusted "
                    "identity).\n"
@@ -915,7 +929,7 @@ int main(int argc, char** argv) {
             args.allow(
                 {"--host", "--port", "--token-file", "--fingerprint", "--target", "--cipher"});
             pair_target(args.require("--host"), args.get("--port", "8443"),
-                        args.require("--token-file"),
+                        args.get("--token-file"),
                         args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
                         args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));
             return 0;

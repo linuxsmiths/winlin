@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Document the public benchmark identity and keep real pairing credentials local.
+# Document the public benchmark identity and optional authenticated mode.
 usage() {
     cat <<'EOF'
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
@@ -10,8 +10,8 @@ Run the Linux server using the repository's build/ and .winlin-local/ directorie
 HTTPS listens on 0.0.0.0:8443 (all IPv4 interfaces) unless --bind/--port overrides it.
 Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
 An existing server.pem/server.key in the state directory takes precedence.
-The private pairing-token is generated locally on first use and then reused.
-Native --cert, --key, and --token-file arguments override individual defaults.
+Authentication is disabled by default; no pairing-token file is needed.
+Native --cert/--key override TLS defaults; explicit --token-file enables authentication.
 Place launcher options first. Relative overrides use the caller's working directory.
 Use -- --help for the native server's help, without requiring state files.
 
@@ -88,7 +88,7 @@ if [[ -e "$state_dir/server.pem" || -L "$state_dir/server.pem" ||
     certificate="$state_dir/server.pem"
     private_key="$state_dir/server.key"
 fi
-token_file="$state_dir/pairing-token"
+token_file=""
 has_certificate=false
 has_private_key=false
 has_token_file=false
@@ -128,9 +128,6 @@ fi
 if ! "$has_private_key"; then
     defaults+=(--key "$private_key")
 fi
-if ! "$has_token_file"; then
-    defaults+=(--token-file "$token_file")
-fi
 
 # Change only the launched process's soft limit, preserving higher limits and the hard ceiling.
 # Abort before readiness rather than starting a benchmark with an unexpectedly small allowance.
@@ -144,24 +141,7 @@ if [[ "$soft_fd_limit" != unlimited ]] && (( soft_fd_limit < minimum_fd_limit ))
     fi
 fi
 
-# Bootstrap only an absent default token. Explicit paths, existing files and symlinks are never
-# overwritten; exclusive creation also prevents concurrent launchers from replacing credentials.
-if ! "$has_token_file" && [[ ! -e "$token_file" && ! -L "$token_file" ]]; then
-    if ! (umask 077; mkdir -p -- "$state_dir"); then
-        echo 'winlin server launcher: FATAL: cannot create local state directory.' >&2
-        exit 1
-    fi
-    if ! token="$(openssl rand -hex 32)"; then
-        echo 'winlin server launcher: FATAL: cannot generate private pairing token; check OpenSSL installation.' >&2
-        exit 1
-    fi
-    if ! (umask 077; set -o noclobber; printf '%s\n' "$token" > "$token_file"); then
-        echo 'winlin server launcher: FATAL: cannot create pairing token; existing credentials were not overwritten.' >&2
-        exit 1
-    fi
-    unset token
-fi
-if [[ ! -f "$token_file" || ! -r "$token_file" ]]; then
+if "$has_token_file" && [[ ! -f "$token_file" || ! -r "$token_file" ]]; then
     printf 'winlin server launcher: FATAL: state file is missing or unreadable: %s\n' "$token_file" >&2
     exit 1
 fi

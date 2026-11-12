@@ -3,7 +3,8 @@ param(
     [string]$BindAddress = '127.0.0.1',
     [ValidateRange(1, 65535)][int]$Port = 8443,
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
-    [string]$CertificateThumbprint = ''
+    [string]$CertificateThumbprint = '',
+    [switch]$RequireAuthentication
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,8 +20,8 @@ if ($BindAddress -eq '0.0.0.0') { throw 'Use a specific IPv4 address, not a wild
 $state = [IO.Path]::GetFullPath($StateDirectory)
 Initialize-WinlinPrivateDirectory -Path $state
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$tokenFile = Join-Path $state 'pairing-token'
-if (Test-Path -LiteralPath $tokenFile) {
+$tokenFile = if ($RequireAuthentication) { Join-Path $state 'pairing-token' } else { $null }
+if ($RequireAuthentication -and (Test-Path -LiteralPath $tokenFile)) {
     throw 'Pairing-token file already exists. Reuse its configured endpoint or choose a fresh StateDirectory.'
 }
 $endpoint = "${BindAddress}:$Port"
@@ -67,18 +68,20 @@ try {
     Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'urlacl', "url=$url",
         "user=$user", 'listen=yes', 'delegate=no') | Out-Host
     $createdUrl = $true
-    $random = [byte[]]::new(32)
-    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($random) } finally { $rng.Dispose() }
-    $token = ([BitConverter]::ToString($random)).Replace('-', '').ToLowerInvariant()
-    $stream = New-WinlinPrivateFileStream -Path $tokenFile
-    $createdToken = $true
-    try {
-        $bytes = [Text.Encoding]::ASCII.GetBytes("$token`n")
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush($true)
+    if ($RequireAuthentication) {
+        $random = [byte[]]::new(32)
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($random) } finally { $rng.Dispose() }
+        $token = ([BitConverter]::ToString($random)).Replace('-', '').ToLowerInvariant()
+        $stream = New-WinlinPrivateFileStream -Path $tokenFile
+        $createdToken = $true
+        try {
+            $bytes = [Text.Encoding]::ASCII.GetBytes("$token`n")
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally { $stream.Dispose() }
     }
-    finally { $stream.Dispose() }
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $pin = ([BitConverter]::ToString($sha.ComputeHash($certificate.RawData))).Replace('-', '').ToLowerInvariant() }
     finally { $sha.Dispose() }

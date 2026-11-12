@@ -77,8 +77,10 @@ clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
-`-- --help` for native help. The server creates a private local pairing token on
-first use and preserves existing credentials/pairing. Launchers never build.
+`-- --help` for native help. Authentication is disabled by default on both OSes:
+**Add server** needs no token file or credential copying. Explicit `--token-file`
+(Windows `-TokenFile`) enables optional authenticated pairing. Existing credential
+files are left untouched but are not used automatically. Launchers never build.
 
 **The bundled TLS identity is public and provides no trustworthy server
 authentication.** It is for isolated synthetic benchmarks only. The client
@@ -107,7 +109,7 @@ Linux-client pairing, and optional privileged HTTPS tests.
 
 After provisioning, start the Windows server in the foreground with
 `.\scripts\run-server.ps1 -BindAddress 10.0.0.4 -Port 8443`. It defaults to
-`build\Release\winlin-server.exe` and `.winlin-local\pairing-token`; use
+`build\Release\winlin-server.exe`, without authentication; use
 `-BuildDirectory`, `-Configuration`, `-StateDirectory`, or `-ServerExe` to
 override discovery. Run with `-Help` for all supported options.
 
@@ -149,7 +151,8 @@ Linux client
 The client is the user's entry point. It will discover an already-running Winlin
 server agent at a supplied IP address, report its capabilities, and allow the
 user to register it as a benchmark target. Onboarding will use a known agent
-port, one-time pairing, and server identity confirmation.
+port and automatic registration. Custom server identities require confirmation;
+token-based pairing is optional.
 
 An interactive, menu-driven console will let users select targets and benchmarks,
 configure workloads, run tests, and inspect results or comparisons.

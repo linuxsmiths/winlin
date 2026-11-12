@@ -315,16 +315,22 @@ struct Runtime {
 
     explicit Runtime(const Args& args)
         : agent(
-              windows_config(args), token_file(args.require("--token-file")),
-              optional_token_file(
-                  args.get("--session-file", args.require("--token-file") + ".session")),
-              [path = args.get("--session-file", args.require("--token-file") + ".session")] {
+              windows_config(args),
+              args.get("--token-file").empty() ? "" : token_file(args.get("--token-file")),
+              args.get("--token-file").empty()
+                  ? std::nullopt
+                  : optional_token_file(
+                        args.get("--session-file", args.get("--token-file") + ".session")),
+              [path = args.get("--session-file", args.get("--token-file") + ".session")] {
                   return issue_token_file(path);
               },
               equal_secret, usage),
           payload(max_object_size), stop_file(args.get("--stop-file")),
           address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "8443"), 65535))) {
+        if (args.get("--token-file").empty()) {
+            log_warning("Authentication disabled; use only on an isolated benchmark network");
+        }
         if (!port) {
             throw std::invalid_argument("HTTP.sys requires an explicitly bound nonzero port");
         }
@@ -687,7 +693,8 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
 int wmain(int argc, wchar_t** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
-        std::cout << "winlin-server --token-file pairing-token [--bind 127.0.0.1] [--port 8443]\n"
+        std::cout << "winlin-server [--bind 127.0.0.1] [--port 8443]\n"
+                     "  [--token-file path] (optional authentication; default: none)\n"
                      "  [--workers 8] [--backend httpsys] [--cipher TLS_AES_128_GCM_SHA256]\n"
                      "  [--max-connections 32768] [--session-file path] [--stop-file path]\n"
                      "Configure the HTTP.sys certificate binding and URL ACL using "
