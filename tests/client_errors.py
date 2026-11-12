@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
         cases = [
             ([client, "add", "--host", "127.0.0.1", "--port", str(port),
               "--target", str(target)], None, 1),
-            ([client], f"1\n127.0.0.1\n{port}\n\n2\n0\n", 0),
+            ([client], f"1\n127.0.0.1\n{port}\n2\n0\n", 0),
         ]
         for arguments, input_text, expected in cases:
             result = subprocess.run(
@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
 
 
 class RegistrationHandler(BaseHTTPRequestHandler):
-    """Provide control and tiny workload responses over TLS without the native guard port."""
+    """Provide HTTP control and independent HTTP/HTTPS workloads without the native guard port."""
 
     protocol_version = "HTTP/1.1"
 
@@ -102,8 +102,9 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert "max_connections" not in settings
             self.server.settings = settings
-            self.server.peer.settings = settings
-            data = self.server.peer if settings["tls"] == "off" else self.server
+            self.server.plain.settings = settings
+            self.server.secure.settings = settings
+            data = self.server.plain if settings["tls"] == "off" else self.server.secure
             self.respond({
                 "run_id": "aa" * 32, "port": data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
@@ -129,8 +130,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     directory = Path(temporary)
     server = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     plain = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
-    plain.peer, server.peer = server, plain
-    for endpoint, encrypted in ((server, True), (plain, False)):
+    secure = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
+    server.plain, server.secure = plain, secure
+    for endpoint, encrypted in ((server, False), (plain, False), (secure, True)):
         endpoint.authorizations = []
         endpoint.run_ids = []
         endpoint.response_status = 200
@@ -146,11 +148,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    secure.socket = context.wrap_socket(secure.socket, server_side=True)
     worker = threading.Thread(target=server.serve_forever)
     plain_worker = threading.Thread(target=plain.serve_forever)
+    secure_worker = threading.Thread(target=secure.serve_forever)
     worker.start()
     plain_worker.start()
+    secure_worker.start()
     try:
         port = str(server.server_port)
         for index in range(2):
@@ -162,21 +166,24 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             )
             assert result.returncode == 0, result.stdout + result.stderr
             assert "access_token" not in json.loads(target.read_text())
+            assert "cipher" not in json.loads(target.read_text())
             assert "authentication" not in result.stdout
 
         # Older target metadata remains readable, but obsolete values never reach the wire.
         saved = json.loads(target.read_text())
         saved["access_token"] = "obsolete"
+        saved["cipher"] = "ignored-legacy-control-cipher"
         target.write_text(json.dumps(saved))
 
         result = subprocess.run(
-            [client], input=f"1\n127.0.0.1\n{port}\n\n2\n1\n0\n",
+            [client], input=f"1\n127.0.0.1\n{port}\n2\n1\n0\n",
             capture_output=True, text=True, timeout=15,
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "state")),
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "Target saved" in result.stdout, result.stdout + result.stderr
         assert "authentication" not in result.stdout
+        assert "TLS 1.3 cipher" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
 
         benchmark = [
@@ -246,7 +253,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert plain.run_ids and all(value == "aa" * 32 for value in plain.run_ids)
         assert all(value is None for value in plain.authorizations)
 
-        server.fail_workload = True
+        secure.fail_workload = True
         output = directory / "failed-benchmark.json"
         result = subprocess.run(
             [*benchmark, "--output", str(output)],
@@ -264,7 +271,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert [row[-1] for row in table_row.findall(result.stdout)] == ["N/A", "N/A"]
         for note in report["notes"]:
             assert note not in result.stdout + result.stderr
-        server.fail_workload = False
+        secure.fail_workload = False
 
         rejected = directory / "rejected.json"
         server.response_status = 503
@@ -278,9 +285,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     finally:
         server.shutdown()
         plain.shutdown()
+        secure.shutdown()
         worker.join(timeout=5)
         plain_worker.join(timeout=5)
+        secure_worker.join(timeout=5)
         server.server_close()
         plain.server_close()
+        secure.server_close()
 
 print("Client registration, benchmark notes, run-specific warnings and error diagnostics passed.")

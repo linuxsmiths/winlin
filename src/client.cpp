@@ -12,13 +12,20 @@ namespace {
 using namespace winlin;
 namespace fs = std::filesystem;
 
-// Hold the saved server identity and an optional workload lease, shared read-only by load workers.
+// Hold the server address, expected workload certificate and optional workload lease.
+// Load workers share this read-only; control always uses plain HTTP.
 // Run IDs exist only in memory and must not be serialized into results or saved targets.
 struct Target {
-    std::string host, port, pin, run_id, cipher;
-    bool tls{true};
+    // host:port is the IP:port of the target server.
+    // pin is the sha256 fingerprint of the workload's TLS certificate, which is our self-signed
+    // certificate.
+    // run_id is a unique identifier for the current workload lease, which is used to isolate
+    // telemetry and other server state from other concurrent workloads.
+    std::string host, port, pin, run_id;
 };
 
+// Check if pin is a valid SHA-256 fingerprint (64 hexadecimal digits) and convert it to
+// lowercase and return it. Throw std::invalid_argument if the pin is invalid.
 std::string checked_pin(std::string pin) {
     pin = lower(std::move(pin));
     if (pin.size() != 64 || !std::all_of(pin.begin(), pin.end(), [](unsigned char ch) {
@@ -29,6 +36,7 @@ std::string checked_pin(std::string pin) {
     return pin;
 }
 
+// Validate that host is a valid numeric IPv4 address.
 void check_host(const std::string& host) {
     in_addr address{};
     if (inet_pton(AF_INET, host.c_str(), &address) != 1) {
@@ -39,6 +47,8 @@ void check_host(const std::string& host) {
 // Reserve new outputs exclusively and replace existing results via a flushed private temporary
 // file. A failed update must leave earlier completed repetitions intact.
 void write_private(const fs::path& path, const Json& value, bool exclusive) {
+    // If exclusive, then the file must not exist and will be created with 0600 permissions.
+    // If not exclusive, then the file must exist and be a private regular file owned by this user.
     if (!exclusive) {
         struct stat status{};
         if (lstat(path.c_str(), &status) || !S_ISREG(status.st_mode) ||
@@ -54,6 +64,8 @@ void write_private(const fs::path& path, const Json& value, bool exclusive) {
         throw system_error("Cannot open " + path.string());
     }
     try {
+        // Now, write the JSON to the file and flush it to disk. The temporary file is renamed
+        // to the final path only after a successful write and flush.
         const auto text = value.dump(2) + "\n";
         std::size_t offset{};
         while (offset < text.size()) {
@@ -69,6 +81,8 @@ void write_private(const fs::path& path, const Json& value, bool exclusive) {
         if (fsync(file.value)) {
             throw system_error("fsync");
         }
+        // If exclusive, the json was written directly to the final path. If not exclusive,
+        // rename the temporary file to the final path.
         if (!exclusive && rename(temporary.c_str(), path.c_str())) {
             throw system_error("rename output");
         }
@@ -80,17 +94,27 @@ void write_private(const fs::path& path, const Json& value, bool exclusive) {
     }
 }
 
-// Validate saved server metadata without echoing file contents in parse errors.
+// Load a target from a JSON file, validating its contents.
+// Typical target file looks like this:
+// tomar@KVPerf-servernew-himanshu:~/winlin$ cat ~/.local/state/winlin/172.16.0.4-38443.json
+// {
+//   "certificate_sha256": "a7f93f90b9dc1d7e7ed5d5e640d70d4c7c634285045388eeba9040ef0debc912",
+//   "host": "172.16.0.4",
+//   "port": "38443"
+// }
 Target load_target(const std::string& path) {
     const auto content = read_private(path);
     try {
         const auto json = Json::parse(content);
-        Target result{json.at("host"), json.at("port"), json.at("certificate_sha256"), "",
-                      json.at("cipher")};
+        Target result{json.at("host"), json.at("port"), json.at("certificate_sha256"),
+                      "" /* run_id */};
+        // Validate host is a numeric IPv4 address
         check_host(result.host);
+        // port must be less than 65535
         if (!number(result.port, 65535)) {
             throw std::invalid_argument("Invalid port");
         }
+        // Validate pin is a valid SHA-256 fingerprint
         result.pin = checked_pin(result.pin);
         return result;
     } catch (const std::exception&) {
@@ -98,19 +122,25 @@ Target load_target(const std::string& path) {
     }
 }
 
-// Own one bounded control response independently of its TLS connection, which closes after
+// Own one bounded metadata response independently of its connection, which closes after
 // exchange. Workload bodies use streaming buffers instead and must not allocate a Response per
 // request.
+//
+// This is used for control traffic and workload capability checks, both small and bounded.
+// Used for control requests like fetching server capabilities (/v1/capabilities),
+// starting and stopping benchmarks (/v1/benchmark/start and /v1/benchmark/stop),
+// and fetching telemetry after the benchmark (/v1/benchmark/telemetry).
 struct Response {
     int status{};
     HttpHead head;
     std::string body;
 };
 
-// Use a separately pinned connection for control traffic, bounded independently of load duration.
+// Control uses plain HTTP (ctx == nullptr); HTTPS workload metadata uses its own pinned context.
+// Each metadata exchange is bounded independently of load duration.
 Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
                   const std::string& path, const std::string& body = {}) {
-    auto socket = connect_stream(target.tls ? ctx : nullptr, target.host, target.port, target.pin);
+    auto socket = connect_stream(ctx, target.host, target.port, target.pin);
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     const std::string request =
         method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
@@ -169,8 +199,8 @@ Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
     return response;
 }
 
-Json control(SSL_CTX* ctx, const Target& target, const std::string& path) {
-    const auto response = exchange(ctx, target, "GET", path);
+Json control(const Target& target, const std::string& path) {
+    const auto response = exchange(nullptr, target, "GET", path);
     if (response.status != 200) {
         throw std::runtime_error("Server rejected control request (HTTP " +
                                  std::to_string(response.status) + ")");
@@ -200,28 +230,25 @@ fs::path state_directory() {
     return directory;
 }
 
-// Verify the server's pinned capabilities before saving its address and TLS settings locally.
+// Discover the HTTP controller; save the expected certificate only for future HTTPS workloads.
 void add_target(const std::string& host, const std::string& port, const std::string& pin,
-                const fs::path& output, const std::string& cipher) {
+                const fs::path& output) {
     check_host(host);
     if (!number(port, 65535)) {
         throw std::invalid_argument("Port must be positive");
     }
-    Target target{host, port, checked_pin(pin), "", cipher};
+    Target target{host, port, checked_pin(pin), ""};
     if (target.pin == benchmark_certificate_sha256) {
         log_warning(
-            "Using the public benchmark certificate; this does not authenticate server identity");
+            "HTTPS workloads use the PUBLIC benchmark certificate; no trustworthy server identity");
     }
-    auto ctx = context(false, cipher);
     // CLI onboarding should work on a fresh client without a manual target-directory setup step.
     if (!output.parent_path().empty()) {
         fs::create_directories(output.parent_path());
     }
-    const auto capabilities = control(ctx.get(), target, "/v1/capabilities");
-    write_private(
-        output,
-        {{"host", host}, {"port", port}, {"certificate_sha256", target.pin}, {"cipher", cipher}},
-        true);
+    const auto capabilities = control(target, "/v1/capabilities");
+    write_private(output, {{"host", host}, {"port", port}, {"certificate_sha256", target.pin}},
+                  true);
     std::cout << "Target saved to " << output.string() << '\n';
     std::cout << capabilities.dump(2) << '\n';
 }
@@ -516,8 +543,8 @@ public:
 // Coordinate setup, warmup and measurement without charging connection establishment to throughput.
 // Every worker must reach both gates even after failure, or the controller would wait forever.
 Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
-           const std::vector<char>& payload, unsigned repetition, SSL_CTX* control_ctx,
-           const Target& control_target, const std::string& run_id) {
+           const std::vector<char>& payload, unsigned repetition, const Target& control_target,
+           const std::string& run_id) {
     std::latch setup_done(config.workers), warmup_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};
@@ -588,8 +615,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     Json server_before, client_before;
     if (!abort) {
         try {
-            server_before =
-                control(control_ctx, control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
+            server_before = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
             client_before = usage();
         } catch (const std::exception& error) {
             fail(error.what());
@@ -607,8 +633,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     }
     const double elapsed = std::chrono::duration<double>(combined.end - measure_start).count();
     const auto client_after = usage();
-    const auto server_after =
-        control(control_ctx, control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
+    const auto server_after = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
@@ -681,8 +706,7 @@ RunConfig configuration(const Args& args) {
 // Persist every finished repetition and a final failure status; a nonzero result must remain
 // visible to automation even when useful partial measurements were saved.
 int run(Target target, const RunConfig& config, const fs::path& output) {
-    auto ctx = context(false, target.cipher);
-    auto capabilities = control(ctx.get(), target, "/v1/capabilities");
+    auto capabilities = control(target, "/v1/capabilities");
     if (!capabilities.contains("supported_tls_modes") || !capabilities.contains("limits")) {
         throw std::runtime_error("Server capabilities are outdated; update and restart the server");
     }
@@ -711,7 +735,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     std::vector<std::string> notes{
         "Closed-loop workload: percentiles exclude arrival-rate queueing and do not establish an "
         "SLA.",
-        "Server process telemetry includes the HTTPS controller; one benchmark lease is active.",
+        "Server process telemetry includes the HTTP controller; one benchmark lease is active.",
         "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
         "load interval.",
         "Reference CPIO attributes all OS-visible server CPU work to the benchmark, including "
@@ -750,7 +774,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     bool errors = false;
     std::string run_id;
     auto command = [&](const std::string& path, const std::string& body = {}) {
-        const auto response = exchange(ctx.get(), target, "POST", path, body);
+        const auto response = exchange(nullptr, target, "POST", path, body);
         if (response.status != 200) {
             throw std::runtime_error(
                 "Server rejected benchmark control (HTTP " + std::to_string(response.status) +
@@ -767,16 +791,22 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                                                               3 * config.timeout + 60))}};
         const auto started = command("/v1/benchmark/start", settings.dump());
         run_id = started.at("run_id");
-        Target workload{target.host,   std::to_string(started.at("port").get<unsigned>()),
-                        target.pin,    run_id,
-                        config.cipher, config.tls != "off"};
+        // Setup the final Target
+        Target workload{target.host, std::to_string(started.at("port").get<unsigned>()), target.pin,
+                        run_id};
+        const bool workload_tls = config.tls != "off";
         auto workload_ctx =
-            workload.tls ? context(false, config.cipher) : Context(nullptr, SSL_CTX_free);
-        auto workload_capabilities = control(workload_ctx.get(), workload, "/v1/capabilities");
+            workload_tls ? context(false, config.cipher) : Context(nullptr, SSL_CTX_free);
+        const auto response = exchange(workload_ctx.get(), workload, "GET", "/v1/capabilities");
+        if (response.status != 200) {
+            throw std::runtime_error("Server rejected workload capability request (HTTP " +
+                                     std::to_string(response.status) + ")");
+        }
+        const auto workload_capabilities = Json::parse(response.body);
         const auto applied = workload_capabilities.at("run");
-        if (applied.at("transport") != (workload.tls ? "https" : "http") ||
+        if (applied.at("transport") != (workload_tls ? "https" : "http") ||
             applied.at("workers") != config.server_workers ||
-            (workload.tls &&
+            (workload_tls &&
              (applied.at("tls_version") != "TLSv1.3" || applied.at("cipher") != config.cipher))) {
             throw std::runtime_error("Server did not apply the requested benchmark settings");
         }
@@ -795,8 +825,8 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         write_private(output, report, false);
         std::cout << "Run  requests/s     p50(us)     p99(us)   errors       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
-            auto result = trial(workload_ctx.get(), workload, config, payload, index, ctx.get(),
-                                target, run_id);
+            auto result =
+                trial(workload_ctx.get(), workload, config, payload, index, target, run_id);
             errors = errors || result.at("errors").get<std::uint64_t>() != 0 ||
                      result.at("completed").get<std::uint64_t>() == 0;
             std::cout << std::fixed << std::setprecision(2) << std::setw(3) << index
@@ -914,25 +944,11 @@ void interactive() {
                 const auto host = prompt("Server IPv4 address");
                 check_host(host);
                 const auto port = prompt("Agent port", "38443");
-                const auto cipher = prompt("TLS 1.3 cipher", "TLS_AES_128_GCM_SHA256");
-                auto ctx = context(false, cipher);
-                auto socket = connect_stream(ctx.get(), host, port, {});
-                const auto pin = fingerprint(socket->ssl.get());
-                std::cout << "Server certificate SHA-256: " << pin << '\n';
-                // Only the bundled public fixture is accepted automatically; custom identities
-                // retain the explicit confirmation step and the saved exact-certificate pin.
-                if (pin != benchmark_certificate_sha256) {
-                    std::cout << "Verify this fingerprint through a trusted channel.\n";
-                    if (prompt("Trust this certificate? Type yes", "no") != "yes") {
-                        continue;
-                    }
-                }
-                add_target(host, port, pin, state_directory() / (host + "-" + port + ".json"),
-                           cipher);
+                add_target(host, port, std::string(benchmark_certificate_sha256),
+                           state_directory() / (host + "-" + port + ".json"));
             } else if (action == "2") {
                 const auto target = load_target(select_target());
-                auto ctx = context(false, target.cipher);
-                std::cout << control(ctx.get(), target, "/v1/capabilities").dump(2) << '\n';
+                std::cout << control(target, "/v1/capabilities").dump(2) << '\n';
             } else if (action == "3") {
                 const auto target = load_target(select_target());
                 RunConfig config;
@@ -977,6 +993,7 @@ int main(int argc, char** argv) {
     using namespace winlin;
     try {
         std::signal(SIGPIPE, SIG_IGN);
+        // If started w/o options, start interactive mode.
         if (argc == 1) {
             interactive();
             return 0;
@@ -987,33 +1004,31 @@ int main(int argc, char** argv) {
                 << "winlin                         Interactive console\n"
                    "winlin add --host IP --target FILE [--fingerprint "
                    "SHA256]\n"
-                   "            [--port 38443] [--cipher TLS_AES_128_GCM_SHA256]\n"
-                   "            Default: bundled PUBLIC benchmark certificate (no trusted "
-                   "identity).\n"
-                   "            Custom certificates require --fingerprint.\n"
+                   "            [--port 38443] Control uses plain HTTP.\n"
+                   "            HTTPS workloads default to the PUBLIC benchmark certificate.\n"
+                   "            Custom workload certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
-                   "Closed-loop persistent HTTPS only; paced load and handshake tests are not "
+                   "Closed-loop persistent HTTP/HTTPS; paced load and handshake tests are not "
                    "implemented yet.\n";
             return 0;
         }
         Args args(argc, argv, 2);
         if (command == "add" || command == "pair") {
-            args.allow({"--host", "--port", "--fingerprint", "--target", "--cipher"});
+            args.allow({"--host", "--port", "--fingerprint", "--target"});
             add_target(args.require("--host"), args.get("--port", "38443"),
                        args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
-                       args.require("--target"), args.get("--cipher", "TLS_AES_128_GCM_SHA256"));
+                       args.require("--target"));
             return 0;
         }
         if (command == "inspect") {
             args.allow({"--target"});
             const auto target = load_target(args.require("--target"));
-            auto ctx = context(false, target.cipher);
-            std::cout << control(ctx.get(), target, "/v1/capabilities").dump(2) << '\n';
+            std::cout << control(target, "/v1/capabilities").dump(2) << '\n';
             return 0;
         }
         if (command == "run") {

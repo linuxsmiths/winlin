@@ -1,4 +1,4 @@
-"""Exercise the actual HTTPS controller and per-run Linux workload engines on temporary ports."""
+"""Exercise the HTTP controller and independent Linux HTTP/TLS workloads on temporary ports."""
 
 import hashlib
 import http.client
@@ -66,9 +66,7 @@ class Controller:
         assert self.process.returncode == 0, stderr
 
     def request(self, method, path, body=None, host="127.0.0.1"):
-        connection = http.client.HTTPSConnection(
-            host, self.port, context=tls_context(), timeout=10,
-        )
+        connection = http.client.HTTPConnection(host, self.port, timeout=10)
         try:
             connection.request(method, path, body=body)
             response = connection.getresponse()
@@ -94,7 +92,7 @@ class Controller:
 
 
 class Workload:
-    """Connect only to the endpoint and automatic lease returned by the HTTPS controller."""
+    """Connect only to the endpoint and automatic lease returned by the HTTP controller."""
 
     def __init__(self, lease):
         self.lease = lease
@@ -115,6 +113,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     controller = Controller(directory)
     try:
         assert controller.ready["bind"] == "0.0.0.0"
+        assert controller.ready["backend"] == "http"
         assert controller.request("GET", "/v1/capabilities", host="127.0.0.2")[0] == 200
         status, capabilities = controller.request("GET", "/v1/capabilities")
         assert status == 200
@@ -147,16 +146,21 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         bad_target = directory / "wrong-pin.json"
         refused = command(
             CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
-            "--target", bad_target, "--fingerprint", "00" * 32, expected=1,
+            "--target", bad_target, "--fingerprint", "00" * 32,
         )
-        assert "certificate changed" in refused.stderr and not bad_target.exists()
+        # A workload pin has no role in HTTP discovery, but HTTPS must still reject mismatches.
+        refused = command(
+            CLIENT, "run", "--target", bad_target, "--tls", "on", "--connections", "1",
+            "--workers", "1", "--server-workers", "1", "--warmup", "0", "--duration", "1",
+            "--requests", "1", "--repetitions", "1", "--output", directory / "wrong-pin-result.json",
+            expected=1,
+        )
+        assert "certificate changed" in refused.stderr
         for invalid in ({"workers": 0}, {"workers": 1.5}, {"tls": "invalid"}, {"unknown": 1},
                         {"max_connections": 32}):
             assert controller.request("POST", "/v1/benchmark/start", json.dumps(invalid))[0] == 400
         body = json.dumps({"tls": "off", "workers": 1})
-        fragmented = http.client.HTTPSConnection(
-            "127.0.0.1", controller.port, context=tls_context(), timeout=5,
-        )
+        fragmented = http.client.HTTPConnection("127.0.0.1", controller.port, timeout=5)
         try:
             fragmented.putrequest("POST", "/v1/benchmark/start")
             fragmented.putheader("Content-Length", str(len(body)))
@@ -310,13 +314,14 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         # A fresh menu discovers control without transport options or fixture confirmation.
         menu_output = directory / "menu-result.json"
         menu = command(
-            CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n\n2\n1\n"
+            CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n2\n1\n"
                            f"3\n1\noff\n2\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout
         assert "authentication" not in menu.stdout and "Trust this certificate?" not in menu.stdout
         assert "Server connection limit" not in menu.stdout
+        assert "TLS 1.3 cipher" not in menu.stdout
         menu_report = json.loads(menu_output.read_text())
         assert menu_report["benchmark"] == "http"
         assert menu_report["server_configuration"]["workers"] == 2
@@ -332,16 +337,25 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     controller = Controller(custom)
     try:
         target = custom / "target.json"
-        refused = command(
+        default_target = custom / "default-pin.json"
+        command(
             CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
-            "--target", target, expected=1,
+            "--target", default_target,
         )
-        assert "certificate changed" in refused.stderr and not target.exists()
         pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(
             (custom / "server.pem").read_text())).hexdigest()
         command(CLIENT, "add", "--host", "127.0.0.1", "--port", controller.port,
                 "--target", target, "--fingerprint", pin)
+        for selected, expected in ((default_target, 1), (target, 0)):
+            result = command(
+                CLIENT, "run", "--target", selected, "--tls", "on", "--connections", "1",
+                "--workers", "1", "--server-workers", "1", "--warmup", "0", "--duration", "1",
+                "--requests", "2", "--repetitions", "1",
+                "--output", custom / f"{selected.stem}-result.json", expected=expected,
+            )
+            if expected:
+                assert "certificate changed" in result.stderr
     finally:
         controller.stop()
 
-print("HTTPS control, HTTP/TLS/kTLS workloads, exclusive leases, runtime tuning and telemetry passed.")
+print("HTTP control, HTTP/TLS/kTLS workloads, exclusive leases, workload pinning and telemetry passed.")

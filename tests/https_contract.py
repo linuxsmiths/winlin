@@ -5,7 +5,7 @@ import subprocess
 
 
 def exercise_single_instance(server_arguments, running_port):
-    """Reject duplicate native servers before readiness, including on a different HTTPS endpoint."""
+    """Reject duplicate native servers before readiness, including on a different control endpoint."""
     for port in (running_port, 1 if running_port != 1 else 2):
         result = subprocess.run(
             [*server_arguments, "--port", str(port)],

@@ -156,19 +156,13 @@ struct UrlGroup {
 };
 
 AgentConfig windows_config(const Args& args) {
-    if (args.get("--backend", "httpsys") != "httpsys") {
-        throw std::invalid_argument("Windows backend must be httpsys (HTTP.sys/Schannel)");
-    }
-    auto config = AgentConfig::from_args(args, "httpsys-schannel");
+    auto config = AgentConfig::from_args(args, "httpsys");
+    config.tls = false;
     config.role = AgentConfig::Role::control;
     config.benchmark_tls_modes = {"on", "off"};
     config.supported_backends = {
         {{"name", "httpsys"}, {"transport", "http"}, {"tls_mode", "off"}},
         {{"name", "httpsys-schannel"}, {"transport", "https"}, {"tls_mode", "on"}}};
-    if (config.cipher != "TLS_AES_128_GCM_SHA256" && config.cipher != "TLS_AES_256_GCM_SHA384") {
-        throw std::invalid_argument(
-            "Schannel backend supports TLS_AES_128_GCM_SHA256 or TLS_AES_256_GCM_SHA384");
-    }
     config.environment = environment();
     config.connection_metrics = false;
     std::erase(config.unavailable_metrics, "hardware_cycles");
@@ -861,9 +855,10 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
         std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
-                     "  [--workers 8] [--backend httpsys] [--cipher TLS_AES_128_GCM_SHA256]\n"
+                     "  [--workers 8]\n"
                      "  [--stop-file path]\n"
-                     "Per-run workload TLS/cipher/workers are controlled remotely.\n"
+                     "Control uses plain HTTP; per-run workload TLS/cipher/workers are controlled "
+                     "remotely.\n"
                      "Configure the HTTP.sys certificate bindings and URL ACLs using "
                      "scripts/setup-server.ps1 first.\n";
         return 0;
@@ -879,8 +874,7 @@ int wmain(int argc, wchar_t** argv) {
             arguments.push_back(value.data());
         }
         Args args(argc, arguments.data());
-        args.allow({"--bind", "--port", "--workers", "--backend", "--cipher", "--stop-file",
-                    "--http-port", "--https-port"});
+        args.allow({"--bind", "--port", "--workers", "--stop-file", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port =
             static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));

@@ -24,13 +24,13 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run-server.ps1"
 class Agent:
     """Own a permanent native control process and its provisioned endpoints."""
 
-    def __init__(self, cipher="TLS_AES_128_GCM_SHA256"):
+    def __init__(self):
         self.port = PORT
         arguments = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
             "-ServerExe", SERVER, "-Port", str(PORT), "-HttpPort", str(HTTP_PORT),
             "-HttpsPort", str(HTTPS_PORT), "-Workers", "2",
-            "-Cipher", cipher, "-StopFile", STOP_FILE,
+            "-StopFile", STOP_FILE,
         ]
         self.process = subprocess.Popen(
             arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -43,10 +43,8 @@ class Agent:
             line = lines.get(timeout=15)
             if not line:
                 raise AssertionError(f"Server failed: {self.process.stderr.read()}")
-            assert json.loads(line)["backend"] == "httpsys-schannel"
-            self.connection = http.client.HTTPSConnection(
-                "127.0.0.1", PORT, context=tls_context(), timeout=5,
-            )
+            assert json.loads(line)["backend"] == "httpsys"
+            self.connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
         except BaseException:
             self.stop()
             raise
@@ -205,14 +203,20 @@ def exercise_run(agent, cipher, mode, workers):
 agent = Agent()
 try:
     exercise_single_instance([SERVER], PORT)
-    agent.connection.connect()
-    assert hashlib.sha256(agent.connection.sock.getpeercert(binary_form=True)).hexdigest() == PIN
-    cipher = agent.connection.sock.cipher()[0]
+    probe = agent.start({"tls": "on", "workers": 1})
+    connection = data_connection("on")
+    try:
+        connection.connect()
+        assert hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest() == PIN
+        cipher = connection.sock.cipher()[0]
+    finally:
+        connection.close()
+        assert agent.request("POST", f"/v1/benchmark/stop?run_id={probe['run_id']}")[0] == 200
 finally:
     agent.stop()
 assert cipher in ("TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"), cipher
 
-agent = Agent(cipher)
+agent = Agent()
 try:
     assert agent.request("POST", "/v1/pair")[0] == 404
     status, payload = agent.request("GET", "/v1/capabilities")
@@ -275,7 +279,7 @@ try:
     legacy.check_hostname = False
     legacy.verify_mode = ssl.CERT_NONE
     legacy.minimum_version = legacy.maximum_version = ssl.TLSVersion.TLSv1_2
-    for port in (PORT, HTTPS_PORT):
+    for port in (HTTPS_PORT,):
         try:
             with legacy.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=3),
                                     server_hostname="127.0.0.1"):
@@ -285,17 +289,9 @@ try:
 finally:
     agent.stop()
 
-agent = Agent(cipher)
+agent = Agent()
 try:
     assert agent.request("GET", "/v1/capabilities")[0] == 200
-finally:
-    agent.stop()
-
-other = "TLS_AES_256_GCM_SHA384" if cipher == "TLS_AES_128_GCM_SHA256" else "TLS_AES_128_GCM_SHA256"
-agent = Agent(other)
-try:
-    status, payload = agent.request("GET", "/v1/capabilities")
-    assert status == 400 and b"cipher" in payload, payload
 finally:
     agent.stop()
 

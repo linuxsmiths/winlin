@@ -24,8 +24,7 @@ if ($Port -eq $HttpPort -or $Port -eq $HttpsPort -or $HttpPort -eq $HttpsPort) {
 $state = [IO.Path]::GetFullPath($StateDirectory)
 Initialize-WinlinPrivateDirectory -Path $state
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$endpoint = "${BindAddress}:$Port"
-$url = "https://${BindAddress}:$Port/"
+$url = "http://${BindAddress}:$Port/"
 $createdCertificate = $false
 $httpUrl = "http://${BindAddress}:$HttpPort/"
 $httpsUrl = "https://${BindAddress}:$HttpsPort/"
@@ -62,13 +61,12 @@ try {
         Write-Warning 'Using the PUBLIC benchmark certificate/key; this provides no trustworthy server identity.'
     }
     $thumbprint = $certificate.Thumbprint
-    foreach ($bindingEndpoint in @($endpoint, "${BindAddress}:$HttpsPort")) {
-        # Add, never update: a conflict must fail without overwriting an existing endpoint.
-        Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'sslcert', "ipport=$bindingEndpoint",
-            "certhash=$thumbprint", 'certstorename=MY', 'appid={49071664-1d0a-4a82-bbb2-72878abc7ca2}',
-            'disablehttp2=enable', 'disablequic=enable', 'disablelegacytls=enable', 'disabletls12=enable') | Out-Host
-        $createdBindings += $bindingEndpoint
-    }
+    $bindingEndpoint = "${BindAddress}:$HttpsPort"
+    # Add, never update: a conflict must fail without overwriting an existing endpoint.
+    Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'sslcert', "ipport=$bindingEndpoint",
+        "certhash=$thumbprint", 'certstorename=MY', 'appid={49071664-1d0a-4a82-bbb2-72878abc7ca2}',
+        'disablehttp2=enable', 'disablequic=enable', 'disablelegacytls=enable', 'disabletls12=enable') | Out-Host
+    $createdBindings += $bindingEndpoint
     foreach ($reservation in @($url, $httpUrl, $httpsUrl)) {
         Invoke-WinlinNative -File netsh.exe -Arguments @('http', 'add', 'urlacl', "url=$reservation",
             "user=$user", 'listen=yes', 'delegate=no') | Out-Host

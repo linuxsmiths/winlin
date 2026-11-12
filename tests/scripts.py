@@ -218,12 +218,12 @@ class Scripts(unittest.TestCase):
         result = self.run_script(
             "run-server.sh", "--state-dir", "private state", "--",
             "--cert", str(custom / "server.pem"), "--key", str(custom / "server.key"),
-            "--backend", "ktls",
+            "--http-port", "39000",
         )
         arguments = json.loads(result.stdout)["arguments"]
         for option in ("--cert", "--key"):
             self.assertEqual(arguments.count(option), 1)
-        self.assertEqual(arguments[-2:], ["--backend", "ktls"])
+        self.assertEqual(arguments[-2:], ["--http-port", "39000"])
 
     def test_launcher_custom_build_paths_and_native_exit_codes(self):
         """Locate caller-relative builds with spaces and preserve application failure statuses."""

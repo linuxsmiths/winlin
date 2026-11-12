@@ -112,14 +112,12 @@ exit 0
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-StateDirectory', $state, '-BindAddress', '10.0.0.4',
         '-Port', '9443', '-HttpPort', '9444', '-HttpsPort', '9445', '-Workers', '3',
-        '-Cipher', 'TLS_AES_256_GCM_SHA384',
         '-StopFile', 'stop with spaces'
     )
     if ($result.ExitCode -ne 0) { throw "Launcher fixture failed: $($result.Output)" }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
     $expected = @(
         '--bind', '10.0.0.4', '--port', '9443', '--http-port', '9444', '--https-port', '9445', '--workers', '3',
-        '--cipher', 'TLS_AES_256_GCM_SHA384',
         '--stop-file', 'stop with spaces'
     )
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
@@ -142,7 +140,7 @@ exit 0
     }
 
     $result = Invoke-LauncherFixture -Arguments @(
-        '-ServerExe', $fakeServer, '-Cipher', 'FAIL_TEST'
+        '-ServerExe', $fakeServer, '-StopFile', 'FAIL_TEST'
     )
     if ($result.ExitCode -ne 23 -or ($result.Output -join "`n") -notmatch 'FATAL:') {
         throw "Launcher lost application failure: $($result.Output)"

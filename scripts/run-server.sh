@@ -7,12 +7,12 @@ usage() {
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
-HTTPS control listens on 0.0.0.0:38443 unless --bind/--port overrides it.
+HTTP control listens on 0.0.0.0:38443 unless --bind/--port overrides it.
 Clients select per-run server workers, TLS on/off/kTLS, and cipher.
 The implementation connection ceiling is 65536 per endpoint; it is not configurable.
 Workload data defaults to HTTP port 38444 or HTTPS port 38445; host overrides:
 --http-port PORT and --https-port PORT. No server restart is needed between modes.
-Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
+Default workload TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
 An existing server.pem/server.key in the state directory takes precedence.
 Native --cert/--key override TLS defaults.
 Place launcher options first. Relative overrides use the caller's working directory.

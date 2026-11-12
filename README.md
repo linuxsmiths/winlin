@@ -16,7 +16,7 @@ target registration and discovery, GET/PUT workloads, process telemetry, and JSO
 Both servers share agent routing, run leases, capabilities, and workload
 semantics. The kTLS backend verifies activation per direction and refuses
 userspace fallback.
-An always-HTTPS controller configures one exclusive run at a time: clients select
+A plain-HTTP controller configures one exclusive run at a time: clients select
 workload TLS on/off, kTLS, cipher, and server workers without
 restarting the server. Compact terminal tables include reference cycles per I/O,
 estimated from whole-server busy CPU time and calibrated invariant-TSC frequency
@@ -77,10 +77,12 @@ Use the foreground launchers:
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
-The Linux HTTPS controller listens on `0.0.0.0:38443` by default, accepting remote IPv4
+The Linux HTTP controller listens on `0.0.0.0:38443` by default, accepting remote IPv4
 clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
 It advertises a separate per-run data endpoint: port 38444 for HTTP or 38445 for
 HTTPS/kTLS. Allow these ports from the client through firewall/VNet rules.
+Control commands, telemetry and run IDs are unencrypted; restrict control access
+to the trusted benchmark network. TLS applies only to the selected workload.
 Inspection shows supported workload choices and implementation limits, not the
 fixed control connection's settings. The connection ceiling is 65,536 per endpoint;
 users choose load concurrency with **Connections**, not a server-limit setting.
@@ -94,8 +96,8 @@ Choose server tuning in the client benchmark menu, or for example:
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
-`-- --help` for native help. **Add server** discovers the endpoint and saves its
-certificate pin locally. Launchers never build.
+`-- --help` for native help. **Add server** discovers the endpoint and saves the
+expected workload certificate pin locally. Launchers never build.
 
 **The bundled TLS identity is public and provides no trustworthy server
 authentication.** It is for isolated synthetic benchmarks only. The client

@@ -8,7 +8,7 @@
 
 namespace winlin {
 // Both native servers reserve this loopback TCP port for their entire lifetime, independently of
-// the HTTPS endpoint. It carries no traffic and permits only one Winlin server per machine.
+// the control endpoint. It carries no traffic and permits only one Winlin server per machine.
 constexpr std::uint16_t server_guard_port = 8444;
 
 // Describe platform capabilities without mixing transport APIs into the common agent. Native
@@ -33,7 +33,6 @@ struct AgentConfig {
     static AgentConfig from_args(const Args& args, std::string backend) {
         AgentConfig result;
         result.backend = std::move(backend);
-        result.cipher = args.get("--cipher", result.cipher);
         result.workers = static_cast<unsigned>(number(
             args.get("--workers", std::to_string(std::min(
                                       8u, std::max(1u, std::thread::hardware_concurrency())))),

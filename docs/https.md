@@ -8,21 +8,21 @@ For Windows server provisioning, see the [Windows guide](windows.md).
 - Linux OpenSSL userspace and explicitly requested OpenSSL+kTLS server backends.
 - Windows HTTP.sys/Schannel with the same control and workload API.
 - HTTP/1.1 over TLS 1.3, with one explicitly selected TLS cipher suite.
-- Plain HTTP workloads on both platforms, selected per run without changing control security.
+- Plain HTTP control on both platforms, independent of workload HTTP/HTTPS selection.
 - Client-controlled server worker count, TLS/kTLS mode, and cipher.
 - Persistent GET, PUT, or mixed workloads with configurable object sizes,
   connections, worker threads, warmup, duration, request limit, and repetitions.
 - Interactive target selection and benchmark configuration, or noninteractive
   `add`, `inspect`, and `run` commands.
 - Client/server process CPU time, peak resident memory, available context switches, server
-  operation counters, latency histograms, throughput, measured cycles per I/O when available,
+  operation counters, latency histograms, throughput, estimated reference cycles per I/O,
   and saved JSON results.
 
 The Linux server and client multiplex nonblocking TCP/TLS connections using epoll.
 Connections are distributed across a configurable number of worker threads,
 rather than creating one thread per connection. The server uses SO_REUSEPORT
 listeners. Windows uses HTTP.sys, Schannel and IOCP for asynchronous HTTP
-processing. Shared agent logic and a shared HTTPS contract test keep
+processing. Shared agent logic and shared HTTP/TLS contract tests keep
 discovery, run leases, object semantics, and result fields aligned.
 Both implementations still need tuning and validation on large machines.
 
@@ -63,20 +63,22 @@ limit causes a fatal startup error: raise the login/service's hard `nofile` limi
 and start a new session or restart the service before retrying. Native executable
 invocations bypass this launcher check; descriptor exhaustion remains fatal.
 
-Only one Winlin server may run per machine, regardless of HTTPS bind address or
+Only one Winlin server may run per machine, regardless of control bind address or
 port. Both OS implementations hold an exclusive listener on `127.0.0.1:8444`
 without accepting connections. This guard is released automatically on exit,
 including crashes; an occupied guard port prevents startup with a clear error.
 Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
 
-The Linux HTTPS control listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
+The Linux HTTP control listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
 separate client machine can connect without an extra server argument. Use
 `--bind 127.0.0.1` for loopback-only testing, or specify an individual test-network
 IPv4 address. The instance guard remains loopback-only. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.
 
-The client always registers through HTTPS control; it never probes or falls back
-to plaintext control. Before each benchmark it starts a separate data endpoint:
+The control channel always uses plain HTTP: no control TLS, certificate handshake,
+pinning, or cipher configuration. Commands, telemetry, and run IDs are unencrypted
+and vulnerable to on-path modification, so restrict these ports to a trusted,
+isolated benchmark network. Before each benchmark the client starts a separate data endpoint:
 port **38444 for HTTP**, or **38445 for HTTPS/OpenSSL/kTLS**. The server advertises
 the effective port and settings; no client connection-transport option is needed.
 Only the selected workload endpoint is active during a run. Native server
@@ -88,16 +90,16 @@ requests receive HTTP 409. The client stops the workload after completion or a
 caught failure; an abandoned workload expires after its bounded lease. Run IDs
 are managed automatically and omitted from results. Plain HTTP
 provides no data confidentiality; use synthetic traffic on an isolated network.
-Server startup `--workers` and `--cipher` configure control
-only; the client controls the workload's values separately.
+Server startup `--workers` configures control workers only; workload workers and
+cipher are selected separately by the client. There is no control cipher option.
 
-After upgrading from the old port 8443, rebuild and restart both programs and
-register the server at port 38443. Saved targets retain their previous port;
-existing Windows HTTP.sys bindings must be provisioned for the new port as well.
-Update firewall/VNet rules accordingly. A less common port may reduce unsolicited
-probes, but does not prevent scanning or replace network isolation.
+After upgrading from TLS control, rebuild and restart both client and server.
+Port 38443 is unchanged; old target files remain readable and their obsolete
+control-cipher value is ignored. Windows needs an HTTP control URL reservation
+instead of the old HTTPS reservation/binding; see the Windows migration instructions.
+Update firewall/VNet rules as needed. A less common port does not replace isolation.
 
-The client already knows the bundled certificate, so no fingerprint entry is needed:
+The client already knows the bundled workload certificate, so no fingerprint entry is needed:
 
 ```sh
 ./scripts/run-client.sh add \
@@ -109,22 +111,23 @@ The client already knows the bundled certificate, so no fingerprint entry is nee
 
 Remote testing uses the same command with the server's IP; no files need copying.
 Any reachable client can run benchmarks. Use only an isolated
-test network and restrict the port with firewall/VNet rules. Custom identities
+test network and restrict the port with firewall/VNet rules. Custom workload identities
 require `--fingerprint SHA256`; their fingerprint
 must be verified independently. This implementation uses exact certificate
-pinning, not CA-chain or certificate-expiry validation; a different certificate
-is rejected, even when no `--fingerprint` was provided.
+pinning, not CA-chain or certificate-expiry validation. Pins are checked when
+connecting to an HTTPS workload, not during HTTP registration/inspection; an
+unexpected workload certificate is rejected even when no `--fingerprint` was provided.
 
-Registration stores only the endpoint, certificate pin, and cipher locally.
+Registration stores only the endpoint and expected workload certificate pin locally.
 Saved targets remain usable across server restarts; existing target files also
 remain readable. Files must be owned by the current user with private permissions
 (mode `0600`). Client authentication is not supported; TLS server-certificate
 verification and automatic benchmark run leases are separate mechanisms.
 
 Alternatively, run `./scripts/run-client.sh` and select **Add server**. It prompts
-only for the IP address, port, and cipher. The bundled certificate
-is accepted automatically with a warning; custom certificates still require
-fingerprint confirmation.
+only for the IP address and port, using the bundled workload certificate pin.
+Register a custom workload pin with CLI `add --fingerprint SHA256`; such targets
+also appear in the interactive menu when saved in its state directory.
 Interactive targets are saved under `$XDG_STATE_HOME/winlin`, or
 `~/.local/state/winlin` when that variable is unset. Targets registered with an
 explicit `--target` path are usable through the CLI; the interactive menu lists
@@ -177,7 +180,7 @@ will correctly reject a different certificate.
 
 Workload TLS defaults to `--tls on` (Linux userspace OpenSSL or Windows Schannel).
 `--tls off` selects plain HTTP; `--tls ktls` requests Linux kTLS. These are run
-settings sent over HTTPS control, not client connection options. Unsupported modes
+settings sent over HTTP control, not client connection options. Unsupported modes
 are rejected, never silently substituted. Server workers default to 8, configurable
 from 1 to 256. The server implementation has a fixed ceiling of 65,536 connections
 per endpoint, advertised in `limits.max_connections`; it is not a run setting.
@@ -224,10 +227,10 @@ overhead.
 
 ### Cipher selection and kTLS
 
-Control and TLS workloads default to `TLS_AES_128_GCM_SHA256`. Client `run --cipher`
-selects the workload cipher on both ends without changing the saved control
-connection. Startup server `--cipher` and client `add --cipher` configure control
-only. Cipher/TLS fields are `null` for plain HTTP. Unsupported selections fail;
+TLS workloads default to `TLS_AES_128_GCM_SHA256`. Client `run --cipher`
+selects the workload cipher on both ends. Control has no TLS context or cipher;
+startup server `--cipher` and client `add --cipher` are not accepted.
+Cipher/TLS fields are `null` for plain HTTP workloads. Unsupported selections fail;
 there is no silent cipher substitution.
 
 The Windows backend supports the Schannel TLS 1.3 AES-128-GCM/SHA-256 and

@@ -16,12 +16,8 @@ void on_signal(int) {
 }
 
 AgentConfig linux_config(const Args& args) {
-    const auto backend = args.get("--backend", "openssl");
-    if (backend != "openssl") {
-        throw std::invalid_argument(
-            "Select benchmark TLS/kTLS from the client; control uses OpenSSL");
-    }
-    auto config = AgentConfig::from_args(args, "openssl");
+    auto config = AgentConfig::from_args(args, "http");
+    config.tls = false;
     config.benchmark_tls_modes = {"on", "off", "ktls"};
     config.supported_ciphers = supported_tls_ciphers();
     config.supported_backends = {
@@ -62,12 +58,9 @@ struct Server : Agent {
            const std::string& run_id = {})
         : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id,
                 host_usage),
-          tls(options && options->tls == "off"
-                  ? Context(nullptr, SSL_CTX_free)
-                  : context(true,
-                            options ? options->cipher
-                                    : args.get("--cipher", "TLS_AES_128_GCM_SHA256"),
-                            options && options->tls == "ktls")),
+          tls(options && options->tls != "off"
+                  ? context(true, options->cipher, options->tls == "ktls")
+                  : Context(nullptr, SSL_CTX_free)),
           payload(options ? max_object_size : 0), ktls(options && options->tls == "ktls") {
         if (tls &&
             (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
@@ -203,7 +196,8 @@ struct Session {
                 if (!body_remaining) {
                     const auto reply = server.Agent::request(
                         *control_head,
-                        {SSL_get_version(socket.ssl.get()), SSL_get_cipher_name(socket.ssl.get())},
+                        {socket.ssl ? SSL_get_version(socket.ssl.get()) : "",
+                         socket.ssl ? SSL_get_cipher_name(socket.ssl.get()) : ""},
                         control_body);
                     control_head.reset();
                     control_body.clear();
@@ -476,11 +470,11 @@ public:
 int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "winlin-server --cert certificate.pem --key private.key\n"
+        std::cout << "winlin-server [--cert certificate.pem --key private.key]\n"
                      "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
-                     "  Benchmark workers/TLS/kTLS are selected by the client per run.\n"
-                     "  [--cipher TLS_AES_128_GCM_SHA256]\n";
+                     "  Control uses plain HTTP; certificate/key apply only to HTTPS workloads.\n"
+                     "  Benchmark workers/TLS/kTLS/cipher are selected by the client per run.\n";
         return 0;
     }
     try {
@@ -488,8 +482,8 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
-        args.allow({"--cert", "--key", "--bind", "--port", "--workers", "--backend", "--cipher",
-                    "--http-port", "--https-port"});
+        args.allow(
+            {"--cert", "--key", "--bind", "--port", "--workers", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port = number(args.get("--http-port", "38444"), 65535);
         const auto https_port = number(args.get("--https-port", "38445"), 65535);
@@ -549,7 +543,7 @@ int main(int argc, char** argv) {
         std::cout << Json{{"event", "listening"},
                           {"bind", bind_address},
                           {"port", port},
-                          {"backend", server.ktls ? "openssl-ktls" : "openssl"},
+                          {"backend", server.config.backend},
                           {"workers", workers}}
                          .dump()
                   << std::endl;

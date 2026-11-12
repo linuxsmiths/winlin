@@ -26,6 +26,11 @@ try {
     $configuration = & (Join-Path $PSScriptRoot '../scripts/setup-server.ps1') `
         -Port $port -HttpPort $httpPort -HttpsPort $httpsPort `
         -StateDirectory (Join-Path $directory 'state')
+    if ($configuration.Url -ne "http://127.0.0.1:$port/" -or
+        $configuration.SslEndpoints.Count -ne 1 -or
+        $configuration.SslEndpoints[0] -ne "127.0.0.1:$httpsPort") {
+        throw 'Control must use plain HTTP; only the HTTPS workload gets a certificate binding.'
+    }
     Invoke-WinlinNative -File $PythonExe -Arguments @(
         (Join-Path $PSScriptRoot 'windows_https.py'),
         $ServerExe, "$port", "$httpPort", "$httpsPort", $configuration.CertificateSha256,

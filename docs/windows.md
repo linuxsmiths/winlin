@@ -1,6 +1,6 @@
 # Windows HTTP.sys/Schannel server
 
-The Windows server implements the same permanent HTTPS control API and exclusive,
+The Windows server implements the same permanent HTTP control API and exclusive,
 per-run synthetic GET/PUT workloads as Linux. Shared logic lives in
 `include/winlin/agent.hpp`; only transport, credential storage, cryptography and
 OS telemetry differ. The Linux client does not need a different workload format.
@@ -64,8 +64,8 @@ $setup | Format-List
 
 This imports the bundled **deliberately public** RSA test certificate/key into
 `LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
-SSL bindings for HTTPS control (default **38443**) and HTTPS workload (**38445**),
-plus URL reservations for both and the plain HTTP workload (**38444**), for the
+SSL binding for the HTTPS workload (**38445**) only, plus HTTP control (default
+**38443**), HTTP workload (**38444**) and HTTPS workload URL reservations for the
 current user. All three ports must be distinct. The current user owns the state;
 run the server as that same account. Service-account provisioning is not automated.
 
@@ -87,12 +87,27 @@ Existing state directories must already be private; setup does not rewrite a
 shared directory's permissions. On setup failure, resources created by that
 invocation are rolled back.
 
-The HTTPS bindings disable HTTP/2, QUIC, TLS 1.0/1.1 and TLS 1.2 for these endpoints,
+The HTTPS workload binding disables HTTP/2, QUIC, TLS 1.0/1.1 and TLS 1.2 for that endpoint,
 without changing machine-wide Schannel policy. Setup does **not** create firewall
 rules. Allow the three selected TCP ports only from authorized benchmark clients using
 your host firewall and VNet configuration. Never expose the agent to the internet.
 Plain HTTP data also requires HTTP/1.1; other request versions are rejected even
 if machine-wide HTTP.sys HTTP/2 support is enabled. Responses disable kernel caching.
+Control commands, telemetry and run IDs use unencrypted HTTP. Restrict access to
+trusted benchmark clients; workload TLS does not protect the control channel.
+
+When upgrading an existing TLS-control installation, stop the old server and
+replace **only its control** reservation/binding in an elevated PowerShell terminal:
+
+```powershell
+netsh http delete urlacl url=https://10.0.0.4:38443/
+netsh http delete sslcert ipport=10.0.0.4:38443
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+netsh http add urlacl url=http://10.0.0.4:38443/ user="$user" listen=yes delegate=no
+```
+
+Use the actual address/port and server account; leave existing workload bindings
+unchanged. Fresh installations should use `setup-server.ps1` instead.
 
 Start the server (the same user can do this without elevation after setup):
 
@@ -111,12 +126,12 @@ Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
 CMake builds. Startup `-Workers`
-and `-Cipher` configure control only; workload settings come
+configures control only; workload workers and cipher come
 from each remote start request. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 
-Only one Winlin server may run per machine, including on different HTTPS ports.
+Only one Winlin server may run per machine, including on different control ports.
 Like Linux, the native server reserves `127.0.0.1:8444` for its lifetime; Winsock
 `SO_EXCLUSIVEADDRUSE` prevents sharing. This loopback-only guard carries no
 communication, needs no HTTP.sys provisioning or firewall rule, and is released
@@ -126,18 +141,17 @@ server before running integration tests.
 The Linux launchers' 512K file-descriptor limit does not apply to HTTP.sys/Winsock;
 there is no corresponding Windows `RLIMIT_NOFILE` setting to raise.
 
-Control uses `httpsys-schannel`. Workload TLS `on` uses `httpsys-schannel`;
+Control uses plain HTTP through `httpsys`. Workload TLS `on` uses `httpsys-schannel`;
 TLS `off` uses `httpsys`. Both use the same in-process native HTTP.sys/IOCP engine,
-not another executable or child process. `--backend httpsys` is accepted explicitly;
-OpenSSL backends and per-run `ktls` requests fail rather than falling back.
+not another executable or child process. Backend selection follows the requested
+workload TLS mode; per-run `ktls` requests fail rather than falling back.
 
 The default cipher is `TLS_AES_128_GCM_SHA256`. To use
 `TLS_AES_256_GCM_SHA384`, select it in the remote run settings (`--cipher` on the
-Linux client). The launcher `-Cipher` (native `--cipher`) independently selects
-the control cipher. HTTP.sys reports negotiated
+Linux client). There is no launcher or native control-cipher option. HTTP.sys reports negotiated
 protocol/algorithm/key size; mismatches or
 missing information cause request rejection. The server does not claim that
-`--cipher` rewrites Schannel's handshake policy. The Linux client offers only
+the requested workload cipher rewrites Schannel's handshake policy. The Linux client offers only
 the selected TLS 1.3 suite.
 
 ### Remote run lifecycle
@@ -245,7 +259,7 @@ ctest --test-dir build -C Release --output-on-failure
 CTest starts Windows PowerShell with a fresh module search path so its built-in
 modules load correctly even when CTest is invoked from PowerShell 7.
 
-These tests provision the public certificate, two bindings and three URL
+These tests provision the public certificate, one SSL binding and three URL
 reservations on distinct ephemeral loopback ports. They exercise exclusive run
 ownership, bounded/split control JSON, lease expiry, live HTTP/HTTPS and worker
 switching, workload isolation, concurrent/persistent GET/PUT,
@@ -256,10 +270,9 @@ For intentional manual endpoint removal, stop the server first and delete only
 its configured URL reservation and binding:
 
 ```powershell
-netsh http delete urlacl url=https://10.0.0.4:38443/
+netsh http delete urlacl url=http://10.0.0.4:38443/
 netsh http delete urlacl url=http://10.0.0.4:38444/
 netsh http delete urlacl url=https://10.0.0.4:38445/
-netsh http delete sslcert ipport=10.0.0.4:38443
 netsh http delete sslcert ipport=10.0.0.4:38445
 ```
 
