@@ -161,6 +161,9 @@ struct TlsSocket {
         if (result > 0) {
             return true;
         }
+        // SSL_ERROR_SYSCALL may have no OpenSSL error queued; preserve the OS cause before calling
+        // SSL_get_error or any diagnostic helper that might change errno.
+        const int socket_error = errno;
         const auto error = SSL_get_error(ssl.get(), result);
         // Our short-lived control clients may close without close_notify. Treat that as peer EOF,
         // not an internal TLS failure; the protocol state machine decides whether EOF was
@@ -168,26 +171,35 @@ struct TlsSocket {
         if (error == SSL_ERROR_ZERO_RETURN ||
             (error == SSL_ERROR_SSL &&
              ERR_GET_REASON(ERR_peek_last_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) ||
-            (error == SSL_ERROR_SYSCALL && result == 0 && errno == 0)) {
+            (error == SSL_ERROR_SYSCALL && result == 0 && socket_error == 0)) {
             throw PeerClosed();
         }
         if (error == SSL_ERROR_WANT_READ) {
             want = EPOLLIN;
         } else if (error == SSL_ERROR_WANT_WRITE) {
             want = EPOLLOUT;
+        } else if (error == SSL_ERROR_SYSCALL) {
+            if (socket_error) {
+                throw std::runtime_error(
+                    "TLS socket I/O failed: " + std::string(std::strerror(socket_error)) +
+                    " (errno " + std::to_string(socket_error) + ")");
+            }
+            throw std::runtime_error("TLS socket I/O failed without an operating-system error");
         } else {
-            throw tls_error(error == SSL_ERROR_ZERO_RETURN ? "Peer closed TLS" : "TLS I/O failed");
+            throw tls_error("TLS I/O failed");
         }
         return false;
     }
 
     bool handshake(bool server) {
         ERR_clear_error();
+        errno = 0;
         return outcome(server ? SSL_accept(ssl.get()) : SSL_connect(ssl.get()));
     }
 
     int read(char* buffer, std::size_t length) {
         ERR_clear_error();
+        errno = 0;
         const int result =
             SSL_read(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
         return outcome(result) ? result : 0;
@@ -195,6 +207,7 @@ struct TlsSocket {
 
     int write(const char* buffer, std::size_t length) {
         ERR_clear_error();
+        errno = 0;
         const int result =
             SSL_write(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
         return outcome(result) ? result : 0;
@@ -254,7 +267,7 @@ inline Fd connect_socket(const std::string& host, const std::string& port) {
             return socket;
         }
     }
-    throw system_error("connect");
+    throw system_error("connect to " + host + ":" + port);
 }
 
 inline void wait_socket(TlsSocket& socket, Clock::time_point deadline) {
@@ -285,8 +298,13 @@ inline std::unique_ptr<TlsSocket> connect_tls(SSL_CTX* ctx, const std::string& h
     }
     const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
                                              std::chrono::duration<double>(timeout));
-    while (!socket->handshake(false)) {
-        wait_socket(*socket, deadline);
+    try {
+        while (!socket->handshake(false)) {
+            wait_socket(*socket, deadline);
+        }
+    } catch (const std::exception& error) {
+        throw std::runtime_error("TLS connection to " + host + ":" + port +
+                                 " failed: " + error.what());
     }
     if (!pin.empty() && !equal_secret(fingerprint(socket->ssl.get()), pin)) {
         throw std::runtime_error("Server certificate changed; refusing connection");

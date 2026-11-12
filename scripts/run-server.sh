@@ -7,6 +7,7 @@ usage() {
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
+HTTPS listens on 0.0.0.0:8443 (all IPv4 interfaces) unless --bind/--port overrides it.
 Default TLS identity: deliberately PUBLIC certs/benchmark/server.pem and server.key.
 An existing server.pem/server.key in the state directory takes precedence.
 The private pairing-token is generated locally on first use and then reused.

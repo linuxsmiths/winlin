@@ -68,8 +68,10 @@ without accepting connections. This guard is released automatically on exit,
 including crashes; an occupied guard port prevents startup with a clear error.
 Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
 
-The default listener is `127.0.0.1:8443`. For a separate client machine, explicitly
-select the server's test-network IPv4 address with `--bind`. Restrict access using
+The Linux HTTPS listener defaults to `0.0.0.0:8443` (all IPv4 interfaces), so a
+separate client machine can connect without an extra server argument. Use
+`--bind 127.0.0.1` for loopback-only testing, or specify an individual test-network
+IPv4 address. The instance guard remains loopback-only. Restrict access using
 the host firewall and VNet rules. Never expose a benchmark agent to the internet.
 
 The client already knows the bundled certificate, so no fingerprint entry is needed:

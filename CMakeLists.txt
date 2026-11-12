@@ -82,6 +82,10 @@ if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME scripts COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts.py")
+    if(TARGET winlin)
+      add_test(NAME client-errors COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/client_errors.py" "$<TARGET_FILE:winlin>")
+    endif()
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET winlin-server AND TARGET winlin)
     add_test(NAME https-integration COMMAND "${Python3_EXECUTABLE}"

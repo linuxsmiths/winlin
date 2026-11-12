@@ -50,9 +50,9 @@ def private_file(path, text):
 
 
 class Agent:
-    """Own a loopback Linux server and control connection; always reap it and retain diagnostics."""
+    """Own a Linux server and loopback control connection; always reap it and retain diagnostics."""
 
-    def __init__(self, directory, backend="openssl", bundled=False):
+    def __init__(self, directory, backend="openssl", bundled=False, bind_address="127.0.0.1"):
         self.directory = directory
         arguments = [
             str(SCRIPTS / "run-server.sh"), "--build-dir", str(Path(SERVER).parent),
@@ -64,6 +64,8 @@ class Agent:
                 "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
                 "--token-file", str(directory / "pairing"),
             ]
+        if bind_address is not None:
+            arguments += ["--bind", bind_address]
         self.process = subprocess.Popen(
             arguments,
             stdout=subprocess.PIPE,
@@ -77,7 +79,9 @@ class Agent:
             line = self.process.stdout.readline()
             if not line:
                 raise AssertionError(f"Server failed: {self.process.stderr.read()}")
-            self.port = json.loads(line)["port"]
+            ready = json.loads(line)
+            self.port = ready["port"]
+            self.bind_address = ready["bind"]
             self.connection = http.client.HTTPSConnection(
                 "127.0.0.1", self.port, context=tls_context(), timeout=3
             )
@@ -209,8 +213,32 @@ with tempfile.TemporaryDirectory(prefix="winlin-test-") as temporary:
         SERVER, "--cert", str(directory / "cert.pem"), "--key", str(directory / "private.key"),
         "--token-file", str(directory / "pairing"),
     ]
+    # Omit --bind to exercise the actual default, not a wrapper-supplied wildcard argument.
+    agent = Agent(directory, bind_address=None)
+    try:
+        assert agent.bind_address == "0.0.0.0"
+        alternate = http.client.HTTPSConnection(
+            "127.0.0.2", agent.port, context=tls_context(), timeout=3,
+        )
+        try:
+            alternate.request("GET", "/v1/capabilities")
+            response = alternate.getresponse()
+            assert response.status == 401
+            response.read()
+        finally:
+            alternate.close()
+    finally:
+        agent.stop()
+
     agent = Agent(directory)
     try:
+        assert agent.bind_address == "127.0.0.1"
+        # An explicit loopback override must not accept connections addressed to another local IP.
+        try:
+            with socket.create_connection(("127.0.0.2", agent.port), timeout=3):
+                raise AssertionError("Explicit loopback listener accepted another IPv4 address")
+        except ConnectionRefusedError:
+            pass
         exercise_single_instance(server_arguments, agent.port)
         assert agent.request("GET", "/v1/capabilities")[0] == 401
         assert agent.request("GET", "/v1/capabilities", bootstrap)[0] == 401

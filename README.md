@@ -71,6 +71,9 @@ Use the foreground launchers:
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
+The Linux HTTPS server listens on `0.0.0.0:8443` by default, accepting remote IPv4
+clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
+
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
