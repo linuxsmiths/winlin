@@ -50,6 +50,10 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.server.is_workload and not self.path.startswith("/v1/object?size="):
+            self.server.metadata_requests.append(self.path)
+            self.respond({"error": "Use HTTP control for metadata"}, status=404)
+            return
         if self.path.startswith("/v1/object?size="):
             self.respond(b"x" * int(self.path.split("=")[1]),
                          status=503 if self.server.fail_workload else None)
@@ -78,6 +82,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                 },
             })
         else:
+            self.server.capability_queries += 1
             payload = {
                 "supported_tls_modes": ["on", "off"],
                 "supported_ciphers": ["TLS_AES_128_GCM_SHA256"],
@@ -88,27 +93,21 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                     "unavailable_metrics": ["voluntary_context_switches"],
                 },
             }
-            if self.headers.get("X-Winlin-Run"):
-                payload["run"] = {
-                    "backend": "test", "transport": "https" if self.server.encrypted else "http",
-                    "tls_version": "TLSv1.3" if self.server.encrypted else None,
-                    "cipher": self.server.settings["cipher"] if self.server.encrypted else None,
-                    "workers": self.server.settings["workers"],
-                }
             self.respond(payload)
 
     def do_POST(self):
         if self.path == "/v1/benchmark/start":
             settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert "max_connections" not in settings
-            self.server.settings = settings
-            self.server.plain.settings = settings
-            self.server.secure.settings = settings
+            if settings["tls"] == "off":
+                settings["cipher"] = None
             data = self.server.plain if settings["tls"] == "off" else self.server.secure
             self.respond({
                 "run_id": "aa" * 32, "port": data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
-                "backend": "test", "settings": settings,
+                "backend": "test",
+                "settings": (dict(settings, workers=settings["workers"] + 1)
+                             if self.server.misreport_workers else settings),
             })
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
             self.respond({"stopped": True})
@@ -132,19 +131,21 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     plain = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     secure = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     server.plain, server.secure = plain, secure
-    for endpoint, encrypted in ((server, False), (plain, False), (secure, True)):
+    for endpoint in (server, plain, secure):
         endpoint.authorizations = []
         endpoint.run_ids = []
         endpoint.response_status = 200
         endpoint.fail_workload = False
-        endpoint.settings = {}
-        endpoint.encrypted = encrypted
+        endpoint.is_workload = endpoint is not server
+        endpoint.metadata_requests = []
+        endpoint.capability_queries = 0
         endpoint.telemetry_samples = 0
         endpoint.cycles_available = False
         endpoint.reference_available = False
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
+    server.misreport_workers = False
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
@@ -192,11 +193,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             "--duration", "1", "--requests", "2", "--repetitions", "2",
         ]
         output = directory / "benchmark.json"
+        queries_before = server.capability_queries
         result = subprocess.run(
             [*benchmark, "--output", str(output)],
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+        assert server.capability_queries == queries_before + 1
         report = json.loads(output.read_text())
         table_row = re.compile(
             r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
@@ -208,7 +211,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert [(row[0], row[-1]) for row in rows] == [("1", "N/A"), ("2", "N/A")]
         assert result.stderr.count(
             "Reference CPIO unavailable: fixture invariant TSC unavailable") == 1
-        assert report["schema_version"] == 4
+        assert report["schema_version"] == 5
         assert len(report["results"]) == 2
         for repetition in report["results"]:
             assert repetition["server_reference_cycles_per_io"] is None
@@ -272,6 +275,20 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         for note in report["notes"]:
             assert note not in result.stdout + result.stderr
         secure.fail_workload = False
+
+        # Validate the HTTP start response rather than asking the data endpoint for settings.
+        server.misreport_workers = True
+        output = directory / "mismatched-settings.json"
+        result = subprocess.run(
+            [*benchmark, "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        report = json.loads(output.read_text())
+        assert report["status"] == "failed"
+        assert "did not apply the requested benchmark settings" in report["failure"]
+        server.misreport_workers = False
+        assert not plain.metadata_requests and not secure.metadata_requests
 
         rejected = directory / "rejected.json"
         server.response_status = 503

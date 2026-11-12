@@ -187,14 +187,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert controller.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
         data = Workload(lease)
         try:
-            status, payload = data.request("GET", "/v1/capabilities")
-            metadata = json.loads(payload)
-            actual = metadata["run"]
-            assert status == 200 and actual["transport"] == "http"
-            assert actual["tls_version"] is None and actual["cipher"] is None
-            assert actual["workers"] == 3
-            assert metadata["limits"]["max_connections"] == 65536
-            assert "authentication" not in metadata
+            assert lease["settings"] == {"tls": "off", "cipher": None, "workers": 3}
+            assert data.request("GET", "/v1/capabilities")[0] == 404
+            assert data.request("GET", "/v1/capabilities", include_run=False)[0] == 404
             assert data.request("GET", "/v1/object?size=256", include_run=False)[0] == 409
             for size in (0, 256, 4096, 65536, 4194304):
                 status, payload = data.request("GET", f"/v1/object?size={size}")
@@ -292,10 +287,11 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         report = json.loads(output.read_text())
         if ktls.returncode == 0:
             assert report["server_run"]["backend"] == "openssl-ktls"
-            assert report["server_run"]["ktls_tx"]
+            assert report["server_final_telemetry"]["ktls_tx_connections"] >= 2
         else:
-            assert report["status"] == "failed"
-            assert "kTLS" in ktls.stderr or "kTLS" in report["failure"]
+            assert report["status"] in ("failed", "completed_with_errors")
+            assert ("kTLS" in ktls.stderr or "kTLS" in report.get("failure", "") or
+                    any("kTLS" in result["first_error"] for result in report["results"]))
         abandoned = controller.start(tls="off", workers=1, lease_seconds=1)
         time.sleep(2.2)
         assert controller.request("GET", "/v1/benchmark/telemetry?run_id=" + abandoned["run_id"])[0] == 409

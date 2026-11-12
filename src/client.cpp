@@ -122,11 +122,11 @@ Target load_target(const std::string& path) {
     }
 }
 
-// Own one bounded metadata response independently of its connection, which closes after
+// Own one bounded control response independently of its connection, which closes after
 // exchange. Workload bodies use streaming buffers instead and must not allocate a Response per
 // request.
 //
-// This is used for control traffic and workload capability checks, both small and bounded.
+// This is used only for small, bounded HTTP control traffic.
 // Used for control requests like fetching server capabilities (/v1/capabilities),
 // starting and stopping benchmarks (/v1/benchmark/start and /v1/benchmark/stop),
 // and fetching telemetry after the benchmark (/v1/benchmark/telemetry).
@@ -136,17 +136,14 @@ struct Response {
     std::string body;
 };
 
-// Control uses plain HTTP (ctx == nullptr); HTTPS workload metadata uses its own pinned context.
-// Each metadata exchange is bounded independently of load duration.
-Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
-                  const std::string& path, const std::string& body = {}) {
-    auto socket = connect_stream(ctx, target.host, target.port, target.pin);
+// Exchange one plain HTTP control request, bounded independently of load duration.
+Response exchange(const Target& target, const std::string& method, const std::string& path,
+                  const std::string& body = {}) {
+    auto socket = connect_stream(nullptr, target.host, target.port, {});
     const auto deadline = Clock::now() + std::chrono::seconds(10);
-    const std::string request =
-        method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
-        (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
-        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
-        body;
+    const std::string request = method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" +
+                                target.port + "\r\nContent-Length: " + std::to_string(body.size()) +
+                                "\r\nConnection: close\r\n\r\n" + body;
     std::size_t sent{};
     while (sent < request.size()) {
         const int count = socket->write(request.data() + sent, request.size() - sent);
@@ -200,7 +197,7 @@ Response exchange(SSL_CTX* ctx, const Target& target, const std::string& method,
 }
 
 Json control(const Target& target, const std::string& path) {
-    const auto response = exchange(nullptr, target, "GET", path);
+    const auto response = exchange(target, "GET", path);
     if (response.status != 200) {
         throw std::runtime_error("Server rejected control request (HTTP " +
                                  std::to_string(response.status) + ")");
@@ -371,7 +368,11 @@ struct LoadConnection {
                     if (!head.first.starts_with("HTTP/1.1 200 ") ||
                         !head.fields.contains("content-length") ||
                         head.length != (get ? config.get_size : 0) || head.close) {
-                        throw std::runtime_error("Unexpected benchmark response: " + head.first);
+                        throw std::runtime_error(
+                            std::string(config.tls == "ktls"
+                                            ? "Unexpected kTLS benchmark response: "
+                                            : "Unexpected benchmark response: ") +
+                            head.first);
                     }
                     const auto preloaded = input.size() - end - 4;
                     if (preloaded > head.length) {
@@ -754,7 +755,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                            "whole-server reference CPIO includes that work.");
     }
     Json report = {
-        {"schema_version", 4},
+        {"schema_version", 5},
         {"benchmark", config.tls == "off" ? "http" : "https"},
         {"notes", notes},
         {"status", "running"},
@@ -774,7 +775,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     bool errors = false;
     std::string run_id;
     auto command = [&](const std::string& path, const std::string& body = {}) {
-        const auto response = exchange(nullptr, target, "POST", path, body);
+        const auto response = exchange(target, "POST", path, body);
         if (response.status != 200) {
             throw std::runtime_error(
                 "Server rejected benchmark control (HTTP " + std::to_string(response.status) +
@@ -797,28 +798,17 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         const bool workload_tls = config.tls != "off";
         auto workload_ctx =
             workload_tls ? context(false, config.cipher) : Context(nullptr, SSL_CTX_free);
-        const auto response = exchange(workload_ctx.get(), workload, "GET", "/v1/capabilities");
-        if (response.status != 200) {
-            throw std::runtime_error("Server rejected workload capability request (HTTP " +
-                                     std::to_string(response.status) + ")");
-        }
-        const auto workload_capabilities = Json::parse(response.body);
-        const auto applied = workload_capabilities.at("run");
-        if (applied.at("transport") != (workload_tls ? "https" : "http") ||
-            applied.at("workers") != config.server_workers ||
-            (workload_tls &&
-             (applied.at("tls_version") != "TLSv1.3" || applied.at("cipher") != config.cipher))) {
+        // Start already reports the configured workload. Actual TLS and kTLS requirements are
+        // enforced on the load connections, not by a separate workload metadata exchange.
+        const auto& applied = started.at("settings");
+        if (started.at("transport") != (workload_tls ? "https" : "http") ||
+            applied.at("tls") != config.tls || applied.at("workers") != config.server_workers ||
+            (workload_tls && applied.at("cipher") != config.cipher)) {
             throw std::runtime_error("Server did not apply the requested benchmark settings");
         }
-        if (config.tls == "ktls" &&
-            (((config.method == "get" || (config.method == "mixed" && config.get_percent)) &&
-              !applied.at("ktls_tx").get<bool>()) ||
-             ((config.method == "put" || (config.method == "mixed" && config.get_percent < 100)) &&
-              !applied.at("ktls_rx").get<bool>()))) {
-            throw std::runtime_error(
-                "Requested kTLS direction is unavailable; refusing userspace fallback");
-        }
         report["server_run"] = applied;
+        report["server_run"]["backend"] = started.at("backend");
+        report["server_run"]["transport"] = started.at("transport");
         report["server_configuration"] = started.at("settings");
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};

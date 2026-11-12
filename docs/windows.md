@@ -171,14 +171,14 @@ The workload is ready before start succeeds. Only one run may exist; conflicting
 starts return HTTP 409. Abandoned leases automatically stop and join the workload.
 Discovery lists supported choices and a fixed 65,536-connection implementation
 ceiling; connection limits are not user settings. Effective settings are reported
-separately in the workload's `run` block and the client's `server_run` result.
+in the HTTP start response and the client's `server_run` result.
 Host details include total OS-visible RAM and SMBIOS machine information.
 Azure SKU detection queries only IMDS `vmSize` with bounded, proxy-free requests;
 unavailable metadata is labelled explicitly. POSIX FD limits are not applicable.
 
 Use the returned `run_id` in the **`X-Winlin-Run` workload header**.
-Only object GET/PUT and capabilities
-are available there. Sample counters through control with
+Only object GET/PUT are available there; discovery and all other metadata use
+plain HTTP control. Sample counters through control with
 `GET /v1/benchmark/telemetry?run_id=ID`, then release the run with
 `POST /v1/benchmark/stop?run_id=ID`. These calls reject non-owner IDs.
 Runtime failures produce errors rather

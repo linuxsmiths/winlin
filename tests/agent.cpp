@@ -117,11 +117,9 @@ int main() {
 
         config.role = AgentConfig::Role::workload;
         Agent workload(config, process, access);
-        const auto run_capabilities =
-            Json::parse(workload.request(head("GET", "/v1/capabilities", access), tls).text);
-        require(run_capabilities.at("run").at("workers") == config.workers &&
-                    run_capabilities.at("run").at("cipher") == config.cipher,
-                "Actual settings are separate from supported choices");
+        require(workload.request(head("GET", "/v1/capabilities", access), tls).status == 404 &&
+                    workload.request(head("GET", "/v1/capabilities", ""), tls).status == 404,
+                "Capability discovery is available only through control");
         try {
             BenchmarkOptions::parse({{"max_connections", 32}});
             require(false, "Implementation connection ceiling must not be configurable");

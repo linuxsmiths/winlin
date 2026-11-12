@@ -242,8 +242,8 @@ Schannel cipher policy.
 
 Select client `run --tls ktls` or the interactive menu to request kTLS without a
 server restart. Discovery advertises kTLS as conditional on kernel/OpenSSL support.
-The workload's `run` block reports actual transmit and receive activation, and
-the server verifies the relevant direction on each workload connection. GET
+The server verifies the relevant direction on each workload connection; activation
+counts are returned through HTTP control telemetry. GET
 requires active kTLS TX; PUT requires active kTLS RX. Missing activation causes
 explicit rejection, not a userspace run mislabeled as kTLS.
 
@@ -261,10 +261,16 @@ such as load-generator CPU saturation or failed requests. General methodology
 caveats and backend measurement limitations appear once in the JSON report's
 top-level `notes` array, not in the console or each repetition's `warnings`.
 Detailed client/server telemetry, CPU utilization percentages, and raw server
-counters stay in the JSON file, not the terminal. Report schema version 4
-saves supported choices in `server_capabilities`, verified effective settings in
-`server_run`, and the selected workload endpoint. It does not expose control-channel
-configuration as benchmark capabilities.
+counters stay in the JSON file, not the terminal. Report schema version 5
+saves supported choices in `server_capabilities`, the HTTP start response's
+configuration in `server_run`, and the selected workload endpoint.
+Discovery is queried once per run through HTTP control; starting a run returns
+its selected settings without a second capability query. Workload endpoints serve
+only object GET/PUT, never metadata. Actual TLS/cipher and certificate checks occur
+on the load connections, and kTLS is checked by the server per I/O direction.
+Connection-specific `tls_version` and `ktls_tx`/`ktls_rx` fields are no longer
+reported in `server_run`; kTLS activation counts remain in control telemetry.
+Control-channel configuration is not exposed as benchmark capabilities.
 
 CPU utilization uses **100% per logical CPU**, so multi-core utilization can exceed
 100%. Each repetition's `server_host` contains OS-visible whole-server busy CPU time

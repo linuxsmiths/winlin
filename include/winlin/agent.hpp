@@ -109,9 +109,8 @@ public:
             {"put_bytes", put_bytes.load()}};
     }
 
-    // Discovery describes supported workloads, never the fixed control connection's settings.
-    // Workload endpoints additionally expose verified settings under a separate run block.
-    Json capabilities(const ConnectionInfo& connection) const {
+    // Control discovery describes supported workloads, never connection-specific settings.
+    Json capabilities() const {
         const auto process = process_usage_();
         const auto host = host_usage_ ? host_usage_() : Json::object();
         auto unavailable = config.unavailable_metrics;
@@ -148,16 +147,6 @@ public:
                host.value("cpu_time_unavailable_reason", Json("Not collected"))},
               {"reference_clock", host.value("reference_clock", Json::object())},
               {"scope", "whole-server CPU and separate process telemetry; one active benchmark"}}}};
-        if (config.role == AgentConfig::Role::workload) {
-            result["run"] = {
-                {"backend", config.backend},
-                {"transport", config.tls ? "https" : "http"},
-                {"tls_version", config.tls ? Json(connection.tls_version) : Json(nullptr)},
-                {"cipher", config.tls ? Json(connection.cipher) : Json(nullptr)},
-                {"workers", config.workers},
-                {"ktls_tx", config.tls ? Json(connection.ktls_tx) : Json(nullptr)},
-                {"ktls_rx", config.tls ? Json(connection.ktls_rx) : Json(nullptr)}};
-        }
         return result;
     }
 
@@ -182,8 +171,7 @@ public:
             const auto path = head.first.substr(first_space + 1, last_space - first_space - 1);
             const bool object = path.starts_with("/v1/object");
             if ((config.role == AgentConfig::Role::control && object) ||
-                (config.role == AgentConfig::Role::workload && !object &&
-                 path != "/v1/capabilities")) {
+                (config.role == AgentConfig::Role::workload && !object)) {
                 return AgentReply::error(404, "Use the advertised control or workload endpoint");
             }
             if (config.role == AgentConfig::Role::workload) {
@@ -214,7 +202,7 @@ public:
                        path.starts_with("/v1/benchmark/stop?run_id=") && !head.length) {
                 reply.text = controller->stop(std::string_view(path).substr(26)).dump();
             } else if (method == "GET" && path == "/v1/capabilities" && !head.length) {
-                reply.text = capabilities(connection).dump();
+                reply.text = capabilities().dump();
             } else if (method == "GET" && path == "/v1/telemetry" && !head.length) {
                 reply.text = telemetry().dump();
             } else if (method == "GET" && path.starts_with("/v1/object?size=") && !head.length) {

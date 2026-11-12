@@ -118,18 +118,9 @@ def exercise_run(agent, cipher, mode, workers):
 
     connection = data_connection(mode)
     try:
-        assert request(connection, "GET", "/v1/capabilities")[0] == 409
+        assert request(connection, "GET", "/v1/capabilities")[0] == 404
         assert request(connection, "GET", "/v1/object?size=512", "0" * 64)[0] == 409
-        status, payload = request(connection, "GET", "/v1/capabilities", run_id)
-        capabilities = json.loads(payload)
-        actual = capabilities["run"]
-        assert status == 200 and actual["workers"] == workers
-        assert "authentication" not in capabilities
-        assert next(iter(capabilities)) == "environment"
-        assert list(capabilities["environment"])[:2] == ["os", "kernel"]
-        assert capabilities["limits"]["max_connections"] == 65536
-        assert actual["cipher"] == (cipher if mode == "on" else None)
-        assert actual["tls_version"] == ("TLSv1.3" if mode == "on" else None)
+        assert request(connection, "GET", "/v1/capabilities", run_id)[0] == 404
         assert request(connection, "GET", "/v1/telemetry", run_id)[0] == 404
         assert request(connection, "POST", "/v1/pair", run_id)[0] == 404
         for size in (0, 256, 512, 4096, 16384, 65536, 1048576, 4194304):
