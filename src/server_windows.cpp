@@ -11,6 +11,8 @@ namespace {
 using namespace winlin;
 HANDLE stop_event{};
 
+// Ask the control runtime to stop on supported console signals. The controller thread performs
+// shutdown; this callback does not cancel requests or release their buffers itself.
 BOOL WINAPI on_console(DWORD event) {
     if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT && event != CTRL_CLOSE_EVENT) {
         return FALSE;
@@ -18,14 +20,18 @@ BOOL WINAPI on_console(DWORD event) {
     return stop_event && SetEvent(stop_event);
 }
 
+// Turn a failed HTTP Server API call into an exception with the operation and Windows error code.
 void check(ULONG result, const char* operation) {
     if (result != NO_ERROR) {
         throw windows_error(operation, result);
     }
 }
 
-// Keep HTTP Server API initialization alive until every queue, URL group and session is released.
-// Runtime declares this before its dependent members so reverse destruction order is safe.
+// Initialize the HTTP Server API for a Runtime and release that initialization when it is
+// destroyed. Its request queue, URL group, and server session require the API to remain
+// initialized. Runtime declares this member before those handles so reverse member destruction
+// closes the dependent handles first. Worker threads must already be joined before member cleanup
+// begins.
 struct HttpApi {
     HttpApi() {
         check(HttpInitialize(HTTPAPI_VERSION{2, 0}, HTTP_INITIALIZE_SERVER, nullptr),
@@ -40,7 +46,9 @@ struct HttpApi {
     }
 };
 
-// Initialize Winsock for address conversion before constructing the native HTTP.sys runtime.
+// Keep Winsock initialized for numeric address conversion and the exclusive server-guard socket.
+// Main creates this before those users and destroys it after them. HTTP.sys handles benchmark
+// connections itself; Winsock here does not provide an alternative workload transport.
 struct Winsock {
     Winsock() {
         WSADATA data{};
@@ -57,8 +65,10 @@ struct Winsock {
     }
 };
 
-// Reserve the same loopback guard as Linux without involving HTTP.sys or processing any traffic.
-// Main keeps this alive until Runtime has drained and closed, and Winsock must outlive the socket.
+// Prevent another Winlin server from starting on this machine by reserving the same loopback port
+// as the Linux implementation. This socket carries no traffic and is separate from HTTP.sys.
+// Exclusive address ownership is intentional: unlike workload listeners, this reservation must
+// not be shared. Main keeps it alive through runtime shutdown, with Winsock outliving the socket.
 struct ServerGuard {
     SOCKET value{INVALID_SOCKET};
 
@@ -112,7 +122,9 @@ private:
     }
 };
 
-// Own the HTTP.sys request queue; Runtime must drain all outstanding operations before closing it.
+// Own the handle through which HTTP.sys delivers requests and accepts asynchronous response I/O.
+// Runtime associates this queue with its completion port and URL group. Before this handle closes,
+// workers must process every outstanding completion so no operation still references request data.
 struct Queue {
     HANDLE value{};
 
@@ -126,7 +138,9 @@ struct Queue {
     }
 };
 
-// Own the API's server-session identifier, not a client connection; it outlives its URL groups.
+// Own an HTTP Server API configuration session. This is not a TCP connection or a client request:
+// it groups the URL configuration used by a Runtime. Its URL groups must be closed before the
+// session itself, so Runtime declares this member before its UrlGroup.
 struct ServerSession {
     HTTP_SERVER_SESSION_ID value{};
 
@@ -140,8 +154,9 @@ struct ServerSession {
     }
 };
 
-// Scope the configured URL and its queue binding; releasing the group removes only this runtime's
-// URLs.
+// Own the URL group that binds this Runtime's endpoint to its request queue. HTTP.sys routes
+// matching requests through that binding. Closing the group removes this Runtime's registered
+// URLs, but does not remove the machine's pre-provisioned URL reservations or certificate bindings.
 struct UrlGroup {
     HTTP_URL_GROUP_ID value{};
 
@@ -155,6 +170,9 @@ struct UrlGroup {
     }
 };
 
+// Describe the permanent HTTP control endpoint and the native Windows workload backends.
+// HTTP.sys/Schannel handles connections and TLS outside this application, so unavailable connection
+// metrics stay unavailable and process CPU telemetry must not be mistaken for whole-server cost.
 AgentConfig windows_config(const Args& args) {
     auto config = AgentConfig::from_args(args, "httpsys");
     config.tls = false;
@@ -176,7 +194,9 @@ AgentConfig windows_config(const Args& args) {
     return config;
 }
 
-// Derive data-plane configuration only from the remotely requested run settings.
+// Prepare a temporary workload using the client's requested transport, cipher, and worker count.
+// Reject unsupported settings rather than silently substituting a different backend. This changes
+// only the workload configuration; the permanent control endpoint remains plain HTTP.
 AgentConfig workload_config(const AgentConfig& host, const BenchmarkOptions& options) {
     if (options.tls == "ktls") {
         throw BenchmarkError(501, "Windows HTTP.sys/Schannel does not support kTLS");
@@ -210,7 +230,8 @@ std::string issue_run_id() {
     return result;
 }
 
-// MinGW's HTTP header predates this Win8 ABI; MSVC uses the current SDK definition.
+// Match the Windows SDK layout for negotiated TLS metadata when cross-building with MinGW,
+// whose HTTP header lacks this definition. MSVC uses the SDK's own structure instead.
 #ifdef __MINGW32__
 struct SslProtocolInfo {
     ULONG Protocol, CipherType, CipherStrength, HashType, HashStrength, KeyExchangeType,
@@ -220,7 +241,9 @@ struct SslProtocolInfo {
 using SslProtocolInfo = HTTP_SSL_PROTOCOL_INFO;
 #endif
 
-// Verify negotiated TLS metadata, not global Schannel policy, before shared dispatch accepts work.
+// Extract and validate the TLS protocol and cipher that HTTP.sys reports for this request.
+// A certificate binding or global Schannel policy does not prove what was actually negotiated.
+// Reject missing or unsupported metadata before the shared Agent accepts an HTTPS workload.
 ConnectionInfo connection_info(const HTTP_REQUEST& request) {
     if (!request.pSslInfo) {
         throw std::invalid_argument("HTTPS is required");
@@ -247,8 +270,10 @@ ConnectionInfo connection_info(const HTTP_REQUEST& request) {
     throw std::invalid_argument("HTTP.sys did not expose negotiated TLS protocol information");
 }
 
-// Adapt only the shared protocol's fields after HTTP.sys has performed native framing validation.
-// Never log the generated text: it contains the Authorization credential.
+// Convert HTTP.sys's parsed request into the header representation expected by the shared Agent.
+// HTTP.sys still performs native HTTP framing; this adapter preserves only the fields used by our
+// routing and validation. Include the workload lease header, but never log the generated text
+// because it contains the run ID.
 HttpHead request_head(const HTTP_REQUEST& request) {
     std::string method;
     switch (request.Verb) {
@@ -294,11 +319,21 @@ HttpHead request_head(const HTTP_REQUEST& request) {
 
 struct Runtime;
 
-// Own all buffers referenced by one asynchronous receive/body/send chain. Completion workers may
-// change between operations, but exactly one completion owns this object at a time; it deletes
-// itself on terminal completion. Runtime and its reusable payload must outlive every live Request.
+// Carry one HTTP request through an asynchronous receive -> optional body reads -> response send.
+// Unlike a Linux Session, this object represents a request, not a persistent client connection.
+// HTTP.sys owns the connection and TLS state, including reuse across successive requests.
+//
+// Runtime posts receives before requests arrive. Each Request submits one operation at a time,
+// and an IOCP worker calls complete() when that operation finishes. The next completion may run on
+// a different worker thread, but operations for this object are handled sequentially.
+//
+// Store headers, body buffers, response structures, and OVERLAPPED state here because HTTP.sys may
+// still reference them after an API call returns. Terminal completion deletes this object;
+// cancellation must also finish through a completion before its buffers can be released.
+// Runtime and its shared GET payload must remain alive until every Request has been destroyed.
 struct Request {
-    // Keep OVERLAPPED first so IOCP's pointer can be recovered without a separate lookup table.
+    // IOCP returns the OVERLAPPED pointer submitted to HTTP.sys. Keep it first so the worker can
+    // recover this enclosing operation and its Request without a separate lookup table.
     struct Operation {
         OVERLAPPED overlapped{};
         Request* request{};
@@ -324,6 +359,7 @@ struct Request {
     explicit Request(Runtime& owner);
     ~Request();
 
+    // View the aligned receive storage as the native request structure filled by HTTP.sys.
     HTTP_REQUEST* header() {
         return reinterpret_cast<HTTP_REQUEST*>(storage.data());
     }
@@ -337,9 +373,19 @@ struct Request {
 
 static_assert(offsetof(Request::Operation, overlapped) == 0);
 
-// Own the shared agent and HTTP.sys/IOCP infrastructure for all Windows workers. Shutdown first
-// stops accepts, then drains cancelled completions and joins workers before member handles close.
-// Process telemetry intentionally excludes kernel TLS work charged to System.
+// Run either the permanent control endpoint or one temporary workload using native HTTP.sys.
+// Agent supplies common routing and telemetry. HTTP.sys owns HTTP framing, client connections,
+// and Schannel TLS processing; application workers consume completions from one shared IOCP queue.
+//
+// The controller thread calls run(), which starts completion workers and posts several pending
+// request receives. A completed header receive normally posts a replacement receive so requests
+// can keep arriving while earlier requests read bodies or send responses.
+//
+// Shutdown first prevents new request receives and cancels queued I/O. Workers keep processing
+// completion packets until live reaches zero, meaning every Request has released its buffers.
+// Join those workers before closing HTTP.sys/IOCP handles or destroying the shared GET payload.
+// Process telemetry covers this application only, not kernel HTTP.sys/Schannel work charged to
+// System.
 struct Runtime {
     Agent agent;
     std::vector<char> payload;
@@ -358,6 +404,7 @@ struct Runtime {
     std::string address;
     unsigned port{};
 
+    // Create the control endpoint from local settings. It has no synthetic GET payload.
     explicit Runtime(const Args& args)
         : agent(windows_config(args), usage, {}, host_usage), stop_file(args.get("--stop-file")),
           address(args.get("--bind", "127.0.0.1")),
@@ -365,7 +412,8 @@ struct Runtime {
         initialize();
     }
 
-    // Workloads use an in-memory run ID and share the control runtime's native engine.
+    // Create a workload with its own queue, workers, and reusable GET payload. It uses the same
+    // native engine as control, but has a separate endpoint and an in-memory run lease.
     Runtime(AgentConfig config, const std::string& run_id, std::string bind_address,
             unsigned bind_port)
         : agent(std::move(config), usage, run_id, host_usage), payload(max_object_size),
@@ -373,7 +421,9 @@ struct Runtime {
         initialize();
     }
 
-    // Register the selected transport with its pre-provisioned URL ACL; HTTP needs no SSL state.
+    // Configure native request routing, limits, timeouts, and completion delivery before workers
+    // start. URL permissions and HTTPS certificate bindings must already have been provisioned;
+    // this method registers a URL but does not modify machine-wide certificate policy.
     void initialize() {
         if (!port) {
             throw std::invalid_argument("HTTP.sys requires an explicitly bound nonzero port");
@@ -393,6 +443,8 @@ struct Runtime {
         if (!payload.empty()) {
             randomize(payload);
         }
+        // Bind this endpoint's URL group to its request queue. Keep configuration handles as
+        // members so they remain valid through request processing and orderly shutdown.
         check(HttpCreateRequestQueue(HTTPAPI_VERSION{2, 0}, nullptr, nullptr, 0, &queue.value),
               "HttpCreateRequestQueue");
         check(HttpCreateServerSession(HTTPAPI_VERSION{2, 0}, &session.value, 0),
@@ -404,6 +456,8 @@ struct Runtime {
         check(HttpSetUrlGroupProperty(group.value, HttpServerBindingProperty, &binding,
                                       sizeof(binding)),
               "Bind HTTP.sys request queue");
+        // Apply limits in HTTP.sys itself, since the application does not accept TCP sockets.
+        // Native timeouts also cover header/body receipt, queue waits, and idle connections.
         HTTP_CONNECTION_LIMIT_INFO limit{};
         limit.Flags.Present = 1;
         limit.MaxConnections = agent.config.connection_limit;
@@ -426,6 +480,8 @@ struct Runtime {
                               ":" + std::to_string(port) + "/");
         check(HttpAddUrlToUrlGroup(group.value, url.c_str(), 0, 0),
               "Register HTTP.sys URL (check URL ACL and, for HTTPS, certificate binding)");
+        // Deliver asynchronous queue operations to the shared completion port. Workers recover
+        // the owning Request from each completed operation rather than polling socket readiness.
         completion_port.value =
             CreateIoCompletionPort(queue.value, nullptr, 0, agent.config.workers);
         if (!completion_port.value) {
@@ -433,11 +489,14 @@ struct Runtime {
         }
     }
 
+    // Cancel outstanding I/O and join workers before member destruction closes native handles.
     ~Runtime() {
         shutdown();
         threads.clear();
     }
 
+    // Request shutdown once, even if both normal teardown and failure recovery call this method.
+    // Cancellation does not free Request objects here; completion workers perform that cleanup.
     void shutdown() {
         if (!stopping.exchange(true)) {
             const auto result = HttpShutdownRequestQueue(queue.value);
@@ -450,6 +509,8 @@ struct Runtime {
         }
     }
 
+    // Preserve the first fatal worker error and wake the controller to begin shutdown. The
+    // controller also checks failure periodically in case signalling the event fails.
     void fail(const std::string& message) {
         {
             std::lock_guard lock(failure_mutex);
@@ -464,14 +525,17 @@ struct Runtime {
         }
     }
 
+    // Post another asynchronous header receive unless shutdown has started. This is a pending
+    // HTTP request receive, not a TCP accept; HTTP.sys manages the underlying connections.
     void accept() {
         if (!stopping) {
             (new Request(*this))->receive();
         }
     }
 
-    // Keep dispatching cancellations after stop: overlapped buffers cannot be freed before
-    // completion.
+    // Consume completed HTTP.sys operations and advance their owning Request objects.
+    // During shutdown, continue until all live requests are gone: cancelled operations still
+    // require their completion packets before the referenced buffers can safely be destroyed.
     void worker() {
         while (!stopping || live.load() != 0) {
             DWORD bytes{};
@@ -487,6 +551,8 @@ struct Runtime {
                 }
                 continue;
             }
+            // Immediate API failures use synthetic packets; pending and successful operations
+            // use native packets. Both take the same request-completion and cleanup path.
             auto* operation = reinterpret_cast<Request::Operation*>(overlapped);
             ULONG error = NO_ERROR;
             if (operation->immediate_error) {
@@ -498,8 +564,10 @@ struct Runtime {
         }
     }
 
-    // Publish readiness only after workers/accepts exist, and preserve failures through orderly
-    // teardown.
+    // Start completion workers, post initial request receives, and then announce readiness.
+    // The calling controller thread waits for a stop event, stop file, or fatal worker failure.
+    // A workload uses its readiness callback without replacing the control console handler.
+    // On every exit path, cancel I/O and join workers before returning or propagating failure.
     void run(bool control = true, const std::function<void()>& listening = {}) {
         bool console_registered = false;
         try {
@@ -508,6 +576,8 @@ struct Runtime {
                     worker();
                 });
             }
+            // Keep several receives pending per worker so arrival processing is not limited to
+            // waiting for the previous request's response. Receives share the same native queue.
             for (unsigned i = 0; i < agent.config.workers * 4; ++i) {
                 accept();
             }
@@ -572,6 +642,8 @@ struct Runtime {
             if (control) {
                 stop_event = nullptr;
             }
+            // Stop new receives and drain outstanding completions before inspecting the final
+            // failure or allowing Runtime's resources to be destroyed.
             shutdown();
             threads.clear();
             if (!failure.empty()) {
@@ -591,18 +663,23 @@ struct Runtime {
     }
 };
 
+// Allocate aligned header storage and register this request in Runtime's live-object count.
+// That count keeps shutdown workers running until the request's terminal cleanup is complete.
 Request::Request(Runtime& owner)
     : runtime(owner), storage((65536 + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t)) {
     operation.request = this;
     ++runtime.live;
 }
 
+// Tell shutdown workers that this request no longer owns any pending-operation buffers.
 Request::~Request() {
     --runtime.live;
 }
 
-// Successful and pending operations already produce IOCP packets. Only immediate failures need a
-// synthetic completion, keeping all terminal cleanup on the same ownership path.
+// Handle the submission result, not the eventual I/O result. Successful and pending operations
+// already produce IOCP packets. An immediate failure has no native packet, so enqueue one to let
+// complete() perform the same error handling and cleanup. If enqueueing also fails, no operation
+// is pending: report a fatal runtime error and delete this Request directly.
 void Request::submitted(ULONG result) {
     if (result != NO_ERROR && result != ERROR_IO_PENDING) {
         operation.immediate_error = result;
@@ -614,6 +691,8 @@ void Request::submitted(ULONG result) {
     }
 }
 
+// Submit a header receive for the next available request. The storage and operation remain owned
+// by this Request until completion, even when the API reports immediate success.
 void Request::receive() {
     state = State::receive;
     operation.overlapped = {};
@@ -623,7 +702,9 @@ void Request::receive() {
                                      nullptr, &operation.overlapped));
 }
 
-// Fully receive PUT or bounded control JSON before acknowledging or dispatching it.
+// Read the declared body in bounded chunks. PUT bytes are discarded, while control JSON is kept
+// for shared dispatch. Only after the complete body arrives may PUT counters advance or the
+// control command execute; then submit the response.
 void Request::read_body() {
     if (!remaining) {
         if (reply.kind == AgentReply::Kind::consume_control) {
@@ -647,8 +728,13 @@ void Request::read_body() {
                                      nullptr, &operation.overlapped));
 }
 
-// Keep headers/body references in this Request until the asynchronous send completes. Disable both
-// application and HTTP.sys caching so repeated GETs still exercise the selected native TLS stack.
+// Build a native HTTP_RESPONSE and submit it to HTTP.sys, which serializes the wire headers and
+// performs the selected transport's send/TLS work. Do not assume the structure determines a fixed
+// wire header length. GET data borrows Runtime's immutable payload; JSON data belongs to reply.
+//
+// Keep all referenced headers, body data, and OVERLAPPED storage alive until send completion.
+// Disable caching both in the response and the HTTP.sys cache policy so repeated GETs still use
+// the native request/response path rather than cached responses.
 void Request::send() {
     state = State::send;
     response = {};
@@ -691,11 +777,19 @@ void Request::send() {
         &cache_policy, nullptr, nullptr, 0, &operation.overlapped, nullptr));
 }
 
-// Dispatch one IOCP completion and either submit the next operation or destroy the request.
-// Exceptions must reach Runtime's failure path rather than escaping a worker and terminating it.
+// Advance this request after one operation completes. Header completion dispatches through Agent,
+// body completion consumes bytes and schedules another read or a response, and successful send
+// completion records GET counters and deletes the request.
+//
+// Errors and shutdown also end the request, cancelling it in HTTP.sys when an ID is available.
+// Catch exceptions here because they must reach the Runtime controller, not escape an IOCP worker.
+// After submitting the next operation or deleting this object, the current callback must not
+// continue using its buffers: another worker may handle the next completion.
 void Request::complete(ULONG error, DWORD bytes) noexcept {
     try {
         if (state == State::receive) {
+            // Replace a finished header receive promptly so new requests can arrive while this
+            // one is processed. Fatal queue/resource errors instead wake the controller.
             id = header()->RequestId;
             if (error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_HANDLE ||
                 error == ERROR_NOT_ENOUGH_MEMORY) {
@@ -705,6 +799,8 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
             }
         }
         if (runtime.stopping || error != NO_ERROR) {
+            // Cancellation packets arrive during normal shutdown too. Release this request only
+            // now that its outstanding operation has completed; warn on unexpected I/O errors.
             if (!runtime.stopping) {
                 log_warning(windows_error("HTTP.sys request I/O failed", error).what());
             }
@@ -718,6 +814,8 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
             return;
         }
         if (state == State::receive) {
+            // HTTP.sys has parsed the native header. Adapt it to the shared protocol and verify
+            // actual TLS metadata before deciding whether to read a body or send a reply.
             try {
                 parsed_head = request_head(*header());
                 connection =
@@ -740,10 +838,14 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
                 send();
             }
         } else if (state == State::body) {
+            // Reject an incomplete or oversized body chunk. Preserve control JSON, but discard
+            // PUT contents after counting how many declared bytes remain.
             if (!bytes || bytes > remaining) {
                 reply = AgentReply::error(400, "Incomplete request body");
                 send();
             } else {
+                // Successful send completion means HTTP.sys finished this response operation,
+                // not that the client application has confirmed receipt.
                 if (reply.kind == AgentReply::Kind::consume_control) {
                     control_body.append(body_buffer.data(), bytes);
                 }
@@ -769,8 +871,13 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
     }
 }
 
-// Own one in-process workload and its controller thread. Readiness is published only after IOCP
-// accepts exist; destruction signals that runtime alone and joins it before removing its URL.
+// Own the temporary Windows workload created by the shared benchmark controller.
+// Its controller thread runs a separate Runtime, which in turn manages its IOCP worker threads.
+// Construction waits for native readiness or startup failure before advertising the endpoint.
+//
+// Destruction signals only this workload's stop event and joins its controller before Runtime
+// resources are released. The permanent control endpoint and its console handler remain intact.
+// Telemetry checks stored controller/worker failures so a stopped workload cannot appear healthy.
 class NativeBenchmark final : public BenchmarkInstance {
     Runtime runtime_;
     mutable std::mutex mutex_;
@@ -850,6 +957,9 @@ public:
 };
 }
 
+// Start the permanent HTTP control endpoint and provide the shared controller with a factory for
+// temporary native workloads. Keep Winsock, the exclusive guard, and controller alive through
+// runtime shutdown. HTTPS certificate bindings are provisioned externally, not changed here.
 int wmain(int argc, wchar_t** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {

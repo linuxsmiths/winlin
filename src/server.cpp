@@ -11,10 +11,15 @@ using namespace winlin;
 std::atomic<bool> interrupted{};
 static_assert(std::atomic<bool>::is_always_lock_free);
 
+// Signal handlers only request shutdown. Worker loops observe this flag and release their own
+// sockets and sessions; cleanup and logging must not run inside the signal handler.
 void on_signal(int) {
     interrupted.store(true, std::memory_order_relaxed);
 }
 
+// Describe the permanent plain-HTTP control endpoint and the workload backends this host supports.
+// Advertising kTLS does not guarantee activation: each workload connection must verify the
+// requested direction after its TLS handshake.
 AgentConfig linux_config(const Args& args) {
     auto config = AgentConfig::from_args(args, "http");
     config.tls = false;
@@ -33,7 +38,9 @@ AgentConfig linux_config(const Args& args) {
     return config;
 }
 
-// Apply requested tuning only to the per-run workload, leaving the control endpoint unchanged.
+// Build the temporary workload's configuration from the settings selected by the client.
+// The control endpoint keeps its original workers and plain-HTTP transport. A kTLS workload still
+// uses OpenSSL for the handshake, but requests kernel TLS record processing afterward.
 AgentConfig workload_config(const Args& args, const BenchmarkOptions& options) {
     auto config = linux_config(args);
     config.role = AgentConfig::Role::workload;
@@ -46,14 +53,22 @@ AgentConfig workload_config(const Args& args, const BenchmarkOptions& options) {
     return config;
 }
 
-// Share immutable TLS configuration/payload and atomic agent counters across Linux workers.
-// Each worker owns separate listeners and sessions; this server must outlive all of them.
+// Hold the configuration and shared resources for either the control endpoint or one workload.
+// Agent supplies the common Linux/Windows routing, request validation, and telemetry counters.
+// This class adds the Linux TLS context and a reusable random payload for GET responses.
+//
+// Workload workers read the same payload instead of generating bytes for every request. The TLS
+// context is configured before workers start; each accepted connection creates its own TLS session.
+// Workers update Agent's atomic counters, but own separate listeners and connection state.
+// Keep this Server alive until all workers and their sessions have been destroyed.
 struct Server : Agent {
     Context tls;
     std::vector<char> payload;
     bool ktls{};
     std::atomic<bool> stop{};
 
+    // Without options, construct a plain-HTTP control server. With options, prepare the selected
+    // workload backend, loading a matching certificate/key only when HTTPS was requested.
     Server(const Args& args, const BenchmarkOptions* options = nullptr,
            const std::string& run_id = {})
         : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id,
@@ -69,6 +84,8 @@ struct Server : Agent {
              SSL_CTX_check_private_key(tls.get()) != 1)) {
             throw tls_error("Cannot load matching certificate/private key");
         }
+        // Generate dummy GET data once, outside request processing. PUT bodies are discarded,
+        // so neither method performs storage I/O during the benchmark.
         if (!payload.empty() &&
             RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
             throw tls_error("Cannot generate reusable payload");
@@ -76,10 +93,19 @@ struct Server : Agent {
     }
 };
 
-// Drive one persistent HTTP/TLS connection without blocking a worker. Buffers survive partial I/O;
-// PUT counts advance only after receipt, GET counts only after the response has been sent.
-// The accept loop reserves an active slot before construction, released by this session's
-// destructor.
+// Process requests on one persistent client connection. A serve() worker owns this Session and
+// calls pump() when epoll reports socket readiness. There is no separate thread for the connection.
+//
+// The state machine first completes TCP/TLS setup, then reads a header and asks Agent how to handle
+// the request. PUT data is consumed and discarded before its response is prepared. Control JSON
+// is retained until the full body can be dispatched. GET responses use Server's shared payload.
+// After sending a response, return to reading headers unless the connection must close.
+//
+// Buffers and offsets remain valid across partial reads, writes, and OpenSSL retries. PUT counters
+// advance after the complete body is received; GET counters advance after the complete response
+// has been accepted by the socket/TLS write path, not after confirmation from the client.
+// Server must outlive this object. The accept loop reserves an active-connection slot before
+// construction, and the Session destructor releases it.
 struct Session {
     StreamSocket socket;
     Server& server;
@@ -99,13 +125,17 @@ struct Session {
     std::string control_body;
     Clock::time_point activity{Clock::now()};
 
+    // Take ownership of an accepted socket and borrow the worker's shared Server resources.
     Session(int fd, Server& owner) : socket(fd, owner.tls.get()), server(owner) {
     }
 
+    // Release the connection slot when the worker removes this session or shuts down.
     ~Session() {
         --server.active;
     }
 
+    // Prepare the response but do not send it yet. Keep JSON text and serialized headers in this
+    // session until pump() finishes writing; object bodies instead borrow Server's GET payload.
     void respond(int status, std::string body = {}, bool object = false, std::size_t size = 0) {
         text_body = std::move(body);
         object_response = object;
@@ -120,7 +150,9 @@ struct Session {
         state = State::send_header;
     }
 
-    // Translate shared dispatch into transport states; a PUT must be drained before responding.
+    // Let the shared Agent validate and route the header, then select the native next step.
+    // PUT and control requests need their full bodies before completion; other replies can be
+    // prepared immediately. Preserve the negotiated TLS information for backend validation.
     void request(const HttpHead& head) {
         body_remaining = 0;
         const ConnectionInfo connection{socket.ssl ? SSL_get_version(socket.ssl.get()) : "",
@@ -143,14 +175,19 @@ struct Session {
         }
     }
 
-    // Advance until OpenSSL needs readiness or the fairness budget is exhausted. False tells the
-    // worker to destroy this session; it does not mean an individual syscall should be retried.
+    // Advance the connection without waiting inside a socket operation. Process at most 128 steps
+    // so one large transfer cannot monopolize the worker. A pending read/write returns true with
+    // socket.want identifying the readiness needed; budget exhaustion also returns true.
+    // False means the worker should remove and close this session, not retry an I/O operation.
     bool pump() {
         for (unsigned step = 0; step < 128; ++step) {
             if (state == State::handshake) {
                 if (!socket.handshake(true)) {
                     return true;
                 }
+                // Inspect actual kTLS activation after OpenSSL completes the handshake. TX and RX
+                // can differ; the shared request handler checks the direction needed by each
+                // method.
                 if (socket.ssl) {
                     tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
                     rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
@@ -189,6 +226,8 @@ struct Session {
                     input.append(buffer.data(), count);
                 }
             } else if (state == State::control_body) {
+                // Header reads may already have received part of the JSON body. Consume those
+                // bytes first, then read only the missing amount before dispatching the command.
                 const auto count = std::min(body_remaining, input.size());
                 control_body.append(input.data(), count);
                 input.erase(0, count);
@@ -212,6 +251,8 @@ struct Session {
                     input.append(buffer.data(), count);
                 }
             } else if (state == State::body) {
+                // Discard a PUT body without storing it. Account for bytes already read alongside
+                // the header, and acknowledge only after the entire declared body is consumed.
                 const auto count = std::min(body_remaining, input.size());
                 input.erase(0, count);
                 body_remaining -= count;
@@ -228,6 +269,8 @@ struct Session {
                     body_remaining -= bytes;
                 }
             } else if (state == State::send_header) {
+                // Preserve the offset on partial writes, including retries required by OpenSSL.
+                // Start the response body only after every header byte has been written.
                 const int bytes = socket.write(output.data() + offset, output.size() - offset);
                 if (!bytes) {
                     return true;
@@ -238,6 +281,9 @@ struct Session {
                     state = State::send_body;
                 }
             } else {
+                // Send either the shared dummy object or the session's JSON response. A completed
+                // persistent response returns to header processing and may use already buffered
+                // input.
                 if (offset < body_size) {
                     const char* data = object_response ? server.payload.data() : text_body.data();
                     const int bytes = socket.write(data + offset, body_size - offset);
@@ -258,13 +304,16 @@ struct Session {
             }
             activity = Clock::now();
         }
+        // The work budget ended without an operation reporting a wait. Either readiness event
+        // schedules another pump() call after this worker has had a chance to serve other sessions.
         socket.want = EPOLLIN | EPOLLOUT;
         return true;
     }
 };
 
-// Claim machine-wide server ownership before constructing workers. Unlike HTTPS listeners, this
-// socket must never enable either reuse option; closing it also releases ownership after a crash.
+// Reserve a loopback port solely to prevent multiple Winlin servers from running on this machine.
+// It carries no benchmark traffic. Unlike worker listeners, it must not use address/port reuse.
+// Main retains the returned socket until shutdown; process exit also releases it after a crash.
 Fd server_guard() {
     Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
     if (fd.value < 0) {
@@ -283,7 +332,9 @@ Fd server_guard() {
     return fd;
 }
 
-// Bind one reuse-port listener per worker; the first ephemeral port is reused by later workers.
+// Create one nonblocking listening socket for a worker. SO_REUSEPORT lets multiple workers bind
+// the same endpoint so the kernel distributes incoming connections between their listeners.
+// If port is zero, record the kernel-selected port and use it for the remaining workers.
 Fd listener(const std::string& bind_address, unsigned& port) {
     Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (fd.value < 0) {
@@ -312,8 +363,17 @@ Fd listener(const std::string& bind_address, unsigned& port) {
     return fd;
 }
 
-// Own all sessions for one listener. Per-connection errors are recoverable; listener/epoll failures
-// escape to main so a partial worker pool cannot masquerade as a successful server.
+// Run one server worker's event loop. This thread owns its listener, epoll queue, and all sessions
+// accepted through that listener; other workers never access those sessions.
+//
+// Listener readiness accepts a bounded batch of connections. Session readiness advances requests
+// through pump(), then either updates the event mask or removes a closed/failed session.
+// A periodic sweep removes sessions with no progress for 60 seconds.
+//
+// Individual connection failures are logged and isolated. Listener or event-loop failures escape
+// to the worker's owner, which stops the server rather than silently losing part of its worker
+// pool. The optional ready callback announces that the listener is registered and this loop is
+// ready.
 void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = {}) {
     Epoll poller;
     poller.set(listener_fd.value, EPOLLIN, true);
@@ -328,6 +388,8 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
         for (int i = 0; i < count; ++i) {
             const int fd = events[i].data.fd;
             if (fd == listener_fd.value) {
+                // Bound each accept batch so a busy listener does not starve existing requests.
+                // Reserve a slot in the server-wide counter before creating a Session.
                 for (unsigned accepted = 0; accepted < 256; ++accepted) {
                     Fd client(accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
                     if (client.value < 0) {
@@ -352,6 +414,8 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                         poller.set(client_fd, EPOLLIN, true);
                         ++server.connections;
                     } catch (...) {
+                        // Undo the reserved slot if construction failed. If a Session was inserted,
+                        // erasing it releases the slot through its destructor instead.
                         if (!sessions.erase(client_fd)) {
                             --server.active;
                         }
@@ -359,6 +423,8 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                     }
                 }
             } else if (const auto it = sessions.find(fd); it != sessions.end()) {
+                // Keep live sessions registered for their next required event. Erasing a session
+                // closes its descriptor, which also removes the descriptor from epoll.
                 try {
                     if (!it->second->pump()) {
                         sessions.erase(it);
@@ -380,6 +446,8 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
             }
         }
         if (Clock::now() - sweep >= std::chrono::seconds(1)) {
+            // Check inactivity once per second rather than scanning every session after every
+            // event batch. An idle keep-alive close is normal; an unfinished request is warned.
             sweep = Clock::now();
             std::erase_if(sessions, [&](const auto& entry) {
                 const auto& session = *entry.second;
@@ -394,8 +462,14 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
     }
 }
 
-// Reuse exactly the native epoll/HTTP engine for all workload modes. Only TLS record processing
-// differs; listeners and worker counts are replaced between exclusive runs, never during a run.
+// Own the temporary Linux workload created by a control-channel benchmark-start command.
+// HTTP, OpenSSL HTTPS, and kTLS all use the same Server/Session event loop; only TLS configuration
+// differs. The requested worker count and listeners are created for this run, not changed mid-run.
+//
+// Construction waits until every worker has registered its listener, or startup has failed.
+// Worker failures are retained for telemetry requests and stop the workload. Destruction signals
+// every worker to exit and joins them before destroying the Server resources they reference.
+// The permanent control server is separate and remains available when this workload stops.
 class LinuxBenchmark final : public BenchmarkInstance {
     Server server_;
     unsigned port_;
@@ -404,6 +478,8 @@ class LinuxBenchmark final : public BenchmarkInstance {
     std::vector<std::jthread> workers_;
 
 public:
+    // Bind all workload listeners before starting threads. Publish a usable endpoint only after
+    // each worker has announced readiness, and join partially started workers if setup fails.
     LinuxBenchmark(const Args& args, const BenchmarkOptions& options, const std::string& id)
         : server_(args, &options, id),
           port_(static_cast<unsigned>(
@@ -425,6 +501,8 @@ public:
                             ready->count_down();
                         });
                     } catch (const std::exception& error) {
+                        // A startup failure must also release its latch slot; otherwise the
+                        // constructor could wait forever for readiness that will never arrive.
                         std::lock_guard lock(failure_mutex_);
                         failure_ = error.what();
                         server_.stop = true;
@@ -446,17 +524,21 @@ public:
         }
     }
 
+    // Stop and join workload threads while their shared Server and TLS context are still alive.
     ~LinuxBenchmark() override {
         server_.stop = true;
         workers_.clear();
     }
 
+    // Return the bound endpoint and selected backend for the client's workload connections.
     Json describe() const override {
         return {{"port", port_},
                 {"transport", server_.config.tls ? "https" : "http"},
                 {"backend", server_.config.backend}};
     }
 
+    // Report worker failure explicitly instead of presenting a stopped workload's counters as
+    // evidence of a healthy run.
     Json telemetry() const override {
         std::lock_guard lock(failure_mutex_);
         if (!failure_.empty()) {
@@ -467,6 +549,8 @@ public:
 };
 }
 
+// Start the permanent control service and provide a factory for temporary workloads. Keep the
+// machine-wide guard and shared controller alive until control workers have finished.
 int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
@@ -491,6 +575,7 @@ int main(int argc, char** argv) {
             (http_port && http_port == https_port)) {
             throw std::invalid_argument("Control, HTTP and HTTPS workload ports must be distinct");
         }
+        // Reserve exclusive ownership and initialize CPU measurement before serving requests.
         const auto instance_guard = server_guard();
         reference_clock();
         process_cycles = std::make_unique<ProcessCycles>();
@@ -511,6 +596,8 @@ int main(int argc, char** argv) {
             [&](const BenchmarkOptions& options, const std::string& id) {
                 return std::make_unique<LinuxBenchmark>(args, options, id);
             });
+        // Control requests create and stop workloads through the shared controller. Each workload
+        // has its own listener pool, while these workers continue to serve control and telemetry.
         Server server(args);
         server.config.role = AgentConfig::Role::control;
         server.controller = &controller;
@@ -547,6 +634,8 @@ int main(int argc, char** argv) {
                           {"workers", workers}}
                          .dump()
                   << std::endl;
+        // Joining waits for a signal or worker failure to stop the loops. Only afterward is it
+        // safe to inspect the recorded failure and destroy the resources used by those threads.
         threads.clear();
         if (!failure.empty()) {
             throw std::runtime_error(failure);
