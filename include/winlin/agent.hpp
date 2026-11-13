@@ -44,8 +44,9 @@ struct AgentConfig {
 
 // Carry negotiated, not merely requested, TLS properties from a transport into shared dispatch.
 // The transport owns the connection and must verify these again for each accepted TLS session.
+// Names borrow stable transport-owned strings or canonical literals through synchronous dispatch.
 struct ConnectionInfo {
-    std::string tls_version, cipher;
+    std::string_view tls_version, cipher;
     bool ktls_tx{}, ktls_rx{};
 };
 
@@ -149,14 +150,10 @@ public:
     }
 
     // Enforce the selected transport and workload lease before dispatching a bounded request.
-    AgentReply request(const HttpHead& head, const ConnectionInfo& connection,
+    AgentReply request(const RequestHead& head, const ConnectionInfo& connection,
                        std::string_view body = {}) {
         try {
-            const auto first_space = head.first.find(' ');
-            const auto last_space = head.first.rfind(' ');
-            if (first_space == std::string::npos || first_space == last_space ||
-                head.first.substr(last_space + 1) != "HTTP/1.1" || !head.fields.contains("host") ||
-                head.length > max_object_size) {
+            if (head.version != "HTTP/1.1" || !head.host || head.length > max_object_size) {
                 return AgentReply::error(400, "Expected HTTP/1.1 with Host and a bounded body");
             }
             if ((config.tls &&
@@ -165,8 +162,8 @@ public:
                 return AgentReply::error(
                     400, "Negotiated TLS version/cipher does not match server configuration");
             }
-            const auto method = head.first.substr(0, first_space);
-            const auto path = head.first.substr(first_space + 1, last_space - first_space - 1);
+            const auto method = head.method;
+            const auto path = head.path;
             // Dummy benchmark object, GET or PUT
             const bool object = path.starts_with("/v1/object");
             // Reject object requests to the control endpoint and control requests to the
@@ -176,8 +173,7 @@ public:
                 return AgentReply::error(404, "Use the advertised control or workload endpoint");
             }
             if (config.role == AgentConfig::Role::workload) {
-                const auto run = head.fields.find("x-winlin-run");
-                if (run == head.fields.end() || run->second != run_id_) {
+                if (!head.run_id || *head.run_id != run_id_) {
                     return AgentReply::error(409, "Workload run ID does not match active lease");
                 }
             }
@@ -223,8 +219,7 @@ public:
                 reply.kind = AgentReply::Kind::object;
                 reply.size = static_cast<std::size_t>(
                     number(std::string_view(path).substr(16), max_object_size));
-            } else if (method == "PUT" && path == "/v1/object" &&
-                       head.fields.contains("content-length")) {
+            } else if (method == "PUT" && path == "/v1/object" && head.content_length) {
                 if (config.backend == "openssl-ktls" && !connection.ktls_rx) {
                     return AgentReply::error(501, "kTLS RX is not active; refusing fallback");
                 }

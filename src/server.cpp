@@ -132,9 +132,9 @@ struct Session {
     std::array<char, max_header_size> buffer{};
     std::size_t input_begin{}, input_end{}, header_search{};
     std::size_t offset{}, body_remaining{}, body_size{};
-    bool close{}, object_response{}, get{}, put{}, tx{}, rx{};
-    std::optional<HttpHead> control_head;
-    std::string control_body;
+    bool close{}, object_response{}, get{}, put{};
+    ConnectionInfo connection;
+    std::string control_header, control_body;
     Clock::time_point activity{Clock::now()};
 
     // Take ownership of an accepted socket and borrow the worker's shared Server resources.
@@ -147,7 +147,7 @@ struct Session {
     }
 
     // Borrow bytes received but not yet consumed. The view is invalidated by the next buffer read
-    // or compaction; parsed HttpHead values own their strings and do not retain this view.
+    // or compaction. RequestHead views must be dispatched or copied before that happens.
     std::string_view pending_input() const {
         return {buffer.data() + input_begin, input_end - input_begin};
     }
@@ -167,12 +167,25 @@ struct Session {
         text_body = std::move(body);
         object_response = object;
         body_size = object ? size : text_body.size();
-        output = "HTTP/1.1 " + std::to_string(status) + " " + (status == 200 ? "OK" : "Error") +
-                 "\r\nContent-Length: " + std::to_string(body_size) +
-                 "\r\nContent-Type: " + (object ? "application/octet-stream" : "application/json") +
-                 "\r\nCache-Control: no-store\r\nConnection: " + (close ? "close" : "keep-alive") +
-                 "\r\nX-Winlin-Ktls-Tx: " + (tx ? "1" : "0") +
-                 "\r\nX-Winlin-Ktls-Rx: " + (rx ? "1" : "0") + "\r\n\r\n";
+
+        // Retain the header buffer's capacity across requests. Building directly into it avoids
+        // allocating a separate concatenation result and replacing the previous buffer each time.
+        output.clear();
+        output.append("HTTP/1.1 ");
+        output.append(std::to_string(status));
+        output.append(status == 200 ? " OK" : " Error");
+        output.append("\r\nContent-Length: ");
+        output.append(std::to_string(body_size));
+        output.append("\r\nContent-Type: ");
+        output.append(object ? "application/octet-stream" : "application/json");
+        output.append("\r\nCache-Control: no-store\r\nConnection: ");
+        output.append(close ? "close" : "keep-alive");
+        output.append("\r\nX-Winlin-Ktls-Tx: ");
+        output.append(connection.ktls_tx ? "1" : "0");
+        output.append("\r\nX-Winlin-Ktls-Rx: ");
+        output.append(connection.ktls_rx ? "1" : "0");
+        output.append("\r\n\r\n");
+
         offset = 0;
         state = State::send_header;
     }
@@ -180,11 +193,8 @@ struct Session {
     // Let the shared Agent validate and route the header, then select the native next step.
     // PUT and control requests need their full bodies before completion; other replies can be
     // prepared immediately. Preserve the negotiated TLS information for backend validation.
-    void request(const HttpHead& head) {
+    void request(const RequestHead& head, std::string_view raw_header) {
         body_remaining = 0;
-        const ConnectionInfo connection{socket.ssl ? SSL_get_version(socket.ssl.get()) : "",
-                                        socket.ssl ? SSL_get_cipher_name(socket.ssl.get()) : "", tx,
-                                        rx};
         const auto reply = server.Agent::request(head, connection);
         close = reply.close;
         // GET benchmark object
@@ -194,7 +204,9 @@ struct Session {
         if (reply.kind == AgentReply::Kind::consume_control) {
             // The benchmark-start header has been parsed. Collect the complete settings JSON
             // before dispatching again; some body bytes may already be in the receive buffer.
-            control_head = head;
+            // Header views cannot survive another receive-buffer read. Own the raw bytes only
+            // for this uncommon multi-read operation and reparse them when the body is complete.
+            control_header.assign(raw_header);
             // Control JSON is bounded by Agent. Allocate its final size once so missing body
             // bytes can be read directly into it, rather than copied through the header buffer.
             control_body.resize(reply.size);
@@ -226,12 +238,13 @@ struct Session {
                     // Clear accounting before parsing: parser failures bypass shared dispatch.
                     get = put = false;
                     try {
-                        const auto head = parse_head(input.substr(0, end + 4));
+                        const auto raw_header = input.substr(0, end + 4);
+                        const auto head = parse_request_head(raw_header);
                         consume_input(end + 4);
                         // Reset the search offset for the next header
                         header_search = 0;
                         // Process the request
-                        request(head);
+                        request(head, raw_header);
                     } catch (const std::invalid_argument& error) {
                         log_warning(std::string("Rejected malformed HTTP header: ") + error.what());
                         close = true;
@@ -315,14 +328,18 @@ struct Session {
                 // can differ; the shared request handler checks the direction needed by each
                 // method.
                 if (socket.ssl) {
-                    tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
-                    rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
+                    // TLS 1.3 does not renegotiate. These OpenSSL-owned names stay valid until
+                    // the SSL session is destroyed, so requests need no temporary owning strings.
+                    connection = {
+                        SSL_get_version(socket.ssl.get()), SSL_get_cipher_name(socket.ssl.get()),
+                        static_cast<bool>(BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()))),
+                        static_cast<bool>(BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get())))};
                     ++server.handshakes;
                 }
-                if (tx) {
+                if (connection.ktls_tx) {
                     ++server.tx_ktls;
                 }
-                if (rx) {
+                if (connection.ktls_rx) {
                     ++server.rx_ktls;
                 }
                 // After handshake, the next step is always reading a request header.
@@ -339,12 +356,9 @@ struct Session {
                 consume_input(count);
                 body_remaining -= count;
                 if (!body_remaining) {
-                    const auto reply = server.Agent::request(
-                        *control_head,
-                        {socket.ssl ? SSL_get_version(socket.ssl.get()) : "",
-                         socket.ssl ? SSL_get_cipher_name(socket.ssl.get()) : ""},
-                        control_body);
-                    control_head.reset();
+                    const auto reply = server.Agent::request(parse_request_head(control_header),
+                                                             connection, control_body);
+                    control_header.clear();
                     control_body.clear();
                     close = reply.close;
                     respond(reply.status, reply.text);

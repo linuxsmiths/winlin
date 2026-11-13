@@ -108,6 +108,66 @@ int main() {
             finish_http_head(native);
         });
 
+        // Request views retain native/raw storage rather than allocating a request line or map.
+        // Owning generic headers remain available for temporary input and returned control data.
+        const std::string raw_request =
+            "PUT /v1/object HTTP/1.1\r\nx-WiNlIn-RuN: lease-with-a-long-enough-value\r\n"
+            "cOnTeNt-LeNgTh:\t256 \r\nHost: localhost\r\nConnection: CLOSE\r\nX-Note: "
+            "ignored\r\n\r\n";
+        const auto request_view = parse_request_head(raw_request);
+        const auto owning_request = parse_head(raw_request);
+        check(request_view == RequestHead(owning_request) && request_view.length == 256 &&
+                  request_view.close && request_view.method == "PUT" &&
+                  request_view.path == "/v1/object" && request_view.version == "HTTP/1.1",
+              "Borrowed and owning requests retain the same routing and framing");
+        check(request_view.path.data() == raw_request.data() + 4 &&
+                  request_view.run_id->data() ==
+                      raw_request.data() + raw_request.find("lease-with"),
+              "Request paths and selected values borrow the original header bytes");
+        const auto empty_fields =
+            parse_request_head("PUT /v1/object HTTP/1.1\r\nHost:\r\nX-Winlin-Run: \t \r\n\r\n");
+        check(empty_fields.host && empty_fields.host->empty() && empty_fields.run_id &&
+                  empty_fields.run_id->empty() && !empty_fields.content_length,
+              "Present empty fields remain distinct from absent fields");
+        check(!parse_request_head("GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n").close,
+              "Request parsing preserves existing whole-value Connection semantics");
+        for (const auto invalid : {
+                 "PUT / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n",
+                 "GET / HTTP/1.1\r\nX-Note: 1\r\nx-note: 2\r\n\r\n",
+                 "GET / HTTP/1.1\r\nX-Winlin-Run: first\r\nx-winlin-run: second\r\n\r\n",
+                 "GET / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length:\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length: 67108865\r\n\r\n",
+                 "GET / HTTP/1.1\r\nBad Field: value\r\n\r\n",
+                 "GET / HTTP/1.1\r\nMissing-colon\r\n\r\n",
+                 "GET / HTTP/1.1\r\nHost: localhost\r\n",
+             }) {
+            rejects([&] {
+                parse_request_head(invalid);
+            });
+        }
+        std::string many_request_fields = "GET / HTTP/1.1\r\nHost: localhost\r\n";
+        for (unsigned index = 0; index < 20; ++index) {
+            many_request_fields += "X-Note-" + std::to_string(index) + ": ignored\r\n";
+        }
+        many_request_fields += "\r\n";
+        check(parse_request_head(many_request_fields).host == "localhost",
+              "Request field storage does not impose a new field-count limit");
+        auto duplicate_cached_field = many_request_fields;
+        duplicate_cached_field.insert(duplicate_cached_field.size() - 2, "hOsT: duplicate\r\n");
+        rejects([&] {
+            parse_request_head(duplicate_cached_field);
+        });
+        many_request_fields.insert(many_request_fields.size() - 2, "x-note-19: duplicate\r\n");
+        rejects([&] {
+            parse_request_head(many_request_fields);
+        });
+        rejects([] {
+            parse_request_head("GET / HTTP/1.1\r\nX-Pad: " + std::string(max_header_size, 'x') +
+                               "\r\n\r\n");
+        });
+
         // Workload parsing borrows framing fields without normalizing or copying header strings.
         const std::string_view response =
             "HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh:\t256 \r\n"

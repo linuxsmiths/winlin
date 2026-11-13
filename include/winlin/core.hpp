@@ -11,10 +11,12 @@
 #include <limits>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <syncstream>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -233,26 +235,56 @@ inline std::size_t find_http_header_end(std::string_view bytes, std::size_t& sea
     return end;
 }
 
-// Parse a complete workload response without heap allocations on the successful path.
-// Preserve bounded framing and duplicate rejection; ignore values unrelated to framing.
-inline WorkloadResponseHead parse_workload_response_head(std::string_view text) {
+// Borrow a field value after removing only HTTP optional whitespace.
+inline std::string_view trim_http_value(std::string_view value) {
+    const auto first = value.find_first_not_of(" \t");
+    return first == std::string_view::npos
+               ? std::string_view{}
+               : value.substr(first, value.find_last_not_of(" \t") - first + 1);
+}
+
+// Order borrowed names case-insensitively for the large-request duplicate index. The scanner
+// owns this index; its keys must not outlive the receive bytes and are never modified.
+struct HttpNameLess {
+    // Compare ASCII names without constructing lowercase strings.
+    bool operator()(std::string_view left, std::string_view right) const {
+        return std::lexicographical_compare(left.begin(), left.end(), right.begin(), right.end(),
+                                            [](unsigned char left_byte, unsigned char right_byte) {
+                                                if (left_byte >= 'A' && left_byte <= 'Z') {
+                                                    left_byte += 'a' - 'A';
+                                                }
+                                                if (right_byte >= 'A' && right_byte <= 'Z') {
+                                                    right_byte += 'a' - 'A';
+                                                }
+                                                return left_byte < right_byte;
+                                            });
+    }
+};
+
+// Validate a complete header and visit its fields. Ordinary headers need no allocation; requests
+// opt into an overflow index to retain logarithmic duplicate checks for large field counts.
+// All names, including ignored ones, participate. Views remain tied to the caller's bytes.
+template <bool IndexedOverflow = false, class Visitor>
+inline std::string_view visit_http_fields(std::string_view text, Visitor visitor) {
     if (text.size() > max_header_size || !text.ends_with("\r\n\r\n")) {
         throw std::invalid_argument("Invalid HTTP header");
     }
     auto end = text.find("\r\n");
     if (end == std::string_view::npos) {
-        throw std::invalid_argument("Invalid HTTP status line");
+        throw std::invalid_argument("Invalid HTTP first line");
     }
-    WorkloadResponseHead head;
-    head.first = text.substr(0, end);
+    const auto first = text.substr(0, end);
 
-    // Cache offsets for ordinary responses, not header contents. Only initialized entries are
-    // read. Larger headers use a slower prefix check rather than allocating or imposing a limit.
+    // Cache offsets for ordinary headers, not header contents. Only initialized entries are
+    // read. The response parser keeps its allocation-free prefix fallback; requests use a tree
+    // only beyond this cache so unusual inputs do not introduce quadratic server parsing work.
     struct FieldSpan {
         std::size_t begin, length;
     };
 
     std::array<FieldSpan, 16> fields;
+    using FieldIndex = std::map<std::string_view, bool, HttpNameLess>;
+    std::conditional_t<IndexedOverflow, FieldIndex, std::nullptr_t> overflow{};
     std::size_t field_count{};
     const auto first_field = end + 2;
     auto position = first_field;
@@ -282,6 +314,15 @@ inline WorkloadResponseHead parse_workload_response_head(std::string_view text) 
                 }
             }
             fields[field_count] = {position, name.size()};
+        } else if constexpr (IndexedOverflow) {
+            if (overflow.empty()) {
+                for (const auto& field : fields) {
+                    overflow.emplace(text.substr(field.begin, field.length), true);
+                }
+            }
+            if (!overflow.emplace(name, true).second) {
+                throw std::invalid_argument("Duplicate HTTP field");
+            }
         } else {
             for (auto previous = first_field; previous < position;) {
                 const auto previous_colon = text.find(':', previous);
@@ -293,31 +334,124 @@ inline WorkloadResponseHead parse_workload_response_head(std::string_view text) 
         }
         ++field_count;
 
-        // Borrow trimmed values only for framing fields; other values need no inspection.
-        const auto trim_view = [](std::string_view value) {
-            const auto first = value.find_first_not_of(" \t");
-            return first == std::string_view::npos
-                       ? std::string_view{}
-                       : value.substr(first, value.find_last_not_of(" \t") - first + 1);
-        };
+        visitor(name, line.substr(colon + 1));
+        position = end + 2;
+    }
+    return first;
+}
+
+// Parse a complete workload response without heap allocations on the successful path.
+// Preserve bounded framing and duplicate rejection; ignore values unrelated to framing.
+inline WorkloadResponseHead parse_workload_response_head(std::string_view text) {
+    WorkloadResponseHead head;
+    head.first = visit_http_fields(text, [&](std::string_view name, std::string_view value) {
         if (http_equal(name, "content-length")) {
             head.has_length = true;
-            head.length = number(trim_view(line.substr(colon + 1)), max_object_size);
+            head.length = number(trim_http_value(value), max_object_size);
         } else if (http_equal(name, "transfer-encoding")) {
             throw std::invalid_argument("Transfer-Encoding is not supported");
         } else if (http_equal(name, "connection")) {
-            auto tokens = line.substr(colon + 1);
+            auto tokens = value;
             while (!tokens.empty()) {
                 const auto comma = tokens.find(',');
-                head.close = head.close || http_equal(trim_view(tokens.substr(0, comma)), "close");
+                head.close =
+                    head.close || http_equal(trim_http_value(tokens.substr(0, comma)), "close");
                 if (comma == std::string_view::npos) {
                     break;
                 }
                 tokens.remove_prefix(comma + 1);
             }
         }
-        position = end + 2;
+    });
+    return head;
+}
+
+// Carry only the request metadata used by shared routing, without owning strings or map nodes.
+// Linux borrows its receive buffer until dispatch finishes; HTTP.sys borrows Request's native
+// storage until completion. Retained control requests must keep their source bytes alive.
+// This value is not independently thread-safe when its backing storage can change.
+struct RequestHead {
+    std::string_view method, path, version;
+    std::optional<std::string_view> host, content_length, connection, transfer_encoding, run_id;
+    std::uint64_t length{};
+    bool close{};
+
+    // Create an empty view for a raw parser or native transport adapter to populate.
+    RequestHead() = default;
+
+    // Borrow an existing owning header for callers that need independent string lifetimes.
+    // The HttpHead must remain alive and unchanged throughout use of the resulting view.
+    RequestHead(const HttpHead& head);
+
+    // Compare parsed metadata independently of where the borrowed bytes are stored.
+    bool operator==(const RequestHead&) const = default;
+};
+
+// Split without copying the path. An invalid line leaves the version empty for Agent's 400 reply.
+inline void set_request_line(RequestHead& head, std::string_view first) {
+    const auto first_space = first.find(' ');
+    const auto last_space = first.rfind(' ');
+    if (first_space == std::string_view::npos || first_space == last_space) {
+        return;
     }
+    head.method = first.substr(0, first_space);
+    head.path = first.substr(first_space + 1, last_space - first_space - 1);
+    head.version = first.substr(last_space + 1);
+}
+
+// Store selected fields in fixed slots. The raw scanner separately checks all ignored names;
+// native adapters must supply only metadata already validated by their HTTP implementation.
+inline void add_request_field(RequestHead& head, std::string_view name, std::string_view value) {
+    std::optional<std::string_view>* destination{};
+    if (http_equal(name, "host")) {
+        destination = &head.host;
+    } else if (http_equal(name, "content-length")) {
+        destination = &head.content_length;
+    } else if (http_equal(name, "connection")) {
+        destination = &head.connection;
+    } else if (http_equal(name, "transfer-encoding")) {
+        destination = &head.transfer_encoding;
+    } else if (http_equal(name, "x-winlin-run")) {
+        destination = &head.run_id;
+    }
+    if (destination) {
+        if (destination->has_value()) {
+            throw std::invalid_argument("Duplicate HTTP field");
+        }
+        *destination = trim_http_value(value);
+    }
+}
+
+// Preserve the generic request parser's framing rules, including absent versus empty fields
+// and its whole-value Connection: close comparison rather than the client's response token list.
+inline void finish_request_head(RequestHead& head) {
+    if (head.transfer_encoding) {
+        throw std::invalid_argument("Transfer-Encoding is not supported");
+    }
+    if (head.content_length) {
+        head.length = number(*head.content_length, max_object_size);
+    }
+    head.close = head.connection && http_equal(*head.connection, "close");
+}
+
+// Adapt an owning header without extending its lifetime or copying request fields.
+inline RequestHead::RequestHead(const HttpHead& head) : length(head.length), close(head.close) {
+    set_request_line(*this, head.first);
+    for (const auto& [name, value] : head.fields) {
+        add_request_field(*this, name, value);
+    }
+}
+
+// Parse arbitrary supported request headers while borrowing their bytes. Duplicate unknown
+// fields and malformed names are rejected too; the fixed slots are not a limit on field count.
+inline RequestHead parse_request_head(std::string_view text) {
+    RequestHead head;
+    const auto first =
+        visit_http_fields<true>(text, [&](std::string_view name, std::string_view value) {
+            add_request_field(head, name, value);
+        });
+    set_request_line(head, first);
+    finish_request_head(head);
     return head;
 }
 

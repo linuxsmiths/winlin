@@ -384,6 +384,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert repetition["errors"] == 0
                 assert repetition["latency"]["samples"] == 100
                 assert repetition["get_completed"] == repetition["put_completed"] == 50
+                assert repetition["received_object_bytes"] == 50 * 512
+                assert repetition["sent_object_bytes"] == 50 * 256
                 cpu = repetition["server_host"]
                 if cpu["reference_cycles"] is None:
                     assert repetition["server_reference_cycles_per_io"] is None

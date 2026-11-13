@@ -297,7 +297,9 @@ struct Request {
     std::array<char, 16384> body_buffer{};
     HTTP_REQUEST_ID id{};
     AgentReply reply;
-    HttpHead parsed_head;
+    // These views borrow storage, never body_buffer; neither receive storage nor its pointers
+    // change while this Request advances through body reads and response completion.
+    RequestHead parsed_head;
     ConnectionInfo connection;
     std::string control_body;
     std::size_t remaining{};

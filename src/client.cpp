@@ -311,6 +311,21 @@ struct Stats {
     }
 };
 
+// Own the two immutable wire headers shared by every connection in one trial. Construction
+// happens before worker startup; the trial retains them until all workers and TLS retries end.
+struct LoadHeaders {
+    std::string get, put;
+
+    // Build both methods from fixed trial settings and the active workload lease, not per I/O.
+    LoadHeaders(const Target& target, const RunConfig& config) {
+        const auto fields = " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
+                            (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
+                            "\r\nContent-Length: ";
+        get = "GET /v1/object?size=" + std::to_string(config.get_size) + fields + "0\r\n\r\n";
+        put = "PUT /v1/object" + fields + std::to_string(config.put_size) + "\r\n\r\n";
+    }
+};
+
 // LoadConnection represents one persistent benchmark connection to the server.
 // It owns the socket, runs as many requests (GET or PUT) as assigned to it and tracks one
 // GET or PUT request at a time. It is a non-blocking state machine that can be multiplexed
@@ -333,8 +348,8 @@ struct LoadConnection {
         read_body
     } state{State::handshake};
     bool alive{true}, get{};
-    // header: outgoing GET/PUT request header
-    std::string header;
+    // Borrow the selected immutable trial header, including through partial writes/TLS retries.
+    std::string_view header;
     // buffer: accumulate response headers directly, then reuse it to discard response body bytes
     std::array<char, max_header_size> buffer{};
     // offset tracks the number of bytes sent in the request header or body
@@ -361,16 +376,12 @@ struct LoadConnection {
     // Start the LoadConnection.
     // Select methods from a global issued-request ticket so mixed ratios do not depend on which
     // method completes faster. In each complete group of 100 tickets the requested ratio is exact.
-    void begin(const Target& target, const RunConfig& config, std::uint64_t index) {
+    void begin(const LoadHeaders& headers, const RunConfig& config, std::uint64_t index) {
         // Which method to issue: GET, PUT, on this connection.
         get = config.method == "get" ||
               (config.method == "mixed" &&
                ((index % 100) * config.get_percent) % 100 < config.get_percent);
-        const auto path = get ? "/v1/object?size=" + std::to_string(config.get_size) : "/v1/object";
-        header = std::string(get ? "GET " : "PUT ") + path + " HTTP/1.1\r\nHost: " + target.host +
-                 ":" + target.port +
-                 (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
-                 "\r\nContent-Length: " + std::to_string(get ? 0 : config.put_size) + "\r\n\r\n";
+        header = get ? headers.get : headers.put;
         offset = 0;
         header_received = 0;
         header_search = 0;
@@ -573,6 +584,7 @@ class LoadWorker {
     const Target& target_;
     const RunConfig& config_;
     const std::vector<char>& payload_;
+    const LoadHeaders& headers_;
     Epoll poller_;
     // All the LoadConnection instances managed by this LoadWorker.
     // connections_ maps each connection's socket fd to its LoadConnection instance.
@@ -584,8 +596,10 @@ public:
     // config: RunConfig details (method, sizes, counts, timeouts) for this worker's requests.
     // payload: PUT request body to send for each PUT request. Must be at least config.put_size
     //          bytes.
-    LoadWorker(const Target& target, const RunConfig& config, const std::vector<char>& payload)
-        : target_(target), config_(config), payload_(payload) {
+    // headers: Immutable trial headers, kept alive with target, config and payload until join.
+    LoadWorker(const Target& target, const RunConfig& config, const std::vector<char>& payload,
+               const LoadHeaders& headers)
+        : target_(target), config_(config), payload_(payload), headers_(headers) {
     }
 
     // Complete and pin every handshake before warmup, keeping connection setup out of measured
@@ -658,7 +672,7 @@ public:
             // Start the request on this connection, which sets its state to send_head and begins
             // the request. The connection will then be driven by pump() until it is idle again
             // and ready for another request.
-            connection.begin(target_, config_, ticket);
+            connection.begin(headers_, config_, ticket);
             // Enable write notifications for the socket already registered with epoll.
             poller_.set(connection.socket.fd.value, EPOLLOUT);
             return true;
@@ -786,6 +800,7 @@ public:
 Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
            const std::vector<char>& payload, unsigned repetition, const Target& control_target,
            const std::string& run_id) {
+    const LoadHeaders headers(target, config);
     std::latch setup_done(config.workers), warmup_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};
@@ -812,7 +827,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
                 std::unique_ptr<LoadWorker> worker;
                 try {
                     // One LoadWorker per worker thread
-                    worker = std::make_unique<LoadWorker>(target, config, payload);
+                    worker = std::make_unique<LoadWorker>(target, config, payload, headers);
                     // setup() opens and handshakes the worker's share of connections
                     worker->setup(ctx, config.connections / config.workers +
                                            (index < config.connections % config.workers ? 1 : 0));

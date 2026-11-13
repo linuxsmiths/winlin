@@ -29,14 +29,15 @@ void test_request_headers() {
 
     const auto adapted = request_head(request);
     const auto parsed =
-        parse_head("PUT /v1/object HTTP/1.1\r\nHost: localhost\r\nContent-Length: 256\r\n"
-                   "Connection: CLOSE\r\nX-Winlin-Run: lease\r\n\r\n");
-    require(adapted.first == parsed.first && adapted.fields == parsed.fields &&
-                adapted.length == parsed.length && adapted.close == parsed.close,
-            "Native metadata must preserve shared normalization and framing");
-    path[0] = 'x';
-    require(adapted.first == parsed.first, "Adapted fields must own their receive-storage data");
-    path[0] = '/';
+        parse_request_head("PUT /v1/object HTTP/1.1\r\nHost: localhost\r\nContent-Length: 256\r\n"
+                           "Connection: CLOSE\r\nX-Winlin-Run: lease\r\n\r\n");
+    require(adapted == parsed, "Native metadata must preserve shared normalization and framing");
+    require(adapted.path.data() == path.data() && adapted.run_id->data() == lease.pRawValue + 1,
+            "Adapted fields must borrow the retained native storage without copying");
+    request.Version = HTTP_VERSION{2, 0};
+    require(request_head(request).version != "HTTP/1.1",
+            "Native HTTP versions must not be silently substituted");
+    request.Version = HTTP_VERSION{1, 1};
 
     // Native metadata must not bypass rejection of duplicate leases, transfer encodings,
     // malformed lengths, or the adapter's existing selected-header size limit.

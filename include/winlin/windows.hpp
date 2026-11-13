@@ -25,8 +25,9 @@ inline std::runtime_error windows_error(std::string message, DWORD code = GetLas
 // Adapt HTTP.sys's parsed request directly to the shared Agent header representation.
 // Retain the same selected fields, header-size bound, normalization, and framing validation as
 // the previous serialized-header path, without building and parsing a second HTTP message.
-// Returned strings own their contents and remain valid after the native receive storage changes.
-inline HttpHead request_head(const HTTP_REQUEST& request) {
+// Views borrow native receive storage, which Request retains unchanged through asynchronous body
+// reads and response completion. Callers must not reuse or release it while these views are used.
+inline RequestHead request_head(const HTTP_REQUEST& request) {
     std::string_view method;
     switch (request.Verb) {
     case HttpVerbGET:
@@ -42,14 +43,17 @@ inline HttpHead request_head(const HTTP_REQUEST& request) {
         method = "UNSUPPORTED";
         break;
     }
-    HttpHead head;
-    head.first = std::string(method) + " " + std::string(request.pRawUrl, request.RawUrlLength) +
-                 " HTTP/" + std::to_string(request.Version.MajorVersion) + "." +
-                 std::to_string(request.Version.MinorVersion);
+    RequestHead head;
+    head.method = method;
+    head.path = {request.pRawUrl, request.RawUrlLength};
+    head.version =
+        request.Version.MajorVersion == 1 && request.Version.MinorVersion == 1 ? "HTTP/1.1" : "";
 
     // Account for the request-line CRLF and final blank line, then each selected field's
     // serialized size. This preserves the old adapter's bound without allocating that text.
-    std::size_t header_size = head.first.size() + 4;
+    std::size_t header_size = method.size() + 1 + head.path.size() + 6 +
+                              std::to_string(request.Version.MajorVersion).size() + 1 +
+                              std::to_string(request.Version.MinorVersion).size() + 4;
     if (header_size > max_header_size) {
         throw std::invalid_argument("Invalid HTTP header");
     }
@@ -58,7 +62,7 @@ inline HttpHead request_head(const HTTP_REQUEST& request) {
         if (header_size > max_header_size) {
             throw std::invalid_argument("Invalid HTTP header");
         }
-        add_http_field(head, name, value);
+        add_request_field(head, name, value);
     };
     const std::array<std::pair<HTTP_HEADER_ID, std::string_view>, 4> names{
         {{HttpHeaderHost, "Host"},
@@ -80,7 +84,7 @@ inline HttpHead request_head(const HTTP_REQUEST& request) {
             add_field("X-Winlin-Run", {field.pRawValue, field.RawValueLength});
         }
     }
-    finish_http_head(head);
+    finish_request_head(head);
     return head;
 }
 
