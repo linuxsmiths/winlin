@@ -123,6 +123,9 @@ struct Session {
         send_header,
         send_body
     } state{State::handshake};
+    // Track the mask actually installed in epoll, separately from the next wait in socket.want.
+    // Accepted sockets start with EPOLLIN; update this cache only after a successful modification.
+    std::uint32_t registered_events{EPOLLIN};
     std::string output, text_body;
     // Read headers directly into reusable storage. The unread range may also contain a body
     // or a subsequent request, so consuming bytes advances an offset rather than shifting them.
@@ -453,7 +456,7 @@ accept_connections(Server& server, int listener_fd, Epoll& poller,
             auto* session_ptr = session.get();
             sessions.emplace(client_fd, std::move(session));
             // Return the stable heap address directly with readiness events.
-            poller.set(client_fd, EPOLLIN, session_ptr, true);
+            poller.set(client_fd, session_ptr->registered_events, session_ptr, true);
             ++server.connections;
         } catch (...) {
             // Undo the reserved slot if construction failed. If a Session was inserted,
@@ -523,9 +526,11 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                 if (!session->pump()) {
                     // Only connection teardown needs the map lookup, not normal I/O events.
                     sessions.erase(fd);
-                } else {
-                    // EPOLL_CTL_MOD replaces event data too, so preserve the Session pointer.
+                } else if (session->socket.want != session->registered_events) {
+                    // Level-triggered registrations stay armed: avoid a syscall when the mask
+                    // is unchanged. Preserve the Session pointer and cache only a successful MOD.
                     poller.set(fd, session->socket.want, session);
+                    session->registered_events = session->socket.want;
                 }
             } catch (const PeerClosed& error) {
                 if (session->state == Session::State::header && !session->pending_input().empty()) {

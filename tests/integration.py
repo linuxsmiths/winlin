@@ -148,6 +148,19 @@ def exercise_session_events(lease):
             for data in connections:
                 response = data.connection.getresponse()
                 assert response.status == 200 and len(response.read()) == 256
+
+        # A slow reader makes the server yield or wait for writability. After draining the large
+        # response, another request must still arrive through the restored read subscription.
+        data = connections[0]
+        data.connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        data.connection.request(
+            "GET", "/v1/object?size=8388608", headers={"X-Winlin-Run": lease["run_id"]},
+        )
+        time.sleep(.1)
+        response = data.connection.getresponse()
+        assert response.status == 200 and len(response.read()) == 8388608
+        status, payload = data.request("GET", "/v1/object?size=256")
+        assert status == 200 and len(payload) == 256
     finally:
         for data in connections:
             data.connection.close()
