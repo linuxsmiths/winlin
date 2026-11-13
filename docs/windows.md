@@ -125,9 +125,9 @@ changes firewall/Schannel policies.
 Use `-BuildDirectory PATH`, `-Configuration Debug`, and `-StateDirectory PATH`
 for nondefault layouts; supplied relative paths use your current PowerShell
 directory. `-ServerExe PATH` selects a binary directly, including single-config
-CMake builds. Startup `-Workers`
-configures control only; workload workers and cipher come
-from each remote start request. `-Help` lists options
+CMake builds. Control always runs one worker; workload workers and cipher come
+from each remote start request. Startup `-Workers`/`--workers` is no longer supported.
+Use the client's `--server-workers` for workload sizing. `-Help` lists options
 without requiring a build or provisioned endpoint. Direct native executable
 invocations remain supported.
 

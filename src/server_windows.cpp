@@ -173,10 +173,8 @@ struct UrlGroup {
 // Describe the permanent HTTP control endpoint and the native Windows workload backends.
 // HTTP.sys/Schannel handles connections and TLS outside this application, so unavailable connection
 // metrics stay unavailable and process CPU telemetry must not be mistaken for whole-server cost.
-AgentConfig windows_config(const Args& args) {
-    auto config = AgentConfig::from_args(args, "httpsys");
-    config.tls = false;
-    config.role = AgentConfig::Role::control;
+AgentConfig windows_config() {
+    auto config = AgentConfig::control_config("httpsys");
     config.benchmark_tls_modes = {"on", "off"};
     config.supported_backends = {
         {{"name", "httpsys"}, {"transport", "http"}, {"tls_mode", "off"}},
@@ -406,7 +404,7 @@ struct Runtime {
 
     // Create the control endpoint from local settings. It has no synthetic GET payload.
     explicit Runtime(const Args& args)
-        : agent(windows_config(args), usage, {}, host_usage), stop_file(args.get("--stop-file")),
+        : agent(windows_config(), usage, {}, host_usage), stop_file(args.get("--stop-file")),
           address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "38443"), 65535))) {
         initialize();
@@ -965,10 +963,10 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
         std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
-                     "  [--workers 8]\n"
                      "  [--stop-file path]\n"
                      "Control uses plain HTTP; per-run workload TLS/cipher/workers are controlled "
                      "remotely.\n"
+                     "Control runs one worker; workloads start only on client request.\n"
                      "Configure the HTTP.sys certificate bindings and URL ACLs using "
                      "scripts/setup-server.ps1 first.\n";
         return 0;
@@ -984,7 +982,7 @@ int wmain(int argc, wchar_t** argv) {
             arguments.push_back(value.data());
         }
         Args args(argc, arguments.data());
-        args.allow({"--bind", "--port", "--workers", "--stop-file", "--http-port", "--https-port"});
+        args.allow({"--bind", "--port", "--stop-file", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port =
             static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));
@@ -997,7 +995,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         ServerGuard instance_guard;
         reference_clock();
-        const auto host_config = windows_config(args);
+        const auto host_config = windows_config();
         const auto address = args.get("--bind", "127.0.0.1");
         BenchmarkController controller(
             issue_run_id, [&](const BenchmarkOptions& options, const std::string& run_id) {

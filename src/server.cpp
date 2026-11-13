@@ -20,9 +20,8 @@ void on_signal(int) {
 // Describe the permanent plain-HTTP control endpoint and the workload backends this host supports.
 // Advertising kTLS does not guarantee activation: each workload connection must verify the
 // requested direction after its TLS handshake.
-AgentConfig linux_config(const Args& args) {
-    auto config = AgentConfig::from_args(args, "http");
-    config.tls = false;
+AgentConfig linux_config() {
+    auto config = AgentConfig::control_config("http");
     config.benchmark_tls_modes = {"on", "off", "ktls"};
     config.supported_ciphers = supported_tls_ciphers();
     config.supported_backends = {
@@ -39,10 +38,10 @@ AgentConfig linux_config(const Args& args) {
 }
 
 // Build the temporary workload's configuration from the settings selected by the client.
-// The control endpoint keeps its original workers and plain-HTTP transport. A kTLS workload still
+// The control endpoint keeps its single worker and plain-HTTP transport. A kTLS workload still
 // uses OpenSSL for the handshake, but requests kernel TLS record processing afterward.
-AgentConfig workload_config(const Args& args, const BenchmarkOptions& options) {
-    auto config = linux_config(args);
+AgentConfig workload_config(const BenchmarkOptions& options) {
+    auto config = linux_config();
     config.role = AgentConfig::Role::workload;
     config.tls = options.tls != "off";
     config.backend = options.tls == "off"    ? "http"
@@ -71,8 +70,7 @@ struct Server : Agent {
     // workload backend, loading a matching certificate/key only when HTTPS was requested.
     Server(const Args& args, const BenchmarkOptions* options = nullptr,
            const std::string& run_id = {})
-        : Agent(options ? workload_config(args, *options) : linux_config(args), usage, run_id,
-                host_usage),
+        : Agent(options ? workload_config(*options) : linux_config(), usage, run_id, host_usage),
           tls(options && options->tls != "off"
                   ? context(true, options->cipher, options->tls == "ktls")
                   : Context(nullptr, SSL_CTX_free)),
@@ -555,9 +553,10 @@ int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout << "winlin-server [--cert certificate.pem --key private.key]\n"
-                     "  [--bind 0.0.0.0] [--port 38443] [--workers 8]\n"
+                     "  [--bind 0.0.0.0] [--port 38443]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
                      "  Control uses plain HTTP; certificate/key apply only to HTTPS workloads.\n"
+                     "  Control runs one worker; no workload listeners start until a client run.\n"
                      "  Benchmark workers/TLS/kTLS/cipher are selected by the client per run.\n";
         return 0;
     }
@@ -566,8 +565,7 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
-        args.allow(
-            {"--cert", "--key", "--bind", "--port", "--workers", "--http-port", "--https-port"});
+        args.allow({"--cert", "--key", "--bind", "--port", "--http-port", "--https-port"});
         const auto control_port = number(args.get("--port", "38443"), 65535);
         const auto http_port = number(args.get("--http-port", "38444"), 65535);
         const auto https_port = number(args.get("--https-port", "38445"), 65535);

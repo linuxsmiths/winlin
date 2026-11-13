@@ -56,7 +56,7 @@ For example:
 
 ```sh
 ./scripts/run-server.sh --build-dir build-server --state-dir /private/winlin \
-  --bind 10.0.0.4 --workers 8
+  --bind 10.0.0.4
 ```
 
 Default directories are repository-relative; supplied relative paths use your
@@ -96,8 +96,10 @@ requests receive HTTP 409. The client stops the workload after completion or a
 caught failure; an abandoned workload expires after its bounded lease. Run IDs
 are managed automatically and omitted from results. Plain HTTP
 provides no data confidentiality; use synthetic traffic on an isolated network.
-Server startup `--workers` configures control workers only; workload workers and
-cipher are selected separately by the client. There is no control cipher option.
+Control always runs one worker. Workload listeners and client-selected workers start
+only when a run is requested and are destroyed when it ends. Startup `--workers`
+is no longer supported; use the client's `--server-workers` for workload sizing.
+There is no control cipher option.
 
 After upgrading from TLS control, rebuild and restart both client and server.
 Port 38443 is unchanged; old target files remain readable and their obsolete

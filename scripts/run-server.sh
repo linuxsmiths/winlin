@@ -9,6 +9,7 @@ Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
 HTTP control listens on 0.0.0.0:38443 unless --bind/--port overrides it.
 Clients select per-run server workers, TLS on/off/kTLS, and cipher.
+Control always runs one worker; workload listeners start only on client request.
 The implementation connection ceiling is 65536 per endpoint; it is not configurable.
 Workload data defaults to HTTP port 38444 or HTTPS port 38445; host overrides:
 --http-port PORT and --https-port PORT. No server restart is needed between modes.
@@ -20,7 +21,7 @@ Use -- --help for the native server's help, without requiring state files.
 
 Examples:
   scripts/run-server.sh
-  scripts/run-server.sh --bind 10.0.0.4 --workers 8
+  scripts/run-server.sh --bind 10.0.0.4
   scripts/run-server.sh --state-dir /private/endpoint --http-port 39000 --https-port 39001
 
 The bundled identity provides no trustworthy server authentication.

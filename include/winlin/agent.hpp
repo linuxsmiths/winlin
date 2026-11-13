@@ -30,16 +30,14 @@ struct AgentConfig {
         "kernel_profiles", "network_counters", "numa_topology"};
     std::string process_cpu_scope{"server process only"};
 
-    static AgentConfig from_args(const Args& args, std::string backend) {
+    // Start only a single plain-HTTP control worker. Workload adapters replace the worker count
+    // with the client's per-run selection when constructing a separate workload endpoint.
+    static AgentConfig control_config(std::string backend) {
         AgentConfig result;
         result.backend = std::move(backend);
-        result.workers = static_cast<unsigned>(number(
-            args.get("--workers", std::to_string(std::min(
-                                      8u, std::max(1u, std::thread::hardware_concurrency())))),
-            256));
-        if (!result.workers) {
-            throw std::invalid_argument("Worker count must be positive");
-        }
+        result.role = Role::control;
+        result.tls = false;
+        result.workers = 1;
         return result;
     }
 };

@@ -37,7 +37,7 @@ class Controller:
         arguments = [
             str(ROOT / "scripts/run-server.sh"), "--build-dir", str(Path(SERVER).parent),
             "--state-dir", str(directory), "--port", "0", "--http-port", "0",
-            "--https-port", "0", "--workers", "2", *extra,
+            "--https-port", "0", *extra,
         ]
         if bind is not None:
             arguments += ["--bind", bind]
@@ -49,6 +49,7 @@ class Controller:
             line = self.process.stdout.readline()
             assert line, self.process.stderr.read()
             self.ready = json.loads(line)
+            assert self.ready["workers"] == 1, self.ready
             self.port = self.ready["port"]
         except BaseException:
             self.stop()
@@ -64,6 +65,24 @@ class Controller:
             self.process.communicate()
             raise AssertionError("Controller or workload workers failed to stop")
         assert self.process.returncode == 0, stderr
+
+    def listening_ports(self):
+        """Inspect this test-owned process's listeners, not other servers in its network namespace."""
+        socket_inodes = set()
+        for descriptor in Path(f"/proc/{self.process.pid}/fd").iterdir():
+            try:
+                target = str(descriptor.readlink())
+            except FileNotFoundError:
+                # A completed control connection can close between listing and reading its fd.
+                continue
+            if target.startswith("socket:["):
+                socket_inodes.add(target[8:-1])
+        ports = []
+        for line in Path(f"/proc/{self.process.pid}/net/tcp").read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[3] == "0A" and fields[9] in socket_inodes:
+                ports.append(int(fields[1].split(":")[1], 16))
+        return sorted(ports)
 
     def request(self, method, path, body=None, host="127.0.0.1"):
         connection = http.client.HTTPConnection(host, self.port, timeout=10)
@@ -114,6 +133,10 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     try:
         assert controller.ready["bind"] == "0.0.0.0"
         assert controller.ready["backend"] == "http"
+        # Startup owns only the exclusive guard and one control listener, not a workload pool.
+        assert controller.listening_ports() == sorted([8444, controller.port])
+        rejected = command(SERVER, "--workers", "8", expected=1)
+        assert "Unknown option: --workers" in rejected.stderr
         assert controller.request("GET", "/v1/capabilities", host="127.0.0.2")[0] == 200
         status, capabilities = controller.request("GET", "/v1/capabilities")
         assert status == 200
@@ -183,6 +206,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
 
         lease = controller.start(tls="off", workers=3)
         assert lease["transport"] == "http"
+        # The requested workload pool is separate; control stays at one listener during the run.
+        assert controller.listening_ports() == sorted([8444, controller.port] + [lease["port"]] * 3)
         assert controller.request("POST", "/v1/benchmark/start", "{}")[0] == 409
         assert controller.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
         data = Workload(lease)

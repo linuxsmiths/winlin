@@ -29,7 +29,7 @@ class Agent:
         arguments = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(LAUNCHER),
             "-ServerExe", SERVER, "-Port", str(PORT), "-HttpPort", str(HTTP_PORT),
-            "-HttpsPort", str(HTTPS_PORT), "-Workers", "2",
+            "-HttpsPort", str(HTTPS_PORT),
             "-StopFile", STOP_FILE,
         ]
         self.process = subprocess.Popen(
@@ -43,7 +43,9 @@ class Agent:
             line = lines.get(timeout=15)
             if not line:
                 raise AssertionError(f"Server failed: {self.process.stderr.read()}")
-            assert json.loads(line)["backend"] == "httpsys"
+            ready = json.loads(line)
+            assert ready["backend"] == "httpsys"
+            assert ready["workers"] == 1, ready
             self.connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
         except BaseException:
             self.stop()

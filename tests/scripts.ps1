@@ -111,13 +111,13 @@ exit 0
 
     $result = Invoke-LauncherFixture -Arguments @(
         '-ServerExe', $fakeServer, '-StateDirectory', $state, '-BindAddress', '10.0.0.4',
-        '-Port', '9443', '-HttpPort', '9444', '-HttpsPort', '9445', '-Workers', '3',
+        '-Port', '9443', '-HttpPort', '9444', '-HttpsPort', '9445',
         '-StopFile', 'stop with spaces'
     )
     if ($result.ExitCode -ne 0) { throw "Launcher fixture failed: $($result.Output)" }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
     $expected = @(
-        '--bind', '10.0.0.4', '--port', '9443', '--http-port', '9444', '--https-port', '9445', '--workers', '3',
+        '--bind', '10.0.0.4', '--port', '9443', '--http-port', '9444', '--https-port', '9445',
         '--stop-file', 'stop with spaces'
     )
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
@@ -137,6 +137,14 @@ exit 0
         '--http-port', '38444', '--https-port', '38445')
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
         throw "Default launcher endpoints changed unexpectedly: $arguments"
+    }
+
+    # Worker counts belong to client start requests, not server startup configuration.
+    $result = Invoke-LauncherFixture -Arguments @(
+        '-ServerExe', $fakeServer, '-Workers', '3'
+    )
+    if ($result.ExitCode -eq 0 -or ($result.Output -join "`n") -notmatch 'Workers') {
+        throw "Launcher accepted the removed startup worker option: $($result.Output)"
     }
 
     $result = Invoke-LauncherFixture -Arguments @(
