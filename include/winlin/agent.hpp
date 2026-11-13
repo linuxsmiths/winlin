@@ -167,7 +167,10 @@ public:
             }
             const auto method = head.first.substr(0, first_space);
             const auto path = head.first.substr(first_space + 1, last_space - first_space - 1);
+            // Dummy benchmark object, GET or PUT
             const bool object = path.starts_with("/v1/object");
+            // Reject object requests to the control endpoint and control requests to the
+            // workload endpoint.
             if ((config.role == AgentConfig::Role::control && object) ||
                 (config.role == AgentConfig::Role::workload && !object)) {
                 return AgentReply::error(404, "Use the advertised control or workload endpoint");
@@ -181,9 +184,14 @@ public:
             AgentReply reply;
             reply.close = head.close;
             if (controller && method == "POST" && path == "/v1/benchmark/start") {
+                // "/v1/benchmark/start" must carry a JSON body describing the benchmark settings.
+                // Bound it to 64 KiB to limit memory use and JSON parsing work.
                 if (!head.length || head.length > 65536) {
                     return AgentReply::error(400, "Expected bounded JSON benchmark settings");
                 }
+
+                // The body has not yet been supplied to this handler. Ask the transport to
+                // collect the declared body and call request() again with the complete JSON.
                 if (body.empty()) {
                     reply.kind = AgentReply::Kind::consume_control;
                     reply.size = head.length;
@@ -192,6 +200,9 @@ public:
                 if (body.size() != head.length) {
                     return AgentReply::error(400, "Incomplete benchmark settings");
                 }
+                // Ok, full body received, parse and dispatch to the controller.
+                // The controller may throw a BenchmarkError if the settings are invalid
+                // or the benchmark cannot be started.
                 reply.text = controller->start(Json::parse(body)).dump();
             } else if (controller && method == "GET" &&
                        path.starts_with("/v1/benchmark/telemetry?run_id=") && !head.length) {
@@ -204,9 +215,11 @@ public:
             } else if (method == "GET" && path == "/v1/telemetry" && !head.length) {
                 reply.text = telemetry().dump();
             } else if (method == "GET" && path.starts_with("/v1/object?size=") && !head.length) {
+                // GET benchmark object of the requested size, bounded to max_object_size.
                 if (config.backend == "openssl-ktls" && !connection.ktls_tx) {
                     return AgentReply::error(501, "kTLS TX is not active; refusing fallback");
                 }
+                // Client expects a raw object
                 reply.kind = AgentReply::Kind::object;
                 reply.size = static_cast<std::size_t>(
                     number(std::string_view(path).substr(16), max_object_size));
@@ -215,6 +228,8 @@ public:
                 if (config.backend == "openssl-ktls" && !connection.ktls_rx) {
                     return AgentReply::error(501, "kTLS RX is not active; refusing fallback");
                 }
+                // PUT benchmark object, bounded to max_object_size.
+                // We must consume the body before replying.
                 reply.kind = AgentReply::Kind::consume_put;
                 reply.size = head.length;
             } else {

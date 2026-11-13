@@ -176,6 +176,7 @@ inline void finish_http_head(HttpHead& head) {
 // Parse one complete, bounded header. Duplicate fields and chunked framing are deliberately
 // rejected so the two native server stacks cannot disagree about request-body boundaries.
 inline HttpHead parse_head(std::string_view text) {
+    // Caller ensures that text ends with "\r\n\r\n"
     if (text.size() > max_header_size || !text.ends_with("\r\n\r\n")) {
         throw std::invalid_argument("Invalid HTTP header");
     }

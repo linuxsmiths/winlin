@@ -107,6 +107,13 @@ struct Server : Agent {
 struct Session {
     StreamSocket socket;
     Server& server;
+    // Each connection completes the handshake once before processing requests. Successful requests
+    // follow these paths; persistent connections then return to header processing:
+    //
+    // Benchmark start: header -> control_body -> send_header -> send_body -> header -> ...
+    // Other control: header -> send_header -> send_body -> header -> ...
+    // Benchmark GET: header -> send_header -> send_body -> header -> ...
+    // Benchmark PUT: header -> body -> send_header -> send_body (empty) -> header -> ...
     enum class State {
         handshake,
         header,
@@ -176,16 +183,22 @@ struct Session {
                                         rx};
         const auto reply = server.Agent::request(head, connection);
         close = reply.close;
+        // GET benchmark object
         get = reply.kind == AgentReply::Kind::object;
+        // PUT benchmark object
         put = reply.kind == AgentReply::Kind::consume_put;
         if (reply.kind == AgentReply::Kind::consume_control) {
+            // The benchmark-start header has been parsed. Collect the complete settings JSON
+            // before dispatching again; some body bytes may already be in the receive buffer.
             control_head = head;
             // Control JSON is bounded by Agent. Allocate its final size once so missing body
             // bytes can be read directly into it, rather than copied through the header buffer.
             control_body.resize(reply.size);
             body_remaining = reply.size;
+            // Subsequent control-body steps consume buffered bytes and read any missing bytes.
             state = State::control_body;
         } else if (put) {
+            // Subsequent body steps discard buffered bytes and read any missing bytes.
             body_size = body_remaining = reply.size;
             state = State::body;
         } else {
@@ -217,17 +230,21 @@ struct Session {
                 if (rx) {
                     ++server.rx_ktls;
                 }
+                // After handshake, the next step is always reading a request header.
                 state = State::header;
             } else if (state == State::header) {
                 const auto input = pending_input();
                 const auto end = find_http_header_end(input, header_search);
                 if (end != std::string::npos) {
+                    // Header fully received
                     // Clear accounting before parsing: parser failures bypass shared dispatch.
                     get = put = false;
                     try {
                         const auto head = parse_head(input.substr(0, end + 4));
                         consume_input(end + 4);
+                        // Reset the search offset for the next header
                         header_search = 0;
+                        // Process the request
                         request(head);
                     } catch (const std::invalid_argument& error) {
                         log_warning(std::string("Rejected malformed HTTP header: ") + error.what());
@@ -334,6 +351,7 @@ struct Session {
             }
             activity = Clock::now();
         }
+
         // The work budget ended without an operation reporting a wait. Either readiness event
         // schedules another pump() call after this worker has had a chance to serve other sessions.
         socket.want = EPOLLIN | EPOLLOUT;
