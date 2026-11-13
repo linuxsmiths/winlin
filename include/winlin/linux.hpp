@@ -255,7 +255,11 @@ struct StreamSocket {
         }
         // TLS client or server, SSL_accept() or SSL_connect() may require multiple calls,
         // as socket becomes readable/writable.
-        ERR_clear_error();
+        // SSL_get_error() requires an empty thread-local queue before the operation. Peeking
+        // avoids clearing every error slot when the queue is already empty, as it normally is.
+        if (ERR_peek_error() != 0) {
+            ERR_clear_error();
+        }
         errno = 0;
         return outcome(server ? SSL_accept(ssl.get()) : SSL_connect(ssl.get()));
     }
@@ -265,7 +269,9 @@ struct StreamSocket {
             return plain_result(::recv(fd.value, buffer, std::min<std::size_t>(length, 16384), 0),
                                 EPOLLIN);
         }
-        ERR_clear_error();
+        if (ERR_peek_error() != 0) {
+            ERR_clear_error();
+        }
         errno = 0;
         const int result =
             SSL_read(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
@@ -278,7 +284,9 @@ struct StreamSocket {
                 ::send(fd.value, buffer, std::min<std::size_t>(length, 16384), MSG_NOSIGNAL),
                 EPOLLOUT);
         }
-        ERR_clear_error();
+        if (ERR_peek_error() != 0) {
+            ERR_clear_error();
+        }
         errno = 0;
         const int result =
             SSL_write(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
