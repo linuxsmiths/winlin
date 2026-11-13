@@ -793,8 +793,8 @@ void Request::send() {
         reply.kind == AgentReply::Kind::object ? "application/octet-stream" : "application/json";
     field(HttpHeaderContentType, content_type, std::strlen(content_type));
     field(HttpHeaderCacheControl, "no-store", 8);
-    const char* connection = reply.close ? "close" : "keep-alive";
-    field(HttpHeaderConnection, connection, std::strlen(connection));
+    const char* connection_header = reply.close ? "close" : "keep-alive";
+    field(HttpHeaderConnection, connection_header, std::strlen(connection_header));
     extra_headers[0] = {16, 1, "X-Winlin-Ktls-Tx", "0"};
     extra_headers[1] = {16, 1, "X-Winlin-Ktls-Rx", "0"};
     extra_headers[0].NameLength = static_cast<USHORT>(std::strlen(extra_headers[0].pName));

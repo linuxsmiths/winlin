@@ -610,7 +610,8 @@ public:
                 const auto base = std::uint64_t{1} << (i / 64);
                 const long double upper =
                     static_cast<long double>(base) * (1 + (i % 64 + 1) / 64.0L);
-                return static_cast<double>(std::min<long double>(upper, maximum_) / 1000);
+                return static_cast<double>(std::min(upper, static_cast<long double>(maximum_)) /
+                                           1000);
             }
         }
         return static_cast<double>(maximum_) / 1000;
