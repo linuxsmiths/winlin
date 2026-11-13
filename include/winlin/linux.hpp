@@ -136,6 +136,7 @@ inline Context context(bool server, const std::string& cipher, bool ktls = false
     return ctx;
 }
 
+// Return the SHA-256 fingerprint of the peer certificate, or throw if no certificate was sent.
 inline std::string fingerprint(SSL* ssl) {
     auto* certificate = SSL_get0_peer_certificate(ssl);
     unsigned char digest[EVP_MAX_MD_SIZE]{};
@@ -168,8 +169,11 @@ public:
 // A zero read/write result means retry with want events, not EOF; terminal TLS errors throw.
 // One worker owns a session, and buffers must remain suitable for OpenSSL's retry requirements.
 struct StreamSocket {
+    // Socket fd
     Fd fd;
+    // TLS session, or nullptr for plaintext TCP
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl{nullptr, SSL_free};
+    // wait_socket() must wait for these events before calling read/write/handshake again.
     std::uint32_t want{EPOLLIN | EPOLLOUT};
 
     StreamSocket(int socket, SSL_CTX* ctx)
@@ -201,6 +205,8 @@ struct StreamSocket {
             (error == SSL_ERROR_SYSCALL && result == 0 && socket_error == 0)) {
             throw PeerClosed();
         }
+        // SSL_ERROR_WANT_READ -> wait for EPOLLIN
+        // SSL_ERROR_WANT_WRITE -> wait for EPOLLOUT.
         if (error == SSL_ERROR_WANT_READ) {
             want = EPOLLIN;
         } else if (error == SSL_ERROR_WANT_WRITE) {
@@ -223,17 +229,20 @@ struct StreamSocket {
             if (server) {
                 return true;
             }
+            // Plain TCP client, wait for POLLOUT.
             pollfd ready{fd.value, POLLOUT, 0};
             const auto result = poll(&ready, 1, 0);
             if (result < 0 && errno != EINTR) {
                 throw system_error("poll TCP connection");
             }
             if (result <= 0) {
+                // Not connected yet, wait_socket() must wait for EPOLLOUT
                 want = EPOLLOUT;
                 return false;
             }
             int error{};
             socklen_t size = sizeof(error);
+            // Connect failure will set socket error
             if (getsockopt(fd.value, SOL_SOCKET, SO_ERROR, &error, &size)) {
                 throw system_error("Inspect TCP connection");
             }
@@ -241,8 +250,11 @@ struct StreamSocket {
                 errno = error;
                 throw system_error("TCP connection");
             }
+            // Connected w/o error
             return true;
         }
+        // TLS client or server, SSL_accept() or SSL_connect() may require multiple calls,
+        // as socket becomes readable/writable.
         ERR_clear_error();
         errno = 0;
         return outcome(server ? SSL_accept(ssl.get()) : SSL_connect(ssl.get()));
@@ -348,6 +360,7 @@ inline Fd connect_socket(const std::string& host, const std::string& port) {
 inline void wait_socket(StreamSocket& socket, Clock::time_point deadline) {
     const auto remaining =
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    // Deadline expired?
     if (remaining <= 0) {
         throw std::runtime_error("Connection operation timed out");
     }
@@ -375,6 +388,7 @@ inline std::unique_ptr<StreamSocket> connect_stream(SSL_CTX* ctx, const std::str
     const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
                                              std::chrono::duration<double>(timeout));
     try {
+        // TLS handshake may require multiple SSL_connect calls, as socket becomes writeable.
         while (!socket->handshake(false)) {
             wait_socket(*socket, deadline);
         }
@@ -382,9 +396,11 @@ inline std::unique_ptr<StreamSocket> connect_stream(SSL_CTX* ctx, const std::str
         throw std::runtime_error(std::string(ctx ? "TLS" : "TCP") + " connection to " + host + ":" +
                                  port + " failed: " + error.what());
     }
+    // Verify the server's certificate fingerprint against the pinned SHA-256 digest, if any.
     if (ctx && !pin.empty() && !equal_secret(fingerprint(socket->ssl.get()), pin)) {
         throw std::runtime_error("Server certificate changed; refusing connection");
     }
+    // Return connected socket
     return socket;
 }
 

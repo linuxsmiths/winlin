@@ -86,6 +86,67 @@ int main() {
         rejects([] {
             parse_head("GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n");
         });
+
+        // Workload parsing borrows framing fields without normalizing or copying header strings.
+        const std::string_view response =
+            "HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh:\t256 \r\n"
+            "Server: Microsoft-HTTPAPI/2.0\r\nConnection: Keep-Alive\r\n\r\n";
+        const auto workload_head = parse_workload_response_head(response);
+        check(workload_head.first == "HTTP/1.1 200 OK" && workload_head.has_length &&
+                  workload_head.length == 256 && !workload_head.close,
+              "Workload response framing is case-insensitive and accepts optional whitespace");
+        check(parse_workload_response_head(
+                  "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive, CLOSE\t\r\n\r\n")
+                  .close,
+              "A close token cannot hide in a Connection list");
+        check(!parse_workload_response_head("HTTP/1.1 200 OK\r\nServer: test\r\n\r\n").has_length,
+              "Missing Content-Length remains distinguishable from a zero-length body");
+        for (const auto invalid : {
+                 "HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nX-Field: 1\r\nx-field: 2\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nBad Field: value\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nMissing-colon\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
+             }) {
+            rejects([&] {
+                parse_workload_response_head(invalid);
+            });
+        }
+
+        // The small duplicate-name cache is an optimization, not a new protocol limit.
+        std::string many_fields = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
+        for (unsigned index = 0; index < 20; ++index) {
+            many_fields += "X-Field-" + std::to_string(index) + ": value\r\n";
+        }
+        many_fields += "\r\n";
+        check(parse_workload_response_head(many_fields).has_length,
+              "Large field counts retain allocation-free framing support");
+        many_fields.insert(many_fields.size() - 2, "x-field-19: duplicate\r\n");
+        rejects([&] {
+            parse_workload_response_head(many_fields);
+        });
+        rejects([] {
+            parse_workload_response_head(
+                "HTTP/1.1 200 OK\r\nX-Field: " + std::string(max_header_size, 'x') + "\r\n\r\n");
+        });
+
+        // Every possible delimiter split must survive incremental reads without rescanning the
+        // already searched prefix. A body containing another delimiter is not part of the header.
+        std::size_t search_from{};
+        for (std::size_t received = 0; received <= response.size(); ++received) {
+            const auto end = find_response_header_end(response.substr(0, received), search_from);
+            check(end ==
+                      (received == response.size() ? response.size() - 4 : std::string_view::npos),
+                  "Incremental framing handles byte-at-a-time headers");
+        }
+        search_from = 0;
+        check(find_response_header_end(std::string(response) + "body\r\n\r\n", search_from) ==
+                  response.size() - 4,
+              "Only the first header delimiter determines body framing");
+
         auto config = RunConfig{};
         config.connections = 16385;
         rejects([&] {

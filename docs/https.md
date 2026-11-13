@@ -26,6 +26,12 @@ processing. Shared agent logic and shared HTTP/TLS contract tests keep
 discovery, run leases, object semantics, and result fields aligned.
 Both implementations still need tuning and validation on large machines.
 
+The workload client reads responses directly into reusable storage. Its allocation-free
+header parser borrows framing fields without building a header map, and delimiter searches
+resume at newly received bytes with overlap for split headers. This retains ordinary
+HTTP/1.1 framing and validation without assuming fixed Linux or HTTP.sys header lengths.
+Control traffic and server requests retain the general-purpose parser.
+
 ## Local quickstart
 
 Build the project using the commands in the [README](../README.md).

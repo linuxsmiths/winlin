@@ -118,6 +118,10 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         self.server.authorizations.append(self.headers.get("Authorization"))
         self.server.run_ids.append(self.headers.get("X-Winlin-Run"))
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        if self.server.is_workload and self.server.raw_response_parts:
+            for part in self.server.raw_response_parts:
+                self.wfile.write(part)
+            return
         self.send_response(self.server.response_status if status is None else status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -136,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.run_ids = []
         endpoint.response_status = 200
         endpoint.fail_workload = False
+        endpoint.raw_response_parts = ()
         endpoint.is_workload = endpoint is not server
         endpoint.metadata_requests = []
         endpoint.capability_queries = 0
@@ -166,6 +171,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 0, result.stdout + result.stderr
+            assert "PUBLIC benchmark certificate" not in result.stderr
             assert "access_token" not in json.loads(target.read_text())
             assert "cipher" not in json.loads(target.read_text())
             assert "authentication" not in result.stdout
@@ -183,6 +189,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "Target saved" in result.stdout, result.stdout + result.stderr
+        assert "PUBLIC benchmark certificate" not in result.stderr
         assert "authentication" not in result.stdout
         assert "TLS 1.3 cipher" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
@@ -255,6 +262,49 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "control_capabilities" not in report
         assert plain.run_ids and all(value == "aa" * 32 for value in plain.run_ids)
         assert all(value is None for value in plain.authorizations)
+
+        # Header fragments and preloaded bodies must work across repeated responses on the same
+        # connection. Separate writes also split the header across TLS records.
+        for mode, endpoint in (("off", plain), ("on", secure)):
+            for size in (256, 65536):
+                endpoint.raw_response_parts = (
+                    b"HTTP/1.1 200 OK\r\ncOnTeNt-Leng",
+                    f"Th: {size}\r\nConnection: keep-alive\r\n\r".encode(),
+                    b"\n" + b"x" * size,
+                )
+                arguments = benchmark.copy()
+                arguments[arguments.index("--get-size") + 1] = str(size)
+                output = directory / f"fragmented-{mode}-{size}.json"
+                result = subprocess.run(
+                    [*arguments, "--tls", mode, "--output", str(output)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+                report = json.loads(output.read_text())
+                assert all(repetition["completed"] == 2 and repetition["errors"] == 0 and
+                           repetition["received_object_bytes"] == 2 * size
+                           for repetition in report["results"])
+                endpoint.raw_response_parts = ()
+
+        # Optimizing response parsing must not turn malformed framing into successful I/O.
+        for index, response in enumerate((
+            b"HTTP/1.1 200 OK\r\nServer: fixture\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 257\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 256\r\ncontent-length: 256\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-Fill: " + b"x" * 16384,
+        )):
+            secure.raw_response_parts = (response[:16384],)
+            output = directory / f"malformed-{index}.json"
+            result = subprocess.run(
+                [*benchmark, "--output", str(output)],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 2, result.stdout + result.stderr
+            report = json.loads(output.read_text())
+            assert report["status"] == "completed_with_errors"
+            assert all(repetition["completed"] == 0 and repetition["errors"] > 0
+                       for repetition in report["results"])
+        secure.raw_response_parts = ()
 
         secure.fail_workload = True
         output = directory / "failed-benchmark.json"

@@ -182,19 +182,153 @@ inline HttpHead parse_head(std::string_view text) {
     return head;
 }
 
+// Borrow only the framing needed by a workload connection, without owning strings or a map.
+// The status line refers to the caller's receive buffer and is invalidated when that buffer
+// changes.
+struct WorkloadResponseHead {
+    std::string_view first;
+    std::uint64_t length{};
+    bool has_length{}, close{};
+};
+
+// Compare ASCII HTTP names and tokens without allocating lowercase copies or consulting a locale.
+inline bool http_equal(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const auto lower_ascii = [](unsigned char ch) {
+            return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
+        };
+        if (lower_ascii(left[index]) != lower_ascii(right[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Search only new bytes and the three-byte overlap needed for a split CRLFCRLF delimiter.
+// Callers reset search_from for each response and retain the accumulated bytes until completion.
+inline std::size_t find_response_header_end(std::string_view bytes, std::size_t& search_from) {
+    const auto end = bytes.find("\r\n\r\n", search_from);
+    if (end == std::string_view::npos) {
+        search_from = bytes.size() > 3 ? bytes.size() - 3 : 0;
+    }
+    return end;
+}
+
+// Parse a complete workload response without heap allocations on the successful path.
+// Preserve bounded framing and duplicate rejection; ignore values unrelated to framing.
+inline WorkloadResponseHead parse_workload_response_head(std::string_view text) {
+    if (text.size() > max_header_size || !text.ends_with("\r\n\r\n")) {
+        throw std::invalid_argument("Invalid HTTP header");
+    }
+    auto end = text.find("\r\n");
+    if (end == std::string_view::npos) {
+        throw std::invalid_argument("Invalid HTTP status line");
+    }
+    WorkloadResponseHead head;
+    head.first = text.substr(0, end);
+
+    // Cache offsets for ordinary responses, not header contents. Only initialized entries are
+    // read. Larger headers use a slower prefix check rather than allocating or imposing a limit.
+    struct FieldSpan {
+        std::size_t begin, length;
+    };
+
+    std::array<FieldSpan, 16> fields;
+    std::size_t field_count{};
+    const auto first_field = end + 2;
+    auto position = first_field;
+    while (position < text.size() - 2) {
+        end = text.find("\r\n", position);
+        if (end == std::string_view::npos) {
+            throw std::invalid_argument("Invalid HTTP field");
+        }
+        const auto line = text.substr(position, end - position);
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos || colon == 0) {
+            throw std::invalid_argument("Invalid HTTP field");
+        }
+        const auto name = line.substr(0, colon);
+        for (unsigned char ch : name) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '-')) {
+                throw std::invalid_argument("Invalid HTTP field name");
+            }
+        }
+
+        // Check all names, including ignored fields, without constructing normalized strings.
+        if (field_count < fields.size()) {
+            for (std::size_t index = 0; index < field_count; ++index) {
+                if (http_equal(name, text.substr(fields[index].begin, fields[index].length))) {
+                    throw std::invalid_argument("Duplicate HTTP field");
+                }
+            }
+            fields[field_count] = {position, name.size()};
+        } else {
+            for (auto previous = first_field; previous < position;) {
+                const auto previous_colon = text.find(':', previous);
+                if (http_equal(name, text.substr(previous, previous_colon - previous))) {
+                    throw std::invalid_argument("Duplicate HTTP field");
+                }
+                previous = text.find("\r\n", previous) + 2;
+            }
+        }
+        ++field_count;
+
+        // Borrow trimmed values only for framing fields; other values need no inspection.
+        const auto trim_view = [](std::string_view value) {
+            const auto first = value.find_first_not_of(" \t");
+            return first == std::string_view::npos
+                       ? std::string_view{}
+                       : value.substr(first, value.find_last_not_of(" \t") - first + 1);
+        };
+        if (http_equal(name, "content-length")) {
+            head.has_length = true;
+            head.length = number(trim_view(line.substr(colon + 1)), max_object_size);
+        } else if (http_equal(name, "transfer-encoding")) {
+            throw std::invalid_argument("Transfer-Encoding is not supported");
+        } else if (http_equal(name, "connection")) {
+            auto tokens = line.substr(colon + 1);
+            while (!tokens.empty()) {
+                const auto comma = tokens.find(',');
+                head.close = head.close || http_equal(trim_view(tokens.substr(0, comma)), "close");
+                if (comma == std::string_view::npos) {
+                    break;
+                }
+                tokens.remove_prefix(comma + 1);
+            }
+        }
+        position = end + 2;
+    }
+    return head;
+}
+
 // Describe one repeatable load configuration, shared by CLI/menu input and result serialization.
 // Call validate() before allocating workers or sockets; workers must not outnumber connections.
 struct RunConfig {
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
+    // How many server workers to start, client workers are in 'workers' below.
     unsigned server_workers{8};
+    // The HTTP method to benchmark, or "mixed" for a mix of GET and PUT.
     std::string method{"get"};
+    // The size of the GET response and PUT request bodies, in bytes.
     std::size_t get_size{4096};
     std::size_t put_size{4096};
+    // Percentage of GET requests in a mixed workload, 0-100. PUTs are the remainder.
     unsigned get_percent{50};
+    // How many concurrent connections to open
     unsigned connections{256};
+    // How many concurrent client workers to start
     unsigned workers{1};
+    // How many seconds to warm up before measuring. Warmup does the same IOs as the benchmark,
+    // but does not count toward the measured duration. This is useful to avoid measuring
+    // cold-start effects.
     double warmup{10};
+    // Benchmark duration in seconds. The benchmark will run for this long, and then stop.
     double duration{30};
+    // How many times to repeat the benchmark. Each repetition will run for 'duration' seconds.
     unsigned repetitions{3};
     std::uint64_t requests{};
     double timeout{10};
@@ -216,6 +350,9 @@ struct RunConfig {
         }
     }
 
+    // Return a JSON object representing the configuration, suitable for serialization.
+    // The TLS version is hardcoded to TLSv1.3 because the benchmark currently only
+    // supports that version.
     Json json() const {
         return {{"tls", tls},
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},

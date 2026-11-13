@@ -1,6 +1,7 @@
 #include "winlin/linux.hpp"
 
 #include <barrier>
+#include <cassert>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -131,12 +132,23 @@ Target load_target(const std::string& path) {
 // starting and stopping benchmarks (/v1/benchmark/start and /v1/benchmark/stop),
 // and fetching telemetry after the benchmark (/v1/benchmark/telemetry).
 struct Response {
+    // The HTTP status code of the response (e.g., 200 for OK, 404 for Not Found).
     int status{};
+    // The parsed HTTP response header, including the status line and any fields.
     HttpHead head;
+    // The body of the HTTP response, which may contain JSON or other data.
     std::string body;
 };
 
-// Exchange one plain HTTP control request, bounded independently of load duration.
+// Send one HTTP control request to the server and receive the response in Response.
+// The connection is closed after the exchange.
+// method is the HTTP method (GET, POST, etc.), path is the request path, and body is the
+// optional request body (for POST requests).
+// path is one of:
+// /v1/capabilities
+// /v1/benchmark/start
+// /v1/benchmark/stop
+// /v1/benchmark/telemetry
 Response exchange(const Target& target, const std::string& method, const std::string& path,
                   const std::string& body = {}) {
     auto socket = connect_stream(nullptr, target.host, target.port, {});
@@ -144,6 +156,8 @@ Response exchange(const Target& target, const std::string& method, const std::st
     const std::string request = method + " " + path + " HTTP/1.1\r\nHost: " + target.host + ":" +
                                 target.port + "\r\nContent-Length: " + std::to_string(body.size()) +
                                 "\r\nConnection: close\r\n\r\n" + body;
+    // Write the request to the socket, handling partial writes, and wait for the socket to
+    // be ready if needed.
     std::size_t sent{};
     while (sent < request.size()) {
         const int count = socket->write(request.data() + sent, request.size() - sent);
@@ -153,6 +167,9 @@ Response exchange(const Target& target, const std::string& method, const std::st
             wait_socket(*socket, deadline);
         }
     }
+
+    // Gather the response header, handling partial reads, and wait for the socket to
+    // be ready if needed.
     std::string input;
     std::array<char, 16384> buffer{};
     std::size_t boundary{};
@@ -172,6 +189,8 @@ Response exchange(const Target& target, const std::string& method, const std::st
             wait_socket(*socket, deadline);
         }
     }
+
+    // Validate the response header and parse it into a Response object.
     Response response;
     response.head = parse_head(std::string_view(input).substr(0, boundary));
     if (!response.head.first.starts_with("HTTP/1.1 ") || response.head.first.size() < 12 ||
@@ -180,6 +199,7 @@ Response exchange(const Target& target, const std::string& method, const std::st
     }
     response.status = number(std::string_view(response.head.first).substr(9, 3), 599);
     response.body = input.substr(boundary);
+    // Read the response body, handling partial reads
     while (response.body.size() < response.head.length) {
         const int count = socket->read(
             buffer.data(),
@@ -196,6 +216,7 @@ Response exchange(const Target& target, const std::string& method, const std::st
     return response;
 }
 
+// Send one HTTP control request to the server and parse the response body as JSON.
 Json control(const Target& target, const std::string& path) {
     const auto response = exchange(target, "GET", path);
     if (response.status != 200) {
@@ -205,6 +226,9 @@ Json control(const Target& target, const std::string& path) {
     return Json::parse(response.body);
 }
 
+// Return the state directory for storing target files and results.
+// Use XDG_STATE_HOME if set, otherwise use HOME/.local/state/winlin. Create the
+// directory if it does not exist.
 fs::path state_directory() {
     const char* state = std::getenv("XDG_STATE_HOME");
     const char* home = std::getenv("HOME");
@@ -235,15 +259,19 @@ void add_target(const std::string& host, const std::string& port, const std::str
         throw std::invalid_argument("Port must be positive");
     }
     Target target{host, port, checked_pin(pin), ""};
-    if (target.pin == benchmark_certificate_sha256) {
-        log_warning(
-            "HTTPS workloads use the PUBLIC benchmark certificate; no trustworthy server identity");
-    }
     // CLI onboarding should work on a fresh client without a manual target-directory setup step.
     if (!output.parent_path().empty()) {
         fs::create_directories(output.parent_path());
     }
+    // Query the server for its capabilities
     const auto capabilities = control(target, "/v1/capabilities");
+    // This writes a target file like
+    // tomar@KVPerf-servernew-himanshu:~/winlin$ cat ~/.local/state/winlin/172.16.0.4-38443.json
+    // {
+    //    "certificate_sha256": "a7f93f90b9dc1d7e7ed5d5e640d70d4c7c634285045388eeba9040ef0debc912",
+    //    "host": "172.16.0.4",
+    //    "port": "38443"
+    // }
     write_private(output, {{"host", host}, {"port", port}, {"certificate_sha256", target.pin}},
                   true);
     std::cout << "Target saved to " << output.string() << '\n';
@@ -283,10 +311,19 @@ struct Stats {
     }
 };
 
-// Own one pinned persistent connection with at most one outstanding workload request. One worker
-// drives it; response bytes are drained before latency is recorded or another request is issued.
+// LoadConnection represents one persistent benchmark connection to the server.
+// It owns the socket, runs as many requests (GET or PUT) as assigned to it and tracks one
+// GET or PUT request at a time. It is a non-blocking state machine that can be multiplexed
+// with epoll.
+// One worker drives it; response bytes are drained before latency is recorded or another
+// request is issued.
 struct LoadConnection {
     StreamSocket socket;
+    // An HTTP(S) request is a sequence of states:
+    // handshake, idle, send_head, send_body, read_head, read_body.
+    //
+    // GET: handshake -> idle -> send_head -> read_head -> read_body -> idle
+    // PUT: handshake -> idle -> send_head -> send_body -> read_head -> read_body -> idle
     enum class State {
         handshake,
         idle,
@@ -296,11 +333,19 @@ struct LoadConnection {
         read_body
     } state{State::handshake};
     bool alive{true}, get{};
-    std::string header, input;
-    std::array<char, 16384> buffer{};
+    // header: outgoing GET/PUT request header
+    std::string header;
+    // buffer: accumulate response headers directly, then reuse it to discard response body bytes
+    std::array<char, max_header_size> buffer{};
+    // offset tracks the number of bytes sent in the request header or body
     std::size_t offset{}, remaining{};
+    // Retain partial headers and resume scanning with overlap for a split delimiter.
+    std::size_t header_received{}, header_search{};
     Clock::time_point started;
 
+    // Constructor
+    // Takes ownership if an already created socket, fd, if TLS is enabled (ctx is not null)
+    // creates the TLS session
     LoadConnection(Fd fd, SSL_CTX* ctx, const Target& target)
         : socket(std::exchange(fd.value, -1), ctx) {
         if (socket.ssl && SSL_set_tlsext_host_name(socket.ssl.get(), target.host.c_str()) != 1) {
@@ -308,9 +353,11 @@ struct LoadConnection {
         }
     }
 
+    // Start the LoadConnection.
     // Select methods from a global issued-request ticket so mixed ratios do not depend on which
     // method completes faster. In each complete group of 100 tickets the requested ratio is exact.
     void begin(const Target& target, const RunConfig& config, std::uint64_t index) {
+        // Which method to issue: GET, PUT, on this connection.
         get = config.method == "get" ||
               (config.method == "mixed" &&
                ((index % 100) * config.get_percent) % 100 < config.get_percent);
@@ -320,22 +367,47 @@ struct LoadConnection {
                  (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
                  "\r\nContent-Length: " + std::to_string(get ? 0 : config.put_size) + "\r\n\r\n";
         offset = 0;
-        input.clear();
+        header_received = 0;
+        header_search = 0;
         started = Clock::now();
+        // By this time the socket is already connected and optionally handshaked;
+        // set the state to send_head to start the request.
         state = State::send_head;
     }
 
-    // Return true only when idle; partial I/O instead leaves readiness requirements in socket.want.
+    // pump() advances the LoadConnection state machine as far as posssible without blocking.
+    // It returns true when the connection is idle and ready for a new request, or false when
+    // more processing is needed. The caller must wait for the socket to be ready for reading
+    // or writing before calling pump() again. The socket.want field is updated to indicate
+    // which events the socket is waiting for. The caller must handle EPOLLIN and EPOLLOUT events
+    // and call pump() again when the socket is ready.
+    //
+    // payload: outgoing PUT request body, passed by reference to avoid copying. It must be
+    //          at least config.put_size bytes long.
     bool pump(const Target& target, const RunConfig& config, const std::vector<char>& payload,
               Stats& stats) {
+        // Every pump() call makes forward progress on the current request.
+        // It returns true when the request is complete and the connection is idle, or false
+        // when more processing is needed. The caller must wait for the socket to be ready
+        // for reading or writing before calling pump() again.
+        // Even if socket is ready, pump() may not complete the request, as it has a budget
+        // of 128 steps to avoid starvation of other connections. e.g., one TLS write can
+        // only do 16KiB so it may take multiple steps to send a 4MiB PUT body, or even when
+        // reading a response body it might take multiple steps to read the entire body if
+        // the socket is not ready for reading.
         for (unsigned step = 0; step < 128; ++step) {
             if (state == State::handshake) {
                 if (!socket.handshake(false)) {
+                    // Still awaiting handshake completion
                     return false;
                 }
                 if (socket.ssl && !equal_secret(fingerprint(socket.ssl.get()), target.pin)) {
                     throw std::runtime_error("Server certificate changed during load setup");
                 }
+                // Handshake completed successfully; the connection is now idle and ready
+                // for a new request, we return true to signal that.
+                // Caller will then call begin() which will set the state to send_head and
+                // start the request.
                 state = State::idle;
                 return true;
             } else if (state == State::idle) {
@@ -343,17 +415,24 @@ struct LoadConnection {
             } else if (state == State::send_head) {
                 const int count = socket.write(header.data() + offset, header.size() - offset);
                 if (!count) {
+                    // Socket is not ready for writing, return false to signal that we need
+                    // to wait for the socket to be ready before calling pump() again.
+                    // Note that we use non-blocking sockets.
                     return false;
                 }
                 offset += count;
                 if (offset == header.size()) {
                     offset = 0;
+                    // header is fully sent, now we can either send the body (for PUT) or
+                    // read the response (for GET).
                     state = get ? State::read_head : State::send_body;
                 }
             } else if (state == State::send_body) {
                 if (offset == config.put_size) {
+                    // All body bytes have been sent, now we can read the response.
                     state = State::read_head;
                 } else {
+                    // Continue sending the body bytes from payload, up to config.put_size.
                     const int count =
                         socket.write(payload.data() + offset, config.put_size - offset);
                     if (!count) {
@@ -362,36 +441,47 @@ struct LoadConnection {
                     offset += count;
                 }
             } else if (state == State::read_head) {
-                const auto end = input.find("\r\n\r\n");
-                if (end != std::string::npos) {
-                    const auto head = parse_head(std::string_view(input).substr(0, end + 4));
-                    if (!head.first.starts_with("HTTP/1.1 200 ") ||
-                        !head.fields.contains("content-length") ||
+                const std::string_view received(buffer.data(), header_received);
+                const auto end = find_response_header_end(received, header_search);
+                if (end != std::string_view::npos) {
+                    const auto head = parse_workload_response_head(received.substr(0, end + 4));
+                    if (!head.first.starts_with("HTTP/1.1 200 ") || !head.has_length ||
                         head.length != (get ? config.get_size : 0) || head.close) {
                         throw std::runtime_error(
                             std::string(config.tls == "ktls"
                                             ? "Unexpected kTLS benchmark response: "
                                             : "Unexpected benchmark response: ") +
-                            head.first);
+                            std::string(head.first));
                     }
-                    const auto preloaded = input.size() - end - 4;
+                    const auto preloaded = header_received - end - 4;
                     if (preloaded > head.length) {
                         throw std::runtime_error("Excess response bytes");
                     }
                     remaining = head.length - preloaded;
                     state = State::read_body;
                 } else {
-                    if (input.size() >= max_header_size) {
+                    // Already accumulated max_header_size bytes without finding the end
+                    // of the header, which is an error.
+                    if (header_received == buffer.size()) {
                         throw std::runtime_error("Oversized response header");
                     }
-                    const int count = socket.read(buffer.data(), buffer.size());
+                    // Read more header bytes.
+                    // Note that we may end up reading some of the response body bytes into
+                    // buffer, which is fine, as we will handle that in the next state (read_body).
+                    // Read directly after existing header bytes, without a scratch-buffer copy.
+                    const int count = socket.read(buffer.data() + header_received,
+                                                  buffer.size() - header_received);
                     if (!count) {
                         return false;
                     }
-                    input.append(buffer.data(), count);
+                    header_received += count;
                 }
             } else {
+                assert(state == State::read_body);
                 if (remaining) {
+                    // Read upto buffer.size() or remaining bytes, whichever is smaller.
+                    // Note that we discard the bytes read, we only care about reading
+                    // the full response body to measure latency and throughput.
                     const int count =
                         socket.read(buffer.data(), std::min(buffer.size(), remaining));
                     if (!count) {
@@ -399,6 +489,8 @@ struct LoadConnection {
                     }
                     remaining -= count;
                 } else {
+                    // All response body bytes have been read and the request is complete,
+                    // we can record the latency and update the stats.
                     const auto ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
                             .count();
@@ -412,6 +504,7 @@ struct LoadConnection {
                         ++stats.puts;
                         stats.sent += config.put_size;
                     }
+                    // Ready for a new request, we return true to signal that.
                     state = State::idle;
                     return true;
                 }
