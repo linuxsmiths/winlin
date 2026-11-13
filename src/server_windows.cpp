@@ -1034,7 +1034,7 @@ int wmain(int argc, wchar_t** argv) {
                 "Control, HTTP and HTTPS ports must be nonzero and distinct");
         }
         ServerGuard instance_guard;
-        reference_clock();
+        initialize_reference_clock();
         const auto host_config = windows_config();
         const auto address = args.get("--bind", "127.0.0.1");
         BenchmarkController controller(

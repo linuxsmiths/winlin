@@ -11,6 +11,25 @@ void require(bool condition, const char* message) {
     }
 }
 
+// Exercise the startup calibration before any host sample initializes its process-wide cache.
+// Unsupported clocks remain valid, but sleeping-thread migration must not discard calibration.
+void test_reference_clock() {
+    GROUP_AFFINITY before{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &before)) {
+        throw windows_error("Cannot query test thread affinity before calibration");
+    }
+    initialize_reference_clock();
+    GROUP_AFFINITY after{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &after)) {
+        throw windows_error("Cannot query test thread affinity after calibration");
+    }
+    require(before.Group == after.Group && before.Mask == after.Mask,
+            "TSC calibration must preserve caller affinity");
+    require(reference_clock().at("unavailable_reason") !=
+                "TSC calibration could not obtain three same-CPU samples",
+            "CPU-pinned TSC calibration must not reject samples for migration");
+}
+
 // Exercise the native header adapter without requiring provisioned HTTP.sys endpoints.
 // The raw parser remains the reference for normalization and framing validation.
 void test_request_headers() {
@@ -141,6 +160,7 @@ void test_completion_errors() {
 
 int main() {
     try {
+        test_reference_clock();
         test_request_headers();
         test_completion_errors();
         const auto snapshot = usage();

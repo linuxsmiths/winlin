@@ -247,6 +247,11 @@ sample is null with `cpu_cycles_unavailable_reason`. CPU cycles also exclude
 HTTP.sys/Schannel work charged to System and include control-process overhead;
 they are not whole-machine hardware-counter measurements and are not used for
 reference CPIO.
+At startup, TSC calibration runs on a temporary thread pinned to one logical CPU,
+preventing Windows scheduling migrations from discarding its sleeping samples.
+The thread exits before serving requests; controller and worker affinity remain
+unchanged. If pinning fails, a warning explains that calibration proceeds unpinned.
+Unsupported or unstable clocks still report reference CPIO as unavailable.
 Processor-group count is recorded, but worker affinity and group/NUMA placement
 are not tuned automatically. Verify scheduling on hosts with more than 64 logical
 processors before interpreting scaling results.

@@ -22,6 +22,34 @@ inline std::runtime_error windows_error(std::string message, DWORD code = GetLas
     return std::runtime_error(std::move(message) + " (Windows error " + std::to_string(code) + ")");
 }
 
+// Initialize the cached TSC calibration on a disposable, single-CPU thread before serving.
+// Windows may migrate sleeping threads between samples; pinning only this thread prevents
+// those rejections without changing the controller's or benchmark workers' affinity.
+inline void initialize_reference_clock() {
+    std::exception_ptr failure;
+    std::jthread sampler([&] {
+        try {
+            PROCESSOR_NUMBER processor{};
+            GetCurrentProcessorNumberEx(&processor);
+            GROUP_AFFINITY affinity{};
+            affinity.Group = processor.Group;
+            affinity.Mask = KAFFINITY{1} << processor.Number;
+            if (!SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr)) {
+                log_warning(windows_error("Cannot pin TSC calibration thread; attempting unpinned "
+                                          "calibration")
+                                .what());
+            }
+            reference_clock();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    sampler.join();
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
+}
+
 // Decode one already-dequeued completion without waiting. A successful batch dequeue does not
 // imply successful I/O; ask Windows to translate each native OVERLAPPED result to a Win32 error.
 // Synthetic submission failures already carry a Win32 error and have no native result to query.
