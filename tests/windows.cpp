@@ -66,11 +66,83 @@ void test_request_headers() {
                                                     oversized.data()};
     rejects();
 }
+
+// A batch can succeed while containing cancelled native I/O and synthetic submission failures.
+// Use a local named pipe to generate real cancellation without privileged HTTP.sys provisioning.
+void test_completion_errors() {
+    const auto name = L"\\\\.\\pipe\\winlin-completion-" + std::to_wstring(GetCurrentProcessId()) +
+                      L"-" + std::to_wstring(GetTickCount64());
+    Handle pipe(CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                                 PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr));
+    if (pipe.value == INVALID_HANDLE_VALUE) {
+        throw windows_error("Create completion-test pipe");
+    }
+    Handle port(CreateIoCompletionPort(pipe.value, nullptr, 0, 1));
+    if (!port.value) {
+        throw windows_error("Create completion-test port");
+    }
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!event.value) {
+        throw windows_error("Create completion-test event");
+    }
+
+    // Leave a real connect pending, and ensure failures elsewhere in the test still cancel and
+    // drain it before stack-backed OVERLAPPED storage or its event can be released.
+    OVERLAPPED cancelled{};
+    cancelled.hEvent = event.value;
+    const BOOL connected = ConnectNamedPipe(pipe.value, &cancelled);
+    require(!connected && GetLastError() == ERROR_IO_PENDING, "Pipe connection must be pending");
+    const auto drain = [&](OVERLAPPED* pending) {
+        if (!CancelIoEx(pipe.value, pending) && GetLastError() != ERROR_NOT_FOUND) {
+            log_warning(windows_error("Cancel completion-test I/O").what());
+        }
+        DWORD transferred{};
+        if (!GetOverlappedResult(pipe.value, pending, &transferred, TRUE) &&
+            GetLastError() != ERROR_OPERATION_ABORTED) {
+            log_warning(windows_error("Drain completion-test I/O").what());
+        }
+    };
+    std::unique_ptr<OVERLAPPED, decltype(drain)> cleanup(&cancelled, drain);
+
+    OVERLAPPED synthetic{};
+    if (!PostQueuedCompletionStatus(port.value, 0, 0, &synthetic) ||
+        !CancelIoEx(pipe.value, &cancelled)) {
+        throw windows_error("Queue mixed completion-test results");
+    }
+
+    bool saw_synthetic = false;
+    bool saw_cancelled = false;
+    while (!saw_synthetic || !saw_cancelled) {
+        std::array<OVERLAPPED_ENTRY, 8> entries;
+        ULONG count{};
+        if (!GetQueuedCompletionStatusEx(port.value, entries.data(),
+                                         static_cast<ULONG>(entries.size()), &count, 5000, FALSE)) {
+            throw windows_error("Dequeue mixed completion-test results");
+        }
+        for (ULONG index = 0; index < count; ++index) {
+            const auto& entry = entries[index];
+            if (entry.lpOverlapped == &synthetic) {
+                require(completion_error(pipe.value, entry.lpOverlapped, ERROR_INVALID_DATA) ==
+                            ERROR_INVALID_DATA,
+                        "Synthetic failures must retain their submission error");
+                saw_synthetic = true;
+            } else {
+                require(entry.lpOverlapped == &cancelled, "Unexpected completion-test packet");
+                require(completion_error(pipe.value, entry.lpOverlapped, NO_ERROR) ==
+                            ERROR_OPERATION_ABORTED,
+                        "A successful batch dequeue must not turn cancelled I/O into success");
+                saw_cancelled = true;
+            }
+        }
+    }
+    cleanup.release();
+}
 }
 
 int main() {
     try {
         test_request_headers();
+        test_completion_errors();
         const auto snapshot = usage();
         require(snapshot.at("voluntary_context_switches").is_null(),
                 "Unavailable counters are null");

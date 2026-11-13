@@ -264,11 +264,15 @@ contexts are allocated on cache misses and freed when the idle cache is full.
 Small atomic reference counts protect submissions and completions that overlap
 across workers; contexts cannot be reused until every reference finishes.
 Shutdown drains active operations and releases each worker's cached storage.
+Completion workers retrieve up to eight already-ready IOCP entries per call;
+they do not wait for a full batch. Native I/O errors and synthetic submission
+failures are decoded per entry, and shutdown processes every dequeued reference.
 
 ## Tests
 
 Ordinary Windows tests cover the shared agent, core behavior, native credential
-ACL enforcement, process telemetry, and PowerShell helpers. Optional HTTPS tests
+ACL enforcement, process telemetry, mixed synthetic/cancelled completion errors,
+and PowerShell helpers. Optional HTTPS tests
 need an **elevated** terminal and Python 3:
 
 ```powershell

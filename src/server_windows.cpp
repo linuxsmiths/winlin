@@ -540,36 +540,38 @@ struct Runtime {
         }
     }
 
-    // Consume completed HTTP.sys operations and advance their owning Request objects.
-    // During shutdown, continue until all live requests are gone: cancelled operations still
-    // require their completion packets before the referenced buffers can safely be destroyed.
+    // Retrieve up to eight ready HTTP.sys completions per call, without waiting to fill a batch.
+    // Keep batches small so one worker does not monopolize completion processing. During shutdown,
+    // drain every dequeued entry: each still owns a reference even if an earlier entry stops I/O.
     void worker() {
         RequestCache cache;
+        std::array<OVERLAPPED_ENTRY, 8> entries;
         while (!stopping || live.load() != 0) {
-            DWORD bytes{};
-            ULONG_PTR key{};
-            OVERLAPPED* overlapped{};
-            const BOOL success =
-                GetQueuedCompletionStatus(completion_port.value, &bytes, &key, &overlapped, 100);
-            const auto completion_error = success ? NO_ERROR : GetLastError();
-            if (!overlapped) {
-                if (!success && completion_error != WAIT_TIMEOUT) {
-                    fail(windows_error("GetQueuedCompletionStatus", completion_error).what());
+            ULONG count{};
+            if (!GetQueuedCompletionStatusEx(completion_port.value, entries.data(),
+                                             static_cast<ULONG>(entries.size()), &count, 100,
+                                             FALSE)) {
+                const auto error = GetLastError();
+                if (error != WAIT_TIMEOUT) {
+                    fail(windows_error("GetQueuedCompletionStatusEx", error).what());
                     return;
                 }
                 continue;
             }
-            // Immediate API failures use synthetic packets; pending and successful operations
-            // use native packets. Both take the same request-completion and cleanup path.
-            auto* operation = reinterpret_cast<Request::Operation*>(overlapped);
-            ULONG error = NO_ERROR;
-            if (operation->immediate_error) {
-                error = operation->immediate_error;
-            } else if (!success) {
-                error = completion_error;
+
+            // Batch success describes dequeueing, not each operation's result. Decode native and
+            // synthetic errors separately, preserving each packet's byte count and reference.
+            for (ULONG index = 0; index < count; ++index) {
+                const auto& entry = entries[index];
+                if (!entry.lpOverlapped) {
+                    continue;
+                }
+                auto* operation = reinterpret_cast<Request::Operation*>(entry.lpOverlapped);
+                const RequestReference reference(operation->request, RequestReleaser{&cache});
+                const auto error =
+                    completion_error(queue.value, entry.lpOverlapped, operation->immediate_error);
+                reference->complete(error, entry.dwNumberOfBytesTransferred, cache);
             }
-            const RequestReference reference(operation->request, RequestReleaser{&cache});
-            reference->complete(error, bytes, cache);
         }
     }
 

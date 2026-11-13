@@ -22,6 +22,17 @@ inline std::runtime_error windows_error(std::string message, DWORD code = GetLas
     return std::runtime_error(std::move(message) + " (Windows error " + std::to_string(code) + ")");
 }
 
+// Decode one already-dequeued completion without waiting. A successful batch dequeue does not
+// imply successful I/O; ask Windows to translate each native OVERLAPPED result to a Win32 error.
+// Synthetic submission failures already carry a Win32 error and have no native result to query.
+inline ULONG completion_error(HANDLE handle, OVERLAPPED* overlapped, ULONG immediate_error) {
+    if (immediate_error) {
+        return immediate_error;
+    }
+    DWORD transferred{};
+    return GetOverlappedResult(handle, overlapped, &transferred, FALSE) ? NO_ERROR : GetLastError();
+}
+
 // Adapt HTTP.sys's parsed request directly to the shared Agent header representation.
 // Retain the same selected fields, header-size bound, normalization, and framing validation as
 // the previous serialized-header path, without building and parsing a second HTTP message.
