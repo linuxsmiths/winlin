@@ -340,6 +340,11 @@ struct LoadConnection {
     // offset tracks the number of bytes sent in the request header or body
     std::size_t offset{}, remaining{};
     // Retain partial headers and resume scanning with overlap for a split delimiter.
+    // header_received: Number of header bytes received so far, including any body bytes
+    //                  that may have been read into buffer.
+    // header_search: Offset at which the next search for the header delimiter begins.
+    //                Revisit up to three bytes so a delimiter split across reads is found,
+    //                without searching the entire accumulated header again. To be precise this is the next search offset.
     std::size_t header_received{}, header_search{};
     Clock::time_point started;
 
@@ -442,9 +447,18 @@ struct LoadConnection {
                 }
             } else if (state == State::read_head) {
                 const std::string_view received(buffer.data(), header_received);
+                // Find the end of the HTTP response header in the received bytes,
+                // searching only new bytes and the overlap needed for a split delimiter.
                 const auto end = find_response_header_end(received, header_search);
                 if (end != std::string_view::npos) {
+                    // OK, full header received, parse it and validate it. Note that we may
+                    // have already read some of the response body bytes into buffer, which
+                    // is fine, we will correctly handle that in the next state (read_body).
                     const auto head = parse_workload_response_head(received.substr(0, end + 4));
+                    // Server must respond with 200 OK and the expected Content-Length, and
+                    // must not close the connection. Otherwise, fail this request and close
+                    // its connection. A measurement reports the failure while other connections
+                    // continue; a warmup failure prevents measurement from starting.
                     if (!head.first.starts_with("HTTP/1.1 200 ") || !head.has_length ||
                         head.length != (get ? config.get_size : 0) || head.close) {
                         throw std::runtime_error(
@@ -453,6 +467,10 @@ struct LoadConnection {
                                             : "Unexpected benchmark response: ") +
                             std::string(head.first));
                     }
+                    // Count response body bytes already consumed by the header reads, so they
+                    // are not read again. Their contents are no longer needed.
+                    // Note that header_received includes any body bytes that may have
+                    // been read into buffer.
                     const auto preloaded = header_received - end - 4;
                     if (preloaded > head.length) {
                         throw std::runtime_error("Excess response bytes");
@@ -460,6 +478,8 @@ struct LoadConnection {
                     remaining = head.length - preloaded;
                     state = State::read_body;
                 } else {
+                    // Header end not found yet, continue reading more bytes into buffer.
+                    //
                     // Already accumulated max_header_size bytes without finding the end
                     // of the header, which is an error.
                     if (header_received == buffer.size()) {
@@ -474,6 +494,8 @@ struct LoadConnection {
                     if (!count) {
                         return false;
                     }
+                    // Number of header bytes received so far, including any body bytes
+                    // that may have been read into buffer.
                     header_received += count;
                 }
             } else {
@@ -510,22 +532,58 @@ struct LoadConnection {
                 }
             }
         }
+        // If we reach here, we have exhausted our 128 steps budget without completing
+        // the request. This can happen when a large body needs many successful reads or writes.
         socket.want = EPOLLIN | EPOLLOUT;
         return false;
     }
 };
 
-// Multiplex a disjoint connection subset using one epoll queue. References belong to the controller
-// and must outlive the worker; no connection or Stats object is shared between worker threads.
+// Run benchmark requests over several connections using one thread, rather than one thread per
+// connection. trial() creates the worker threads and divides the connections between them.
+// This class does not create a thread itself; its methods run on the thread created by trial().
+//
+// Each LoadConnection knows how to send a request and read its response. LoadWorker decides which
+// connection to work on next. It asks epoll which sockets are ready, then calls pump() on those
+// connections. If a connection cannot continue yet, the worker moves on to others instead of
+// blocking the whole thread. pump() also limits how much work it does in one call so that a large
+// request does not keep the worker from serving its other connections.
+//
+// setup() opens all of this worker's connections, completes their TCP/TLS setup, and checks the
+// certificate pins for TLS connections. This happens before warmup, so connection setup is not
+// included in the measured request performance.
+//
+// phase() runs either warmup or measurement using those same connections. Each connection has at
+// most one outstanding request. When that request finishes, the worker starts another on the same
+// connection if time and request limits allow. The request counter is shared across workers so
+// that the request limit applies to the whole run, not separately to each worker.
+//
+// Once the phase's time or request limit is reached, the worker stops starting new requests.
+// It continues processing requests already started until they finish, fail, or time out.
+// phase() returns this worker's statistics; trial() combines the measured results from all workers.
+//
+// Only this worker's thread uses its connections, epoll queue, and local statistics. The target,
+// configuration, and PUT payload are not copied into the worker: it holds read-only references
+// to them. The caller must keep those objects alive and unchanged while the worker uses them.
+//
+// e.g., for 1024 connections with 16 workers, there will be 16 LoadWorker instances, each with
+// 64 LoadConnection instances. Each worker runs on its own thread and uses epoll to multiplex
+// its 64 connections without blocking.
 class LoadWorker {
     const Target& target_;
     const RunConfig& config_;
     const std::vector<char>& payload_;
     Epoll poller_;
+    // All the LoadConnection instances managed by this LoadWorker.
+    // connections_ maps each connection's socket fd to its LoadConnection instance.
     std::unordered_map<int, std::unique_ptr<LoadConnection>> connections_;
     std::array<epoll_event, 256> events_{};
 
 public:
+    // target: Target details (host, port, pin, run_id) for this worker's connections.
+    // config: RunConfig details (method, sizes, counts, timeouts) for this worker's requests.
+    // payload: PUT request body to send for each PUT request. Must be at least config.put_size
+    //          bytes.
     LoadWorker(const Target& target, const RunConfig& config, const std::vector<char>& payload)
         : target_(target), config_(config), payload_(payload) {
     }
@@ -534,9 +592,13 @@ public:
     // load.
     void setup(SSL_CTX* ctx, unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
+            // Connect to the server and create a LoadConnection for it.
+            // connect_socket() may return before the nonblocking TCP connection has completed.
+            // pump() finishes TCP/TLS setup when readiness events arrive.
             auto connection = std::make_unique<LoadConnection>(
                 connect_socket(target_.host, target_.port), ctx, target_);
             const int fd = connection->socket.fd.value;
+            // Register the connection's socket fd with epoll for both read and write events
             poller_.set(fd, EPOLLIN | EPOLLOUT, true);
             connections_.emplace(fd, std::move(connection));
         }
@@ -553,6 +615,8 @@ public:
                 if (connection.state == LoadConnection::State::idle) {
                     continue;
                 }
+                // Advance TCP/TLS setup; more readiness events and pump() calls may be needed.
+                // payload_ is not used here, but we pass it to satisfy the pump() signature.
                 if (connection.pump(target_, config_, payload_, unused)) {
                     ++ready;
                     poller_.set(connection.socket.fd.value, 0);
@@ -563,6 +627,10 @@ public:
         }
     }
 
+    // Generate the workload for either warmup or measurement. Stop starting new requests when
+    // the time limit or global request limit is reached, then finish outstanding requests.
+    // The phase can run beyond its duration while draining, or end early if all connections fail.
+    // Return the statistics for this worker's requests.
     // Stop issuing at the first limit, but drain outstanding requests up to their individual
     // timeout.
     Stats phase(Clock::time_point start, double duration, std::atomic<std::uint64_t>& issued,
@@ -570,59 +638,118 @@ public:
         Stats stats;
         const auto deadline = start + std::chrono::duration<double>(duration);
         std::size_t active{};
+
         auto issue = [&](LoadConnection& connection) {
+            // If time limit is reached or the connection is dead, do not issue a new request.
             if (!connection.alive || Clock::now() >= deadline) {
                 return false;
             }
+            // The reserved-request count is also the candidate ticket for the next request.
             auto ticket = issued.load(std::memory_order_relaxed);
             // Reserve a request globally before sending, including when the limit is below workers.
             do {
+                // limit is 0 for no limit, otherwise stop issuing when the limit is reached.
                 if (limit && ticket >= limit) {
                     return false;
                 }
+                // Reserve the next ticket atomically; retry if another worker reserved it first.
             } while (!issued.compare_exchange_weak(ticket, ticket + 1, std::memory_order_relaxed));
+
+            // Start the request on this connection, which sets its state to send_head and begins
+            // the request. The connection will then be driven by pump() until it is idle again
+            // and ready for another request.
             connection.begin(target_, config_, ticket);
+            // Enable write notifications for the socket already registered with epoll.
             poller_.set(connection.socket.fd.value, EPOLLOUT);
             return true;
         };
+
+        // Try to assign an initial request to each live connection. Time and request limits
+        // may prevent some connections from receiving one. Reuse these connections for more
+        // requests as they complete, while the limits still allow new requests.
         for (auto& [fd, connection] : connections_) {
             (void)fd;
             if (issue(*connection)) {
                 ++active;
             }
         }
+
+        // The main loop of the phase. It continues until there are no more active requests,
+        // either because issuance has stopped and outstanding requests have been drained,
+        // or because all connections have failed.
         while (active) {
+            // Each active connection has one outstanding request. Wait for socket readiness
+            // so those requests can make progress; other connections may be idle or dead.
             const int count = poller_.wait(events_.data(), events_.size(), 10);
+            // Process each ready connection. pump() will advance the state machine for that
+            // connection as far as possible without blocking. If the connection becomes idle,
+            // issue() will start a new request on it, if the time and request limits allow
             for (int i = 0; i < count; ++i) {
                 auto& connection = *connections_.at(events_[i].data.fd);
+                // Connections can be closed by the server or fail during the phase, skip
+                // them, also skip connections that are idle. Note that typically an idle
+                // connection would mean that it is ready for a new request, but since we
+                // issue new requests immediately as soon as a connection completes its
+                // request (see pump() call below()), an idle connection here means there
+                // are no more requests to issue, either because the time limit or request limit
+                // has been reached.
                 if (!connection.alive || connection.state == LoadConnection::State::idle) {
                     continue;
                 }
                 try {
+                    // This connection is ready for reading or writing, call pump() to advance
+                    // its state machine.
                     if (connection.pump(target_, config_, payload_, stats)) {
+                        // True return value means the connection is done with the current request
+                        // and is now idle, ready for a new request. Try to issue a new request on
+                        // this connection, if the time and request limits allow.
                         --active;
                         if (issue(connection)) {
                             ++active;
                         } else {
+                            // No further request was assigned for this phase. Disable normal
+                            // read/write notifications, but leave the socket registered and open.
+                            // Errors or hangups may still be reported. Keep live connections for
+                            // measurement after warmup; worker destruction eventually closes them.
                             poller_.set(connection.socket.fd.value, 0);
                         }
                     } else {
+                        // False return from pump() means the connection is still processing
+                        // its current request, and we need to wait for it to be ready for
+                        // reading or writing again, or resume after yielding its step budget.
                         poller_.set(connection.socket.fd.value, connection.socket.want);
                     }
                 } catch (const std::exception& error) {
                     stats.fail(error.what());
+                    // Report the failure here, while the socket is still identifiable. Later
+                    // events skip this dead connection, so they must not repeat the warning.
+                    log_warning(
+                        "Workload connection fd " + std::to_string(connection.socket.fd.value) +
+                        " became dead: " + error.what() +
+                        ". Closing it without replacement; remaining connections continue.");
                     connection.alive = false;
                     connection.socket.fd = Fd{};
                     --active;
                 }
             }
+
+            // After processing ready connections, check how long each outstanding request
+            // has been running. The timeout applies to the request, not the connection's age.
             const auto now = Clock::now();
             for (auto& [fd, connection] : connections_) {
                 (void)fd;
+                // Fail a request that has exceeded its timeout, and permanently close its
+                // connection so no further requests are assigned to it.
                 if (connection->alive && connection->state != LoadConnection::State::idle &&
                     std::chrono::duration<double>(now - connection->started).count() >=
                         config_.timeout) {
                     stats.fail("Request timed out");
+                    // A timeout also permanently removes this connection from the workload.
+                    // Log once before closing it; the alive check prevents repeated reports.
+                    log_warning("Workload connection fd " +
+                                std::to_string(connection->socket.fd.value) +
+                                " became dead: Request timed out. Closing it without replacement; "
+                                "remaining connections continue.");
                     connection->alive = false;
                     connection->socket.fd = Fd{};
                     --active;
@@ -634,8 +761,28 @@ public:
     }
 };
 
-// Coordinate setup, warmup and measurement without charging connection establishment to throughput.
-// Every worker must reach both gates even after failure, or the controller would wait forever.
+// Run one benchmark repetition using several worker threads, then combine their results into a
+// JSON report. Each thread creates a LoadWorker and owns a share of the configured connections.
+// The calling thread coordinates when the workers start warmup and measurement, and collects
+// client and server telemetry around the measured workload.
+//
+// First, wait for every worker to finish establishing its connections. Release them together
+// using a common warmup start time. Next, wait for every worker to finish warmup, including all
+// outstanding warmup requests, before collecting the initial telemetry. Only then release the
+// workers for measurement using a common measurement start time. This keeps connection setup
+// and warmup requests out of the measured workload.
+//
+// The two latches tell the calling thread when setup and warmup have finished. The same barrier
+// is used twice: workers wait there until the calling thread has prepared the next phase.
+// A worker that encounters a fatal error records it and skips further workload, but must still
+// signal both latches and participate in both barrier waits. Otherwise, the calling thread or
+// another worker could wait forever for a participant that exited early. If a thread cannot be
+// created, the calling thread accounts for its missing latch signals and barrier participation.
+//
+// Join all workers before reading their results or allowing the objects they reference to go
+// out of scope. If a fatal error was recorded, throw it after the threads have finished.
+// Otherwise, merge the measured request statistics, collect final telemetry, and return the
+// report with warnings for request failures or possible client CPU saturation.
 Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
            const std::vector<char>& payload, unsigned repetition, const Target& control_target,
            const std::string& run_id) {
@@ -656,20 +803,29 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         abort = true;
     };
     try {
+        // Create one thread per worker, each of which will create its own LoadWorker and manage
+        // its share of the configured connections. The threads will wait for the calling thread
+        // to signal when to start warmup and measurement, and will report any fatal errors back
+        // to the calling thread via the fail() lambda.
         for (unsigned index = 0; index < config.workers; ++index) {
             threads.emplace_back([&, index] {
                 std::unique_ptr<LoadWorker> worker;
                 try {
+                    // One LoadWorker per worker thread
                     worker = std::make_unique<LoadWorker>(target, config, payload);
+                    // setup() opens and handshakes the worker's share of connections
                     worker->setup(ctx, config.connections / config.workers +
                                            (index < config.connections % config.workers ? 1 : 0));
                 } catch (const std::exception& error) {
                     fail(error.what());
                 }
+                // Synchronize with the calling thread to ensure all workers have finished setup
+                // before starting warmup.
                 setup_done.count_down();
                 gate.arrive_and_wait();
                 if (!abort) {
                     try {
+                        // Issue warmup requests for config.warmup seconds, then drain them.
                         const auto warmup =
                             worker->phase(warmup_start, config.warmup, warmup_issued, 0);
                         if (warmup.errors) {
@@ -679,10 +835,17 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
                         fail(error.what());
                     }
                 }
+                // Synchronize with the calling thread to ensure all workers have finished
+                // warmup before starting measurement.
                 warmup_done.count_down();
                 gate.arrive_and_wait();
                 if (!abort) {
                     try {
+                        // Issue measurement requests for config.duration seconds or until
+                        // config.requests have been issued, whichever comes first.
+                        // Then drain outstanding requests before returning the results.
+                        // The issued counter is shared across all workers, so the request limit
+                        // applies to the whole run.
                         results[index] =
                             worker->phase(measure_start, config.duration, issued, config.requests);
                     } catch (const std::exception& error) {
@@ -706,9 +869,15 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     gate.arrive_and_wait();
     // Drain warmup before taking the baseline; no warmup request may leak into measurement.
     warmup_done.wait();
+
+    // All workers have signalled warmup completion. They wait at the barrier before proceeding
+    // to measurement, unless a failure causes them to skip the measured workload.
     Json server_before, client_before;
     if (!abort) {
         try {
+            // Collect baseline telemetry before starting measurement, so that the measurement
+            // phase can be compared against the baseline. The server telemetry is collected via
+            // the control API, and the client telemetry is collected via the usage() function.
             server_before = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
             client_before = usage();
         } catch (const std::exception& error) {
@@ -716,7 +885,10 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         }
     }
     measure_start = Clock::now();
+    // Release worker threads to start measurement phase
     gate.arrive_and_wait();
+
+    // Destroying the jthread objects joins every worker before their results are read.
     threads.clear();
     if (abort) {
         throw std::runtime_error(failure);
@@ -726,6 +898,8 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         combined.merge(stats);
     }
     const double elapsed = std::chrono::duration<double>(combined.end - measure_start).count();
+    // Collect telemetry after measurement, so that the measurement phase can be compared against
+    // the baseline.
     const auto client_after = usage();
     const auto server_after = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
     auto client_usage = usage_delta(client_before, client_after, elapsed);
@@ -908,6 +1082,9 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         write_private(output, report, false);
         std::cout << "Run  requests/s     p50(us)     p99(us)   errors       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
+            // Run trial() for each repetition, which creates the worker threads, assigns
+            // a subset of connections to each worker, issues requests, and collects the
+            // measured telemetry.
             auto result =
                 trial(workload_ctx.get(), workload, config, payload, index, target, run_id);
             errors = errors || result.at("errors").get<std::uint64_t>() != 0 ||

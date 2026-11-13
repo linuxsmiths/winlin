@@ -17,6 +17,9 @@ These rules apply to all development in this repository.
 
 - Explain code with good comments unless its purpose and behavior are very
   obvious. Explain intent and rationale, not just what individual statements say.
+- Write comments in clear, explanatory sentences rather than terse summaries or
+  compressed jargon. Give readers enough context to understand how the code
+  works and why it is structured that way without needing a separate explanation.
 - Start every class or struct with a documentation comment explaining why it
   exists, what it does, who uses it, and any precautions or callouts. Include
   ownership, lifetime, thread-safety, and platform constraints where relevant.

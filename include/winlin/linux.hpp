@@ -305,6 +305,7 @@ struct StreamSocket {
 // closing their descriptors removes registrations, so an idle session need not be explicitly
 // deleted.
 class Epoll {
+    // Epoll control fd
     Fd fd_{epoll_create1(EPOLL_CLOEXEC)};
 
 public:

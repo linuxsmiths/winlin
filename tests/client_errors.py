@@ -334,6 +334,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert report["status"] == "completed_with_errors"
             assert all(repetition["completed"] == 0 and repetition["errors"] > 0
                        for repetition in report["results"])
+            assert result.stderr.count("became dead:") == sum(
+                repetition["errors"] for repetition in report["results"]
+            ), result.stderr
         secure.raw_response_parts = ()
 
         secure.fail_workload = True
@@ -345,6 +348,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert result.returncode == 2, result.stdout + result.stderr
         report = json.loads(output.read_text())
         assert report["status"] == "completed_with_errors"
+        assert result.stderr.count("became dead:") == sum(
+            repetition["errors"] for repetition in report["results"]
+        ), result.stderr
         for repetition in report["results"]:
             assert repetition["errors"] > 0
             assert repetition["server_reference_cycles_per_io"] is None
