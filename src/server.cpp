@@ -548,7 +548,7 @@ public:
 }
 
 // Start the permanent control service and provide a factory for temporary workloads. Keep the
-// machine-wide guard and shared controller alive until control workers have finished.
+// machine-wide guard and shared controller alive until the control thread has finished.
 int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
@@ -577,6 +577,7 @@ int main(int argc, char** argv) {
         const auto instance_guard = server_guard();
         reference_clock();
         process_cycles = std::make_unique<ProcessCycles>();
+
         BenchmarkController controller(
             [] {
                 std::array<unsigned char, 32> bytes{};
@@ -593,48 +594,37 @@ int main(int argc, char** argv) {
             },
             [&](const BenchmarkOptions& options, const std::string& id) {
                 return std::make_unique<LinuxBenchmark>(args, options, id);
-            });
-        // Control requests create and stop workloads through the shared controller. Each workload
-        // has its own listener pool, while these workers continue to serve control and telemetry.
+        });
+
+        // Control requests create and stop workloads through the shared controller. Control has
+        // one listener and one thread; only workloads create client-sized listener/worker pools.
         Server server(args);
         server.config.role = AgentConfig::Role::control;
         server.controller = &controller;
         const auto bind_address = args.get("--bind", "0.0.0.0");
         auto port = static_cast<unsigned>(number(args.get("--port", "38443"), 65535));
-        const auto workers = server.config.workers;
-        std::vector<Fd> listeners;
-        for (unsigned i = 0; i < workers; ++i) {
-            listeners.push_back(listener(bind_address, port));
-        }
-        std::mutex error_mutex;
+        auto control_listener = listener(bind_address, port);
         std::string failure;
-        std::vector<std::jthread> threads;
-        try {
-            for (auto& fd : listeners) {
-                threads.emplace_back([&, owned = std::move(fd)]() mutable {
-                    try {
-                        serve(server, std::move(owned));
-                    } catch (const std::exception& error) {
-                        std::lock_guard lock(error_mutex);
-                        failure = error.what();
-                        server.stop = true;
-                    }
-                });
+        // Transfer the listener to the control thread. Main reads failure only after joining
+        // that thread, so recording its terminal error does not need a mutex.
+        std::jthread control_thread([&, owned = std::move(control_listener)]() mutable {
+            try {
+                serve(server, std::move(owned));
+            } catch (const std::exception& error) {
+                failure = error.what();
+                server.stop = true;
             }
-        } catch (...) {
-            server.stop = true;
-            throw;
-        }
+        });
         std::cout << Json{{"event", "listening"},
                           {"bind", bind_address},
                           {"port", port},
                           {"backend", server.config.backend},
-                          {"workers", workers}}
+                          {"workers", server.config.workers}}
                          .dump()
                   << std::endl;
-        // Joining waits for a signal or worker failure to stop the loops. Only afterward is it
-        // safe to inspect the recorded failure and destroy the resources used by those threads.
-        threads.clear();
+        // Wait for a signal or fatal control-loop error to end serve(). Joining makes the error
+        // available to main and keeps the shared server/controller alive until the thread exits.
+        control_thread.join();
         if (!failure.empty()) {
             throw std::runtime_error(failure);
         }
