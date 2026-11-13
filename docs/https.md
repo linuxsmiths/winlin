@@ -264,12 +264,15 @@ activation is **not** evidence of NIC cryptographic offload.
 ## Results and limitations
 
 The console shows a compact per-run table of throughput, p50/p99 latency, errors,
-and estimated reference cycles per I/O (`Ref CPIO`). Decimal table values use two decimal places;
+average whole-server CPU utilization (`Avg CPU(%)`), and estimated reference cycles
+per I/O (`Ref CPIO`). CPU utilization is averaged over each repetition's server-side
+telemetry interval, with 100% representing one logical CPU; unavailable values
+appear as `N/A`. Decimal table values use two decimal places;
 JSON retains measurement precision. The console also shows run-specific warnings,
 such as load-generator CPU saturation or failed requests. General methodology
 caveats and backend measurement limitations appear once in the JSON report's
 top-level `notes` array, not in the console or each repetition's `warnings`.
-Detailed client/server telemetry, CPU utilization percentages, and raw server
+Detailed client/server telemetry, process CPU utilization percentages, and raw server
 counters stay in the JSON file, not the terminal. Report schema version 5
 saves supported choices in `server_capabilities`, the HTTP start response's
 configuration in `server_run`, and the selected workload endpoint.

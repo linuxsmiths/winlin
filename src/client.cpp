@@ -1095,7 +1095,8 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
         write_private(output, report, false);
-        std::cout << "Run  requests/s     p50(us)     p99(us)   errors       Ref CPIO\n";
+        std::cout
+            << "Run  requests/s     p50(us)     p99(us)   errors   Avg CPU(%)       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
             // Run trial() for each repetition, which creates the worker threads, assigns
             // a subset of connections to each worker, issues requests, and collects the
@@ -1109,6 +1110,13 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                       << std::setw(12) << result.at("latency").at("p50_us").get<double>()
                       << std::setw(12) << result.at("latency").at("p99_us").get<double>()
                       << std::setw(9) << result.at("errors").get<std::uint64_t>() << ' ';
+            const auto& cpu = result.at("server_host").at("cpu_utilization_percent");
+            if (cpu.is_null()) {
+                std::cout << std::setw(12) << "N/A";
+            } else {
+                std::cout << std::setw(12) << cpu.get<double>();
+            }
+            std::cout << ' ';
             const auto& cpio = result.at("server_reference_cycles_per_io");
             if (cpio.is_null()) {
                 std::cout << std::setw(14) << "N/A";

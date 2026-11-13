@@ -71,7 +71,8 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                                                      else "fixture counter access denied"),
                 },
                 "host": {
-                    "busy_cpu_seconds": self.server.telemetry_samples * 0.5,
+                    "busy_cpu_seconds": (self.server.telemetry_samples * 0.5
+                                         if self.server.host_cpu_available else None),
                     "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
                     "reference_clock": {
                         "frequency_hz": 20002 if self.server.reference_available else None,
@@ -152,6 +153,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.telemetry_samples = 0
         endpoint.cycles_available = False
         endpoint.reference_available = False
+        endpoint.host_cpu_available = True
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
@@ -240,12 +242,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         report = json.loads(output.read_text())
         table_row = re.compile(
             r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
-            r"(\d+\.\d{2})\s+(\d+)\s+(N/A|\d+\.\d{2})\s*$", re.MULTILINE,
+            r"(\d+\.\d{2})\s+(\d+)\s+(N/A|\d+\.\d{2})\s+"
+            r"(N/A|\d+\.\d{2})\s*$", re.MULTILINE,
         )
         assert "Ref CPIO" in result.stdout
+        assert "Avg CPU(%)" in result.stdout
         assert "{" not in result.stdout, result.stdout
         rows = table_row.findall(result.stdout)
         assert [(row[0], row[-1]) for row in rows] == [("1", "N/A"), ("2", "N/A")]
+        assert [row[-2] for row in rows] == ["200.00", "200.00"]
         assert result.stderr.count(
             "Reference CPIO unavailable: fixture invariant TSC unavailable") == 1
         assert report["schema_version"] == 5
@@ -279,6 +284,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         report = json.loads(output.read_text())
         rows = table_row.findall(result.stdout)
         assert [(row[0], row[-1]) for row in rows] == [("1", "5000.50"), ("2", "5000.50")]
+        assert [row[-2] for row in rows] == ["200.00", "200.00"]
         assert "CPIO unavailable" not in result.stderr, result.stderr
         assert "{" not in result.stdout, result.stdout
         assert all(repetition["server_reference_cycles_per_io"] == 5000.5
@@ -292,6 +298,21 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "control_capabilities" not in report
         assert plain.run_ids and all(value == "aa" * 32 for value in plain.run_ids)
         assert all(value is None for value in plain.authorizations)
+
+        # Missing whole-server counters must not appear as zero CPU utilization.
+        server.host_cpu_available = False
+        output = directory / "unavailable-cpu-benchmark.json"
+        result = subprocess.run(
+            [*benchmark, "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = table_row.findall(result.stdout)
+        assert [(row[-2], row[-1]) for row in rows] == [("N/A", "N/A"), ("N/A", "N/A")]
+        report = json.loads(output.read_text())
+        assert all(repetition["server_host"]["cpu_utilization_percent"] is None
+                   for repetition in report["results"])
+        server.host_cpu_available = True
 
         # Header fragments and preloaded bodies must work across repeated responses on the same
         # connection. Separate writes also split the header across TLS records.
