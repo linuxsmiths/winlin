@@ -7,7 +7,7 @@ usage() {
 Usage: scripts/run-server.sh [--build-dir PATH] [--state-dir PATH] [--] [server arguments...]
 
 Run the Linux server using the repository's build/ and .winlin-local/ directories.
-HTTP control listens on 0.0.0.0:38443 unless --bind/--port overrides it.
+HTTP control listens on 0.0.0.0:38080 unless --bind/--port overrides it.
 Clients select per-run server workers, TLS on/off/kTLS, and cipher.
 Control always runs one worker; workload listeners start only on client request.
 The implementation connection ceiling is 65536 per endpoint; it is not configurable.

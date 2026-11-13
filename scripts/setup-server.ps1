@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$BindAddress = '127.0.0.1',
-    [ValidateRange(1, 65535)][int]$Port = 38443,
+    [ValidateRange(1, 65535)][int]$Port = 38080,
     [ValidateRange(1, 65535)][int]$HttpPort = 38444,
     [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),

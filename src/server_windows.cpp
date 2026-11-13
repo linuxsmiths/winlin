@@ -406,7 +406,7 @@ struct Runtime {
     explicit Runtime(const Args& args)
         : agent(windows_config(), usage, {}, host_usage), stop_file(args.get("--stop-file")),
           address(args.get("--bind", "127.0.0.1")),
-          port(static_cast<unsigned>(number(args.get("--port", "38443"), 65535))) {
+          port(static_cast<unsigned>(number(args.get("--port", "38080"), 65535))) {
         initialize();
     }
 
@@ -961,7 +961,7 @@ public:
 int wmain(int argc, wchar_t** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::wstring_view(argv[1]) == L"--help")) {
-        std::cout << "winlin-server [--bind 127.0.0.1] [--port 38443]\n"
+        std::cout << "winlin-server [--bind 127.0.0.1] [--port 38080]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
                      "  [--stop-file path]\n"
                      "Control uses plain HTTP; per-run workload TLS/cipher/workers are controlled "
@@ -983,7 +983,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         Args args(argc, arguments.data());
         args.allow({"--bind", "--port", "--stop-file", "--http-port", "--https-port"});
-        const auto control_port = number(args.get("--port", "38443"), 65535);
+        const auto control_port = number(args.get("--port", "38080"), 65535);
         const auto http_port =
             static_cast<unsigned>(number(args.get("--http-port", "38444"), 65535));
         const auto https_port =

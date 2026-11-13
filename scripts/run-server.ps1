@@ -5,7 +5,7 @@ param(
     [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
     [string]$ServerExe = '',
     [string]$BindAddress = '127.0.0.1',
-    [ValidateRange(1, 65535)][int]$Port = 38443,
+    [ValidateRange(1, 65535)][int]$Port = 38080,
     [ValidateRange(1, 65535)][int]$HttpPort = 38444,
     [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
     [string]$StopFile,
@@ -20,7 +20,7 @@ Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
     [-HttpPort N] [-HttpsPort N]
     [-StopFile PATH]
 
-Defaults: build\Release\winlin-server.exe, HTTP control 127.0.0.1:38443,
+Defaults: build\Release\winlin-server.exe, HTTP control 127.0.0.1:38080,
 HTTP workload port 38444 and HTTPS workload port 38445.
 Default directories are relative to the repository; supplied
 relative paths use the caller's working directory. -ServerExe overrides binary

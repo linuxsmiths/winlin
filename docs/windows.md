@@ -58,14 +58,14 @@ IPv4 address (use `127.0.0.1` for loopback only):
 
 ```powershell
 $setup = .\scripts\setup-server.ps1 -BindAddress 10.0.0.4 `
-    -Port 38443 -HttpPort 38444 -HttpsPort 38445
+    -Port 38080 -HttpPort 38444 -HttpsPort 38445
 $setup | Format-List
 ```
 
 This imports the bundled **deliberately public** RSA test certificate/key into
 `LocalMachine\My` (or reuses the same existing entry), then creates an HTTP.sys
 SSL binding for the HTTPS workload (**38445**) only, plus HTTP control (default
-**38443**), HTTP workload (**38444**) and HTTPS workload URL reservations for the
+**38080**), HTTP workload (**38444**) and HTTPS workload URL reservations for the
 current user. All three ports must be distinct. The current user owns the state;
 run the server as that same account. Service-account provisioning is not automated.
 
@@ -97,23 +97,29 @@ Control commands, telemetry and run IDs use unencrypted HTTP. Restrict access to
 trusted benchmark clients; workload TLS does not protect the control channel.
 
 When upgrading an existing TLS-control installation, stop the old server and
-replace **only its control** reservation/binding in an elevated PowerShell terminal:
+replace **only its control** reservation/binding in an elevated PowerShell terminal.
+The following example moves the old control endpoint from 38443 to the new default,
+38080, without changing the workload endpoints:
 
 ```powershell
 netsh http delete urlacl url=https://10.0.0.4:38443/
 netsh http delete sslcert ipport=10.0.0.4:38443
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-netsh http add urlacl url=http://10.0.0.4:38443/ user="$user" listen=yes delegate=no
+netsh http add urlacl url=http://10.0.0.4:38080/ user="$user" listen=yes delegate=no
 ```
 
 Use the actual address/port and server account; leave existing workload bindings
 unchanged. Fresh installations should use `setup-server.ps1` instead.
+If the old control endpoint already used plain HTTP, remove its `http://` URL
+reservation instead; there is no control SSL binding to delete. Existing saved
+client targets keep the old port, so register a new target for 38080. Alternatively,
+keep using the old port explicitly with `-Port`/`--port`.
 
 Start the server (the same user can do this without elevation after setup):
 
 ```powershell
 .\scripts\run-server.ps1 -BindAddress 10.0.0.4 `
-    -Port 38443 -HttpPort 38444 -HttpsPort 38445
+    -Port 38080 -HttpPort 38444 -HttpsPort 38445
 ```
 
 The launcher defaults to the repository's `build\Release\winlin-server.exe`.
@@ -197,7 +203,7 @@ fingerprint through an independent trusted channel if using a custom certificate
 The bundled public certificate needs no fingerprint entry:
 
 ```sh
-./scripts/run-client.sh add --host 10.0.0.4 --port 38443 \
+./scripts/run-client.sh add --host 10.0.0.4 --port 38080 \
   --target .winlin-local/windows.json
 
 ./scripts/run-client.sh inspect --target .winlin-local/windows.json
@@ -270,7 +276,7 @@ For intentional manual endpoint removal, stop the server first and delete only
 its configured URL reservation and binding:
 
 ```powershell
-netsh http delete urlacl url=http://10.0.0.4:38443/
+netsh http delete urlacl url=http://10.0.0.4:38080/
 netsh http delete urlacl url=http://10.0.0.4:38444/
 netsh http delete urlacl url=https://10.0.0.4:38445/
 netsh http delete sslcert ipport=10.0.0.4:38445

@@ -334,11 +334,14 @@ Fd server_guard() {
 // the same endpoint so the kernel distributes incoming connections between their listeners.
 // If port is zero, record the kernel-selected port and use it for the remaining workers.
 Fd listener(const std::string& bind_address, unsigned& port) {
+    // Nonblocking socket
     Fd fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (fd.value < 0) {
         throw system_error("socket");
     }
     int one = 1;
+    // SO_REUSEPORT tells the kernel to distribute incoming connections between multiple
+    // listeners on the same endpoint.
     if (setsockopt(fd.value, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
         setsockopt(fd.value, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one))) {
         throw system_error("SO_REUSEPORT");
@@ -553,7 +556,7 @@ int main(int argc, char** argv) {
     using namespace winlin;
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout << "winlin-server [--cert certificate.pem --key private.key]\n"
-                     "  [--bind 0.0.0.0] [--port 38443]\n"
+                     "  [--bind 0.0.0.0] [--port 38080]\n"
                      "  [--http-port 38444] [--https-port 38445]\n"
                      "  Control uses plain HTTP; certificate/key apply only to HTTPS workloads.\n"
                      "  Control runs one worker; no workload listeners start until a client run.\n"
@@ -566,7 +569,7 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_signal);
         Args args(argc, argv);
         args.allow({"--cert", "--key", "--bind", "--port", "--http-port", "--https-port"});
-        const auto control_port = number(args.get("--port", "38443"), 65535);
+        const auto control_port = number(args.get("--port", "38080"), 65535);
         const auto http_port = number(args.get("--http-port", "38444"), 65535);
         const auto https_port = number(args.get("--https-port", "38445"), 65535);
         if ((control_port && (control_port == http_port || control_port == https_port)) ||
@@ -602,7 +605,7 @@ int main(int argc, char** argv) {
         server.config.role = AgentConfig::Role::control;
         server.controller = &controller;
         const auto bind_address = args.get("--bind", "0.0.0.0");
-        auto port = static_cast<unsigned>(number(args.get("--port", "38443"), 65535));
+        auto port = static_cast<unsigned>(number(args.get("--port", "38080"), 65535));
         auto control_listener = listener(bind_address, port);
         std::string failure;
         // Transfer the listener to the control thread. Main reads failure only after joining

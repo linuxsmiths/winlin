@@ -75,7 +75,7 @@ without accepting connections. This guard is released automatically on exit,
 including crashes; an occupied guard port prevents startup with a clear error.
 Linux HTTPS workers retain their independent `SO_REUSEPORT` listeners.
 
-The Linux HTTP control listener defaults to `0.0.0.0:38443` (all IPv4 interfaces), so a
+The Linux HTTP control listener defaults to `0.0.0.0:38080` (all IPv4 interfaces), so a
 separate client machine can connect without an extra server argument. Use
 `--bind 127.0.0.1` for loopback-only testing, or specify an individual test-network
 IPv4 address. The instance guard remains loopback-only. Restrict access using
@@ -101,10 +101,11 @@ only when a run is requested and are destroyed when it ends. Startup `--workers`
 is no longer supported; use the client's `--server-workers` for workload sizing.
 There is no control cipher option.
 
-After upgrading from TLS control, rebuild and restart both client and server.
-Port 38443 is unchanged; old target files remain readable and their obsolete
-control-cipher value is ignored. Windows needs an HTTP control URL reservation
-instead of the old HTTPS reservation/binding; see the Windows migration instructions.
+After upgrading, rebuild and restart both client and server. The control port now
+defaults to **38080**, replacing 38443. Existing target files keep their saved port;
+register a new target for 38080 or explicitly keep the server on the old port.
+Their obsolete control-cipher value is ignored. Windows needs an HTTP control URL
+reservation for the selected port; see the Windows migration instructions.
 Update firewall/VNet rules as needed. A less common port does not replace isolation.
 
 The client already knows the bundled workload certificate, so no fingerprint entry is needed:

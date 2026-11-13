@@ -1203,7 +1203,7 @@ void interactive() {
             if (action == "1") {
                 const auto host = prompt("Server IPv4 address");
                 check_host(host);
-                const auto port = prompt("Agent port", "38443");
+                const auto port = prompt("Agent port", "38080");
                 add_target(host, port, std::string(benchmark_certificate_sha256),
                            state_directory() / (host + "-" + port + ".json"));
             } else if (action == "2") {
@@ -1268,7 +1268,7 @@ int main(int argc, char** argv) {
                 << "winlin                         Interactive console\n"
                    "winlin add --host IP --target FILE [--fingerprint "
                    "SHA256]\n"
-                   "            [--port 38443] Control uses plain HTTP.\n"
+                   "            [--port 38080] Control uses plain HTTP.\n"
                    "            HTTPS workloads default to the PUBLIC benchmark certificate.\n"
                    "            Custom workload certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
@@ -1284,7 +1284,7 @@ int main(int argc, char** argv) {
         Args args(argc, argv, 2);
         if (command == "add" || command == "pair") {
             args.allow({"--host", "--port", "--fingerprint", "--target"});
-            add_target(args.require("--host"), args.get("--port", "38443"),
+            add_target(args.require("--host"), args.get("--port", "38080"),
                        args.get("--fingerprint", std::string(benchmark_certificate_sha256)),
                        args.require("--target"));
             return 0;

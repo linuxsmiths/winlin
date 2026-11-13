@@ -133,7 +133,7 @@ exit 0
         throw "Default launch must need no state files: $($result.Output)"
     }
     $arguments = ($result.Output | Where-Object { $_.StartsWith('[') }) | ConvertFrom-Json
-    $expected = @('--bind', '127.0.0.1', '--port', '38443',
+    $expected = @('--bind', '127.0.0.1', '--port', '38080',
         '--http-port', '38444', '--https-port', '38445')
     if (Compare-Object -ReferenceObject $expected -DifferenceObject $arguments -SyncWindow 0) {
         throw "Default launcher endpoints changed unexpectedly: $arguments"
