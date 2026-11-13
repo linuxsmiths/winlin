@@ -53,7 +53,7 @@ also sets the default job count. Selecting a component reconfigures that build
 directory; use separate build directories to retain independent client/server
 configurations. HTTPS integration tests are included only when both are enabled.
 
-Prep installs compiler/build tools, OpenSSL development/runtime packages,
+Prep installs compiler/build tools, gperftools development/runtime packages, OpenSSL,
 nlohmann/json, Python, and CA certificates. It does not configure TLS identities,
 firewalls, kernel modules, persistent file descriptor limits, or benchmark tuning;
 see the HTTPS guide for runtime setup. It adds no third-party package repositories.
@@ -65,6 +65,22 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Linux client, server, and C++ tests use **gperftools minimal tcmalloc by default**.
+`WINLIN_USE_TCMALLOC` is a CMake switch; to use the system allocator instead:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWINLIN_USE_TCMALLOC=OFF
+```
+
+The build script preserves this cached choice. An enabled option requires
+`libtcmalloc_minimal` (`libgoogle-perftools-dev` on Ubuntu); missing dependencies
+are configuration errors, not a silent fallback. Windows defaults to its native
+allocator and rejects enabling this Linux-only option. Environment metadata
+records the build-selected `allocator` as `tcmalloc_minimal` or `system`; compare
+results with that distinction in mind. External allocator overrides such as
+`LD_PRELOAD` are not detected. This option changes allocation, not the selected
+HTTP/TLS backend, and does not eliminate per-request allocations.
 
 See [the HTTPS quickstart](docs/https.md) for certificate setup, registration, workloads,
 results, and current limitations. A deliberately public certificate/key is

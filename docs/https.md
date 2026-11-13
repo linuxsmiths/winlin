@@ -352,6 +352,13 @@ the full response. Percentile estimates use bounded-memory logarithmic buckets
 with approximately 1.56% relative bucket width. Latency samples describe
 successful requests only; inspect errors and timeouts separately.
 
+Client and server environment metadata include the build-selected process
+`allocator`: Linux defaults to `tcmalloc_minimal`, with
+`-DWINLIN_USE_TCMALLOC=OFF` selecting `system`. Windows uses `system`.
+These configurations are not allocator-equivalent, so retain the metadata when
+comparing OS results. External overrides such as `LD_PRELOAD` are not detected,
+and process allocator selection does not describe HTTP.sys kernel allocations.
+
 Important limitations:
 
 - This is a closed-loop generator. It does not measure latency under a fixed

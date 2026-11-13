@@ -48,6 +48,7 @@ packages=(
     build-essential
     ca-certificates
     cmake
+    libgoogle-perftools-dev
     libssl-dev
     nlohmann-json3-dev
     openssl

@@ -403,6 +403,7 @@ inline Json environment() {
             {"openssl", nullptr},
             {"winlin_version", WINLIN_VERSION},
             {"build_type", WINLIN_BUILD_TYPE},
+            {"allocator", WINLIN_ALLOCATOR},
             {"compiler", compiler}};
 }
 }

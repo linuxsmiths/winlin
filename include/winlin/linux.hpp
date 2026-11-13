@@ -613,6 +613,7 @@ inline Json environment() {
             {"openssl", OpenSSL_version(OPENSSL_VERSION)},
             {"winlin_version", WINLIN_VERSION},
             {"build_type", WINLIN_BUILD_TYPE},
+            {"allocator", WINLIN_ALLOCATOR},
             {"compiler", __VERSION__}};
 }
 

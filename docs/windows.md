@@ -47,6 +47,12 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DWINLIN_BUILD_CLIENT=OFF
 cmake --build build --config Release --parallel 2
 ```
 
+Windows uses its native process allocator (`allocator: system` in environment
+metadata). Winlin's `WINLIN_USE_TCMALLOC` option is currently Linux-only and
+defaults to OFF on Windows. Upstream gperftools supports Windows
+`tcmalloc_minimal`, but Winlin does not yet integrate it. The Linux default-on
+allocator option does not change HTTP.sys/Schannel.
+
 ## Configure control and workload endpoints
 
 HTTP.sys owns TLS termination, so certificates belong in the Windows certificate

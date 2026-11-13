@@ -326,6 +326,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             )
             report = json.loads(output.read_text())
             assert report["status"] == "completed" and len(report["results"]) == 2
+            assert (report["client_environment"]["allocator"] ==
+                    report["server_capabilities"]["environment"]["allocator"] ==
+                    capabilities["environment"]["allocator"])
             assert report["server_configuration"]["workers"] == workers
             assert report["server_run"]["transport"] == ("http" if mode == "off" else "https")
             assert "control_capabilities" not in report

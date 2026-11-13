@@ -5,16 +5,40 @@ include(CTest)
 include(FetchContent)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(client_default ON)
+  set(tcmalloc_default ON)
 else()
   set(client_default OFF)
+  set(tcmalloc_default OFF)
 endif()
 option(WINLIN_BUILD_CLIENT "Build the Linux client" ${client_default})
 option(WINLIN_BUILD_SERVER "Build the native benchmark server" ON)
 option(WINLIN_WINDOWS_HTTPS_TESTS "Run privileged Windows HTTP.sys loopback tests" OFF)
+option(WINLIN_USE_TCMALLOC "Use gperftools minimal tcmalloc for Linux executables" ${tcmalloc_default})
 if(WINLIN_BUILD_CLIENT AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "The client is Linux-only; configure with -DWINLIN_BUILD_CLIENT=OFF.")
 endif()
 find_package(Threads REQUIRED)
+
+# Keep allocator selection consistent across the client, server, and C++ tests. An enabled option
+# must not silently fall back, since allocator differences can affect benchmark comparisons.
+add_library(winlin_allocator INTERFACE)
+set(winlin_allocator_name "system")
+if(WINLIN_USE_TCMALLOC)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "WINLIN_USE_TCMALLOC is supported only on Linux; configure it OFF on Windows.")
+  endif()
+  find_library(WINLIN_TCMALLOC_LIBRARY NAMES tcmalloc_minimal)
+  if(NOT WINLIN_TCMALLOC_LIBRARY)
+    message(FATAL_ERROR
+      "WINLIN_USE_TCMALLOC=ON requires gperftools libtcmalloc_minimal. "
+      "Install libgoogle-perftools-dev on Ubuntu, or configure -DWINLIN_USE_TCMALLOC=OFF.")
+  endif()
+  mark_as_advanced(WINLIN_TCMALLOC_LIBRARY)
+  target_link_libraries(winlin_allocator INTERFACE "${WINLIN_TCMALLOC_LIBRARY}" Threads::Threads)
+  set(winlin_allocator_name "tcmalloc_minimal")
+endif()
+message(STATUS "Winlin process allocator: ${winlin_allocator_name}")
+
 find_package(nlohmann_json 3.11 QUIET)
 if(NOT nlohmann_json_FOUND)
   # Pin and verify the fallback dependency rather than changing the code used between runs.
@@ -33,8 +57,9 @@ target_include_directories(winlin_core INTERFACE include)
 target_compile_features(winlin_core INTERFACE cxx_std_23)
 target_compile_definitions(winlin_core INTERFACE
   WINLIN_VERSION="${PROJECT_VERSION}" WINLIN_BUILD_TYPE="$<CONFIG>"
+  WINLIN_ALLOCATOR="${winlin_allocator_name}"
   WINLIN_BENCHMARK_CERTIFICATE_SHA256="${benchmark_certificate_sha256}")
-target_link_libraries(winlin_core INTERFACE nlohmann_json::nlohmann_json)
+target_link_libraries(winlin_core INTERFACE nlohmann_json::nlohmann_json winlin_allocator)
 if(MSVC)
   target_compile_options(winlin_core INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus)
 else()

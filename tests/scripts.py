@@ -160,6 +160,18 @@ class Scripts(unittest.TestCase):
         self.assertFalse(self.calls("apt-get"))
         self.assertFalse(self.calls("sudo"))
 
+    def test_prep_requires_tcmalloc_for_default_builds(self):
+        """Check and install the allocator dependency without changing the real host."""
+        result = self.run_script(
+            "prep.sh", "--check", expected=1, WINLIN_TEST_MISSING="libgoogle-perftools-dev",
+        )
+        self.assertIn("libgoogle-perftools-dev", result.stderr)
+        self.assertFalse(self.calls("apt-get"))
+        self.run_script("prep.sh", WINLIN_TEST_MISSING="libgoogle-perftools-dev")
+        self.assertEqual(self.calls("apt-get"), [
+            ["update"], ["install", "-y", "--no-install-recommends", "libgoogle-perftools-dev"],
+        ])
+
     def test_prep_installs_only_missing_packages_and_is_idempotent(self):
         environment = {"WINLIN_TEST_MISSING": "nlohmann-json3-dev"}
         self.run_script("prep.sh", **environment)
