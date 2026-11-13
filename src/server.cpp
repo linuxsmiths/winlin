@@ -414,6 +414,52 @@ Fd listener(const std::string& bind_address, unsigned& port) {
     return fd;
 }
 
+// Accept a bounded batch into the worker-owned session map without starving existing connections.
+// Keep connection setup out of serve()'s hot instruction path; persistent workloads rarely accept
+// new connections after setup. Failures propagate to the worker's owner, as in the event loop.
+[[gnu::cold, gnu::noinline]] void
+accept_connections(Server& server, int listener_fd, Epoll& poller,
+                   std::unordered_map<int, std::unique_ptr<Session>>& sessions) {
+    // Reserve a slot in the server-wide counter before creating a Session.
+    for (unsigned accepted = 0; accepted < 256; ++accepted) {
+        Fd client(accept4(listener_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+        if (client.value < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            throw system_error("accept");
+        }
+        // Do not allow more than the configured number of concurrent connections
+        // to the server.
+        if (server.active.fetch_add(1) >= server.config.connection_limit) {
+            log_warning("Server connection limit reached; rejecting connection");
+            --server.active;
+            continue;
+        }
+
+        // Accepted socket fd
+        const int client_fd = client.value;
+        try {
+            // One Session per accepted connection.
+            auto session = std::make_unique<Session>(std::exchange(client.value, -1), server);
+            sessions.emplace(client_fd, std::move(session));
+            // Register this newly accepted socket fd with epoll
+            poller.set(client_fd, EPOLLIN, true);
+            ++server.connections;
+        } catch (...) {
+            // Undo the reserved slot if construction failed. If a Session was inserted,
+            // erasing it releases the slot through its destructor instead.
+            if (!sessions.erase(client_fd)) {
+                --server.active;
+            }
+            throw;
+        }
+    }
+}
+
 // Run one server worker's event loop. This thread owns its listener, epoll queue, and all sessions
 // accepted through that listener; other workers never access those sessions.
 //
@@ -448,50 +494,11 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
         // Process all ready sockets.
         for (int i = 0; i < count; ++i) {
             const int fd = events[i].data.fd;
-            if (fd == listener_fd.value) {
-                // Ready event on listener socket means one or more new connections are
-                // waiting to be accepted.
-                // Bound each accept batch so a busy listener does not starve existing requests.
-                // Reserve a slot in the server-wide counter before creating a Session.
-                for (unsigned accepted = 0; accepted < 256; ++accepted) {
-                    Fd client(accept4(fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
-                    if (client.value < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        throw system_error("accept");
-                    }
-                    // Do not allow more than the configured number of concurrent connections
-                    // to the server.
-                    if (server.active.fetch_add(1) >= server.config.connection_limit) {
-                        log_warning("Server connection limit reached; rejecting connection");
-                        --server.active;
-                        continue;
-                    }
-
-                    // Accepted socket fd
-                    const int client_fd = client.value;
-                    try {
-                        // One Session per accepted connection.
-                        auto session =
-                            std::make_unique<Session>(std::exchange(client.value, -1), server);
-                        sessions.emplace(client_fd, std::move(session));
-                        // Register this newly accepted socket fd with epoll
-                        poller.set(client_fd, EPOLLIN, true);
-                        ++server.connections;
-                    } catch (...) {
-                        // Undo the reserved slot if construction failed. If a Session was inserted,
-                        // erasing it releases the slot through its destructor instead.
-                        if (!sessions.erase(client_fd)) {
-                            --server.active;
-                        }
-                        throw;
-                    }
-                }
-            } else if (const auto it = sessions.find(fd); it != sessions.end()) {
+            if (fd == listener_fd.value) [[unlikely]] {
+                accept_connections(server, listener_fd.value, poller, sessions);
+                continue;
+            }
+            if (const auto it = sessions.find(fd); it != sessions.end()) {
                 // Activity on an accepted socket fd.
                 // Keep live sessions registered for their next required event. Erasing a session
                 // closes its descriptor, which also removes the descriptor from epoll.
