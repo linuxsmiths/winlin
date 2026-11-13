@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from https_contract import exercise_single_instance, tls_context
+from https_contract import exercise_request_reuse, exercise_single_instance, pending_puts, tls_context
 
 
 SERVER, CLIENT = sys.argv[1:3]
@@ -345,6 +345,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
 
         for mode in ("off", "on"):
             lease = controller.start(tls=mode, workers=1)
+            pending = []
             try:
                 exercise_receive_buffer(lease)
                 measured = controller.telemetry(lease)
@@ -352,8 +353,16 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert measured["put_completed"] == 1, measured
                 assert measured["put_bytes"] == 65536, measured
                 exercise_session_events(lease)
+                puts_before = controller.telemetry(lease)["put_completed"]
+                exercise_request_reuse(lambda: Workload(lease).connection, lease["run_id"])
+                assert controller.telemetry(lease)["put_completed"] == puts_before + 39
+                pending = pending_puts(lambda: Workload(lease).connection, lease["run_id"], 6)
             finally:
-                controller.finish(lease)
+                try:
+                    controller.finish(lease)
+                finally:
+                    for connection in pending:
+                        connection.close()
 
         for mode, workers in (("on", 1), ("off", 4), ("on", 2)):
             output = directory / f"{mode}-{workers}.json"

@@ -256,6 +256,15 @@ be rejected by the kernel before reaching the shared agent. Every workload
 response explicitly disables HTTP.sys response caching. Both servers reuse a
 pre-generated payload and fully consume PUT bodies before acknowledging them.
 
+Windows workers also reuse whole request contexts, including their 64 KiB native
+receive buffers and 16 KiB body buffers. Each worker retains at most 16 idle
+contexts; this is a cache bound, not a connection or active-request limit.
+Warm reuse resets metadata without clearing those large buffers. Additional
+contexts are allocated on cache misses and freed when the idle cache is full.
+Small atomic reference counts protect submissions and completions that overlap
+across workers; contexts cannot be reused until every reference finishes.
+Shutdown drains active operations and releases each worker's cached storage.
+
 ## Tests
 
 Ordinary Windows tests cover the shared agent, core behavior, native credential
@@ -274,7 +283,8 @@ modules load correctly even when CTest is invoked from PowerShell 7.
 These tests provision the public certificate, one SSL binding and three URL
 reservations on distinct ephemeral loopback ports. They exercise exclusive run
 ownership, bounded/split control JSON, lease expiry, live HTTP/HTTPS and worker
-switching, workload isolation, concurrent/persistent GET/PUT,
+switching, workload isolation, concurrent/persistent GET/PUT, request-context reuse
+across zero/nonzero bodies, cache overflow, abandoned PUTs and shutdown with pending body reads,
 TLS/cipher rejection, process cycle telemetry, and control discovery across restarts,
 then remove their own resources. They do not change global cipher policy.
 

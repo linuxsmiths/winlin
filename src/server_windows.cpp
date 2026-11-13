@@ -269,6 +269,7 @@ ConnectionInfo connection_info(const HTTP_REQUEST& request) {
 }
 
 struct Runtime;
+struct RequestCache;
 
 // Carry one HTTP request through an asynchronous receive -> optional body reads -> response send.
 // Unlike a Linux Session, this object represents a request, not a persistent client connection.
@@ -276,12 +277,13 @@ struct Runtime;
 //
 // Runtime posts receives before requests arrive. Each Request submits one operation at a time,
 // and an IOCP worker calls complete() when that operation finishes. The next completion may run on
-// a different worker thread, but operations for this object are handled sequentially.
+// a different worker thread, even before the submitting callback returns. References keep both
+// the submitter and each outstanding completion alive until they finish using this object.
 //
 // Store headers, body buffers, response structures, and OVERLAPPED state here because HTTP.sys may
-// still reference them after an API call returns. Terminal completion deletes this object;
-// cancellation must also finish through a completion before its buffers can be released.
-// Runtime and its shared GET payload must remain alive until every Request has been destroyed.
+// still reference them after an API call returns. The final reference returns this object and its
+// buffers to the current worker's bounded cache, or deletes them during shutdown/cache overflow.
+// Runtime and its shared GET payload must outlive every reference and every worker cache.
 struct Request {
     // IOCP returns the OVERLAPPED pointer submitted to HTTP.sys. Keep it first so the worker can
     // recover this enclosing operation and its Request without a separate lookup table.
@@ -292,6 +294,7 @@ struct Request {
     } operation;
 
     Runtime& runtime;
+    std::atomic<unsigned> references{};
     enum class State { receive, body, send } state{State::receive};
     std::vector<std::max_align_t> storage;
     std::array<char, 16384> body_buffer{};
@@ -310,21 +313,64 @@ struct Request {
     std::string content_length;
 
     explicit Request(Runtime& owner);
-    ~Request();
 
     // View the aligned receive storage as the native request structure filled by HTTP.sys.
     HTTP_REQUEST* header() {
         return reinterpret_cast<HTTP_REQUEST*>(storage.data());
     }
 
+    void prepare();
+    void release(RequestCache* cache) noexcept;
     void receive();
     void read_body();
     void send();
-    void complete(ULONG error, DWORD bytes) noexcept;
+    void complete(ULONG error, DWORD bytes, RequestCache& cache) noexcept;
     void submitted(ULONG result);
 };
 
 static_assert(offsetof(Request::Operation, overlapped) == 0);
+
+// Retain a small hot set of whole requests, including their 64 KiB receive and 16 KiB body buffers.
+// Only the owning IOCP worker accesses this cache, so checkout/return needs no shared pool lock.
+// At most 16 idle requests remain per worker: about 1.3 MiB of native/body buffers, plus metadata
+// and any retained control JSON capacity. Active requests are not capped here.
+// Worker exit destroys idle storage before Runtime joins the thread and releases native handles.
+struct RequestCache {
+    std::array<std::unique_ptr<Request>, 16> idle;
+    std::size_t count{};
+
+    // Transfer an idle request to the caller, or request a fresh allocation when the cache is
+    // empty.
+    Request* take() noexcept {
+        if (!count) {
+            return nullptr;
+        }
+        return idle[--count].release();
+    }
+
+    // Take ownership only when there is room; the caller deletes requests that exceed the bound.
+    bool put(Request* request) noexcept {
+        if (count == idle.size()) {
+            return false;
+        }
+        idle[count++].reset(request);
+        return true;
+    }
+};
+
+// Release one adopted caller/completion reference on every exit path, including exceptions.
+// The optional cache belongs to the current thread, not necessarily the request's original worker.
+// This deleter recycles only the final reference; it does not necessarily destroy the Request.
+struct RequestReleaser {
+    RequestCache* cache{};
+
+    // Pair an existing reference with its eventual release, without acquiring another reference.
+    void operator()(Request* request) const noexcept {
+        request->release(cache);
+    }
+};
+
+using RequestReference = std::unique_ptr<Request, RequestReleaser>;
 
 // Run either the permanent control endpoint or one temporary workload using native HTTP.sys.
 // Agent supplies common routing and telemetry. HTTP.sys owns HTTP framing, client connections,
@@ -335,8 +381,9 @@ static_assert(offsetof(Request::Operation, overlapped) == 0);
 // can keep arriving while earlier requests read bodies or send responses.
 //
 // Shutdown first prevents new request receives and cancels queued I/O. Workers keep processing
-// completion packets until live reaches zero, meaning every Request has released its buffers.
-// Join those workers before closing HTTP.sys/IOCP handles or destroying the shared GET payload.
+// completion packets until live reaches zero, meaning no request has a caller or completion
+// reference. Workers then destroy their idle caches. Join them before closing HTTP.sys/IOCP
+// handles or destroying the shared GET payload.
 // Process telemetry covers this application only, not kernel HTTP.sys/Schannel work charged to
 // System.
 struct Runtime {
@@ -478,11 +525,18 @@ struct Runtime {
         }
     }
 
-    // Post another asynchronous header receive unless shutdown has started. This is a pending
-    // HTTP request receive, not a TCP accept; HTTP.sys manages the underlying connections.
-    void accept() {
+    // Reuse a worker-local context when available, then post an asynchronous HTTP request receive,
+    // not a TCP accept. Initial receives have no worker cache. Keep a caller reference until the
+    // submission returns, because its IOCP completion may already be running on another worker.
+    void accept(RequestCache* cache = nullptr) {
         if (!stopping) {
-            (new Request(*this))->receive();
+            auto* request = cache ? cache->take() : nullptr;
+            if (!request) {
+                request = new Request(*this);
+            }
+            request->prepare();
+            const RequestReference reference(request, RequestReleaser{cache});
+            request->receive();
         }
     }
 
@@ -490,6 +544,7 @@ struct Runtime {
     // During shutdown, continue until all live requests are gone: cancelled operations still
     // require their completion packets before the referenced buffers can safely be destroyed.
     void worker() {
+        RequestCache cache;
         while (!stopping || live.load() != 0) {
             DWORD bytes{};
             ULONG_PTR key{};
@@ -513,7 +568,8 @@ struct Runtime {
             } else if (!success) {
                 error = completion_error;
             }
-            operation->request->complete(error, bytes);
+            const RequestReference reference(operation->request, RequestReleaser{&cache});
+            reference->complete(error, bytes, cache);
         }
     }
 
@@ -616,30 +672,57 @@ struct Runtime {
     }
 };
 
-// Allocate aligned header storage and register this request in Runtime's live-object count.
-// That count keeps shutdown workers running until the request's terminal cleanup is complete.
+// Allocate receive/body storage once per context, not once per HTTP request on a warm cache.
+// Native I/O keeps the same aligned buffer address until the context's final reference is released.
 Request::Request(Runtime& owner)
     : runtime(owner), storage((65536 + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t)) {
     operation.request = this;
+}
+
+// Reset only per-request metadata after exclusive checkout. Do not clear the large receive/body
+// buffers: HTTP.sys writes the returned bytes, and body consumers read only completed byte counts.
+// Clear the native request ID explicitly so a failed receive cannot cancel a previous request.
+void Request::prepare() {
+    id = HTTP_NULL_ID;
+    header()->RequestId = HTTP_NULL_ID;
+    reply = AgentReply{};
+    parsed_head = {};
+    connection = {};
+    control_body.clear();
+    remaining = 0;
+    content_length.clear();
+    references.store(1, std::memory_order_relaxed);
     ++runtime.live;
 }
 
-// Tell shutdown workers that this request no longer owns any pending-operation buffers.
-Request::~Request() {
-    --runtime.live;
+// Return storage only after every submitting caller and completion has stopped using it.
+// The final release may occur on a different worker; use that worker's cache, never a remote one.
+// Keep live nonzero through cleanup so shutdown cannot mistake a retiring request for idle work.
+void Request::release(RequestCache* cache) noexcept {
+    if (references.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+    }
+    auto& owner = runtime;
+    if (owner.stopping || !cache || !cache->put(this)) {
+        delete this;
+    }
+    --owner.live;
 }
 
 // Handle the submission result, not the eventual I/O result. Successful and pending operations
 // already produce IOCP packets. An immediate failure has no native packet, so enqueue one to let
 // complete() perform the same error handling and cleanup. If enqueueing also fails, no operation
-// is pending: report a fatal runtime error and delete this Request directly.
+// is pending: drop its completion reference and report a fatal runtime error. The caller still
+// owns a reference until the submission returns, so this cannot recycle a context underneath it.
 void Request::submitted(ULONG result) {
     if (result != NO_ERROR && result != ERROR_IO_PENDING) {
+        RequestReference completion(this, RequestReleaser{});
         operation.immediate_error = result;
-        if (!PostQueuedCompletionStatus(runtime.completion_port.value, 0, 0,
-                                        &operation.overlapped)) {
+        if (PostQueuedCompletionStatus(runtime.completion_port.value, 0, 0,
+                                       &operation.overlapped)) {
+            completion.release();
+        } else {
             runtime.fail("Cannot enqueue HTTP.sys I/O error");
-            delete this;
         }
     }
 }
@@ -650,6 +733,7 @@ void Request::receive() {
     state = State::receive;
     operation.overlapped = {};
     operation.immediate_error = 0;
+    references.fetch_add(1, std::memory_order_relaxed);
     submitted(HttpReceiveHttpRequest(runtime.queue.value, HTTP_NULL_ID, 0, header(),
                                      static_cast<ULONG>(storage.size() * sizeof(std::max_align_t)),
                                      nullptr, &operation.overlapped));
@@ -675,6 +759,7 @@ void Request::read_body() {
     state = State::body;
     operation.overlapped = {};
     operation.immediate_error = 0;
+    references.fetch_add(1, std::memory_order_relaxed);
     submitted(
         HttpReceiveRequestEntityBody(runtime.queue.value, id, 0, body_buffer.data(),
                                      static_cast<ULONG>(std::min(body_buffer.size(), remaining)),
@@ -725,6 +810,7 @@ void Request::send() {
     }
     operation.overlapped = {};
     operation.immediate_error = 0;
+    references.fetch_add(1, std::memory_order_relaxed);
     submitted(HttpSendHttpResponse(
         runtime.queue.value, id, reply.close ? HTTP_SEND_RESPONSE_FLAG_DISCONNECT : 0, &response,
         &cache_policy, nullptr, nullptr, 0, &operation.overlapped, nullptr));
@@ -732,13 +818,13 @@ void Request::send() {
 
 // Advance this request after one operation completes. Header completion dispatches through Agent,
 // body completion consumes bytes and schedules another read or a response, and successful send
-// completion records GET counters and deletes the request.
+// completion records GET counters. The worker releases this callback's reference on return.
 //
 // Errors and shutdown also end the request, cancelling it in HTTP.sys when an ID is available.
 // Catch exceptions here because they must reach the Runtime controller, not escape an IOCP worker.
-// After submitting the next operation or deleting this object, the current callback must not
-// continue using its buffers: another worker may handle the next completion.
-void Request::complete(ULONG error, DWORD bytes) noexcept {
+// A caller reference prevents early reuse while submission unwinds, but does not permit reading
+// mutable request fields after another operation is posted: another worker may already own them.
+void Request::complete(ULONG error, DWORD bytes, RequestCache& cache) noexcept {
     try {
         if (state == State::receive) {
             // Replace a finished header receive promptly so new requests can arrive while this
@@ -748,7 +834,7 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
                 error == ERROR_NOT_ENOUGH_MEMORY) {
                 runtime.fail(windows_error("HttpReceiveHttpRequest", error).what());
             } else {
-                runtime.accept();
+                runtime.accept(&cache);
             }
         }
         if (runtime.stopping || error != NO_ERROR) {
@@ -763,7 +849,6 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
                     log_warning(windows_error("HttpCancelHttpRequest", result).what());
                 }
             }
-            delete this;
             return;
         }
         if (state == State::receive) {
@@ -810,7 +895,6 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
                 ++runtime.agent.gets;
                 runtime.agent.get_bytes += reply.size;
             }
-            delete this;
         }
     } catch (const std::exception& failure) {
         runtime.fail(failure.what());
@@ -820,7 +904,6 @@ void Request::complete(ULONG error, DWORD bytes) noexcept {
                 log_warning(windows_error("HttpCancelHttpRequest after failure", result).what());
             }
         }
-        delete this;
     }
 }
 

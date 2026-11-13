@@ -24,3 +24,44 @@ def tls_context():
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.maximum_version = ssl.TLSVersion.TLSv1_3
     return context
+
+
+def pending_puts(connect, run_id, count):
+    """Keep body reads outstanding until the caller supplies the rest or cancels them."""
+    connections = []
+    try:
+        for _ in range(count):
+            connection = connect()
+            connections.append(connection)
+            connection.putrequest("PUT", "/v1/object")
+            connection.putheader("X-Winlin-Run", run_id)
+            connection.putheader("Content-Length", "32769")
+            connection.endheaders()
+            connection.send(b"x")
+        return connections
+    except BaseException:
+        for connection in connections:
+            connection.close()
+        raise
+
+
+def exercise_request_reuse(connect, run_id):
+    """Exercise context turnover, multi-read bodies, cancellation, and clean metadata on reuse."""
+    # Exceed a Windows worker's idle-cache capacity without changing the active-request limit.
+    # Abandon one body, then verify subsequent nonempty and empty responses have clean framing.
+    connections = pending_puts(connect, run_id, 40)
+    try:
+        connections[0].close()
+        for connection in connections[1:]:
+            connection.send(b"x" * 32768)
+            response = connection.getresponse()
+            assert response.status == 200 and response.read() == b""
+            for size in (512, 0):
+                connection.request(
+                    "GET", f"/v1/object?size={size}", headers={"X-Winlin-Run": run_id},
+                )
+                response = connection.getresponse()
+                assert response.status == 200 and len(response.read()) == size
+    finally:
+        for connection in connections:
+            connection.close()

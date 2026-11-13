@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 
-from https_contract import exercise_single_instance, tls_context
+from https_contract import exercise_request_reuse, exercise_single_instance, pending_puts, tls_context
 
 
 SERVER, PORT, HTTP_PORT, HTTPS_PORT, PIN, STOP_FILE = sys.argv[1:]
@@ -152,17 +152,26 @@ def exercise_run(agent, cipher, mode, workers):
         """Exercise persistent IOCP GET/PUT chains from independent client connections."""
         connection = data_connection(mode)
         try:
-            for operation in range(8):
+            for operation in range(32):
                 method = "GET" if (index + operation) % 2 else "PUT"
-                path = "/v1/object?size=4096" if method == "GET" else "/v1/object"
-                body = None if method == "GET" else b"x" * 4096
+                size = (0, 256, 16384, 65536)[(index + operation // 2) % 4]
+                path = f"/v1/object?size={size}" if method == "GET" else "/v1/object"
+                body = None if method == "GET" else b"x" * size
                 status, payload = request(connection, method, path, run_id, body)
-                assert status == 200 and len(payload) == (4096 if method == "GET" else 0)
+                assert status == 200 and len(payload) == (size if method == "GET" else 0)
         finally:
             connection.close()
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(load, range(8)))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(load, range(16)))
+
+    status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
+    assert status == 200, payload
+    puts_before = json.loads(payload)["put_completed"]
+    exercise_request_reuse(lambda: data_connection(mode), run_id)
+    status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
+    assert status == 200, payload
+    assert json.loads(payload)["put_completed"] == puts_before + 39
 
     if mode == "off":
         # HTTP.sys may support HTTP/2 globally, but this benchmark must reject non-HTTP/1.1 data.
@@ -189,7 +198,14 @@ def exercise_run(agent, cipher, mode, workers):
     else:
         assert process["cpu_cycles"] > 0 and process["cpu_cycles_source"] == "QueryProcessCycleTime"
         assert process["cpu_cycles_unavailable_reason"] is None
-    assert agent.request("POST", f"/v1/benchmark/stop?run_id={run_id}")[0] == 200
+    # Stop while real body operations are pending, not just idle header receives. Their cancelled
+    # completions and all cached contexts must drain before the next Runtime can take the endpoint.
+    pending = pending_puts(lambda: data_connection(mode), run_id, 6)
+    try:
+        assert agent.request("POST", f"/v1/benchmark/stop?run_id={run_id}")[0] == 200
+    finally:
+        for connection in pending:
+            connection.close()
     assert agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")[0] == 409
 
 
