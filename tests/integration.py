@@ -311,13 +311,14 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n2\n1\n"
-                           f"3\n1\noff\n2\nget\n256\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
+                           f"3\n1\noff\n2\nget\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout
         assert "authentication" not in menu.stdout and "Trust this certificate?" not in menu.stdout
         assert "Server connection limit" not in menu.stdout
         assert "TLS 1.3 cipher" not in menu.stdout
+        assert "GET size" in menu.stdout and "PUT size" not in menu.stdout
         menu_report = json.loads(menu_output.read_text())
         assert menu_report["benchmark"] == "http"
         assert menu_report["server_configuration"]["workers"] == 2

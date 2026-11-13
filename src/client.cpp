@@ -1043,8 +1043,12 @@ void interactive() {
                 config.method = lower(prompt("Method: get / put / mixed", "get"));
                 std::cout << "Size presets: 256B, 512B, 1KiB, 4KiB, 8KiB, 16KiB, 64KiB, 256KiB, "
                              "1MiB, 4MiB\n";
-                config.get_size = object_size(prompt("GET size", "4KiB"));
-                config.put_size = object_size(prompt("PUT size", "4KiB"));
+                if (config.method == "get" || config.method == "mixed") {
+                    config.get_size = object_size(prompt("GET size", "4KiB"));
+                }
+                if (config.method == "put" || config.method == "mixed") {
+                    config.put_size = object_size(prompt("PUT size", "4KiB"));
+                }
                 if (config.method == "mixed") {
                     config.get_percent =
                         number(prompt("GET percentage by request count", "50"), 100);

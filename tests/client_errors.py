@@ -114,6 +114,11 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         else:
             self.respond({"error": "Unsupported route"}, status=404)
 
+    def do_PUT(self):
+        """Consume the complete dummy PUT before acknowledging an interactive workload."""
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.respond(b"")
+
     def respond(self, payload, status=None):
         self.server.authorizations.append(self.headers.get("Authorization"))
         self.server.run_ids.append(self.headers.get("X-Winlin-Run"))
@@ -193,6 +198,31 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "authentication" not in result.stdout
         assert "TLS 1.3 cipher" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
+
+        for method, size_input, expected_gets, expected_puts in (
+            ("get", "512\n", 2, 0),
+            ("put", "256\n", 0, 2),
+            ("mixed", "512\n256\n50\n", 1, 1),
+        ):
+            output = directory / f"menu-{method}.json"
+            result = subprocess.run(
+                [client],
+                input=(f"3\n1\noff\n1\n{method}\n{size_input}"
+                       f"1\n1\n0\n1\n2\n1\n{output}\n0\n"),
+                capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, XDG_STATE_HOME=str(directory / "state")),
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert ("GET size" in result.stdout) == (method != "put")
+            assert ("PUT size" in result.stdout) == (method != "get")
+            report = json.loads(output.read_text())
+            assert report["status"] == "completed", report
+            if method != "put":
+                assert report["configuration"]["get_size_bytes"] == 512
+            if method != "get":
+                assert report["configuration"]["put_size_bytes"] == 256
+            assert report["results"][0]["get_completed"] == expected_gets
+            assert report["results"][0]["put_completed"] == expected_puts
 
         benchmark = [
             client, "run", "--target", str(target), "--get-size", "256",
