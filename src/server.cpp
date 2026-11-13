@@ -1,6 +1,7 @@
 #include "winlin/linux.hpp"
 #include "winlin/agent.hpp"
 
+#include <cassert>
 #include <iostream>
 #include <latch>
 #include <mutex>
@@ -212,27 +213,9 @@ struct Session {
     // False means the worker should remove and close this session, not retry an I/O operation.
     bool pump() {
         for (unsigned step = 0; step < 128; ++step) {
-            if (state == State::handshake) {
-                if (!socket.handshake(true)) {
-                    return true;
-                }
-                // Inspect actual kTLS activation after OpenSSL completes the handshake. TX and RX
-                // can differ; the shared request handler checks the direction needed by each
-                // method.
-                if (socket.ssl) {
-                    tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
-                    rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
-                    ++server.handshakes;
-                }
-                if (tx) {
-                    ++server.tx_ktls;
-                }
-                if (rx) {
-                    ++server.rx_ktls;
-                }
-                // After handshake, the next step is always reading a request header.
-                state = State::header;
-            } else if (state == State::header) {
+            // Check recurring workload states first, before connection setup and control-body
+            // collection, without adding helper calls to the state machine.
+            if (state == State::header) {
                 const auto input = pending_input();
                 const auto end = find_http_header_end(input, header_search);
                 if (end != std::string::npos) {
@@ -270,7 +253,80 @@ struct Session {
                     }
                     input_end += count;
                 }
-            } else if (state == State::control_body) {
+            } else if (state == State::send_header) {
+                // Preserve the offset on partial writes, including retries required by OpenSSL.
+                // Start the response body only after every header byte has been written.
+                const int bytes = socket.write(output.data() + offset, output.size() - offset);
+                if (!bytes) {
+                    return true;
+                }
+                offset += bytes;
+                if (offset == output.size()) {
+                    offset = 0;
+                    state = State::send_body;
+                }
+            } else if (state == State::send_body) {
+                // Send either the shared dummy object or the session's JSON response. A completed
+                // persistent response returns to header processing and may use already buffered
+                // input.
+                if (offset < body_size) {
+                    const char* data = object_response ? server.payload.data() : text_body.data();
+                    const int bytes = socket.write(data + offset, body_size - offset);
+                    if (!bytes) {
+                        return true;
+                    }
+                    offset += bytes;
+                } else {
+                    if (get) {
+                        ++server.gets;
+                        server.get_bytes += body_size;
+                    }
+                    if (close) {
+                        return false;
+                    }
+                    state = State::header;
+                }
+            } else if (state == State::body) {
+                // Discard a PUT body without storing it. Account for bytes already read alongside
+                // the header, and acknowledge only after the entire declared body is consumed.
+                const auto count = std::min(body_remaining, pending_input().size());
+                consume_input(count);
+                body_remaining -= count;
+                if (!body_remaining) {
+                    ++server.puts;
+                    server.put_bytes += body_size;
+                    respond(200);
+                } else {
+                    const int bytes =
+                        socket.read(buffer.data(), std::min(buffer.size(), body_remaining));
+                    if (!bytes) {
+                        return true;
+                    }
+                    body_remaining -= bytes;
+                }
+            } else if (state == State::handshake) {
+                if (!socket.handshake(true)) {
+                    return true;
+                }
+                // Inspect actual kTLS activation after OpenSSL completes the handshake. TX and RX
+                // can differ; the shared request handler checks the direction needed by each
+                // method.
+                if (socket.ssl) {
+                    tx = BIO_get_ktls_send(SSL_get_wbio(socket.ssl.get()));
+                    rx = BIO_get_ktls_recv(SSL_get_rbio(socket.ssl.get()));
+                    ++server.handshakes;
+                }
+                if (tx) {
+                    ++server.tx_ktls;
+                }
+                if (rx) {
+                    ++server.rx_ktls;
+                }
+                // After handshake, the next step is always reading a request header.
+                state = State::header;
+            } else {
+                assert(state == State::control_body);
+
                 // Header reads may already have received part of the JSON body. Consume those
                 // bytes first, then read only the missing amount before dispatching the command.
                 const auto input = pending_input();
@@ -296,57 +352,6 @@ struct Session {
                         return true;
                     }
                     body_remaining -= count;
-                }
-            } else if (state == State::body) {
-                // Discard a PUT body without storing it. Account for bytes already read alongside
-                // the header, and acknowledge only after the entire declared body is consumed.
-                const auto count = std::min(body_remaining, pending_input().size());
-                consume_input(count);
-                body_remaining -= count;
-                if (!body_remaining) {
-                    ++server.puts;
-                    server.put_bytes += body_size;
-                    respond(200);
-                } else {
-                    const int bytes =
-                        socket.read(buffer.data(), std::min(buffer.size(), body_remaining));
-                    if (!bytes) {
-                        return true;
-                    }
-                    body_remaining -= bytes;
-                }
-            } else if (state == State::send_header) {
-                // Preserve the offset on partial writes, including retries required by OpenSSL.
-                // Start the response body only after every header byte has been written.
-                const int bytes = socket.write(output.data() + offset, output.size() - offset);
-                if (!bytes) {
-                    return true;
-                }
-                offset += bytes;
-                if (offset == output.size()) {
-                    offset = 0;
-                    state = State::send_body;
-                }
-            } else {
-                // Send either the shared dummy object or the session's JSON response. A completed
-                // persistent response returns to header processing and may use already buffered
-                // input.
-                if (offset < body_size) {
-                    const char* data = object_response ? server.payload.data() : text_body.data();
-                    const int bytes = socket.write(data + offset, body_size - offset);
-                    if (!bytes) {
-                        return true;
-                    }
-                    offset += bytes;
-                } else {
-                    if (get) {
-                        ++server.gets;
-                        server.get_bytes += body_size;
-                    }
-                    if (close) {
-                        return false;
-                    }
-                    state = State::header;
                 }
             }
             activity = Clock::now();
