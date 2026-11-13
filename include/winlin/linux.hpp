@@ -332,6 +332,17 @@ public:
         }
     }
 
+    // Return caller-owned state with each event instead of an fd that needs another lookup.
+    // Supply the pointer on every modification, and keep it valid while returned events use it.
+    void set(int socket, std::uint32_t events, void* state, bool add = false) {
+        epoll_event event{};
+        event.events = events;
+        event.data.ptr = state;
+        if (epoll_ctl(fd_.value, add ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, socket, &event) != 0) {
+            throw system_error("epoll_ctl");
+        }
+    }
+
     int wait(epoll_event* events, int count, int timeout) {
         const int result = epoll_wait(fd_.value, events, count, timeout);
         if (result < 0 && errno != EINTR) {

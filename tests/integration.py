@@ -127,6 +127,32 @@ class Workload:
         return response.status, response.read()
 
 
+def exercise_session_events(lease):
+    """Keep event pointers valid across ownership-map growth, rearming, and connection turnover."""
+    connections = [Workload(lease) for _ in range(32)]
+    try:
+        for iteration in range(3):
+            # Keep surviving sessions active while replacing peers and reusing server descriptors.
+            if iteration == 1:
+                for index in range(0, len(connections), 2):
+                    connections[index].connection.close()
+                    connections[index] = Workload(lease)
+
+            # Leave requests outstanding together so batches can mix listener and session events.
+            # The first pass grows the session map; later passes exercise saved pointers after
+            # rehashing and EPOLL_CTL_MOD, which must retain the pointer rather than an fd.
+            for data in connections:
+                data.connection.request(
+                    "GET", "/v1/object?size=256", headers={"X-Winlin-Run": lease["run_id"]},
+                )
+            for data in connections:
+                response = data.connection.getresponse()
+                assert response.status == 200 and len(response.read()) == 256
+    finally:
+        for data in connections:
+            data.connection.close()
+
+
 def exercise_receive_buffer(lease):
     """Keep request/body boundaries intact across fragmented and pipelined HTTP/TLS input."""
     raw = socket.create_connection(("127.0.0.1", lease["port"]), timeout=5)
@@ -312,6 +338,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert measured["get_completed"] == 133, measured
                 assert measured["put_completed"] == 1, measured
                 assert measured["put_bytes"] == 65536, measured
+                exercise_session_events(lease)
             finally:
                 controller.finish(lease)
 

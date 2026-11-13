@@ -445,9 +445,10 @@ accept_connections(Server& server, int listener_fd, Epoll& poller,
         try {
             // One Session per accepted connection.
             auto session = std::make_unique<Session>(std::exchange(client.value, -1), server);
+            auto* session_ptr = session.get();
             sessions.emplace(client_fd, std::move(session));
-            // Register this newly accepted socket fd with epoll
-            poller.set(client_fd, EPOLLIN, true);
+            // Return the stable heap address directly with readiness events.
+            poller.set(client_fd, EPOLLIN, session_ptr, true);
             ++server.connections;
         } catch (...) {
             // Undo the reserved slot if construction failed. If a Session was inserted,
@@ -476,12 +477,14 @@ accept_connections(Server& server, int listener_fd, Epoll& poller,
 // It handles the listener socket and all accepted connections.
 void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = {}) {
     Epoll poller;
-    // Register the listener socket with epoll waiting for EPOLLIN events.
-    poller.set(listener_fd.value, EPOLLIN, true);
+    // A null event pointer identifies the listener; accepted sockets carry their Session pointer.
+    poller.set(listener_fd.value, EPOLLIN, nullptr, true);
     if (ready) {
         ready();
     }
-    // Accepted socket fd to Session mapping.
+    // The map owns sessions, but readiness events carry Session pointers to avoid a hash lookup
+    // and map-node pointer chasing on every I/O event. Rehashing only moves ownership entries;
+    // the separately allocated sessions stay at stable addresses.
     std::unordered_map<int, std::unique_ptr<Session>> sessions;
     std::array<epoll_event, 256> events{};
     auto sweep = Clock::now();
@@ -491,43 +494,44 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
         // Wait for EPOLLIN/EPOLLOUT events on all registered sockets.
         const int count = poller.wait(events.data(), events.size(), 100);
 
-        // Process all ready sockets.
+        // This worker alone destroys sessions, and each socket has one epoll registration.
+        // Processing an event can remove only its own session. Sweep timeouts after the entire
+        // batch so other pointers already returned by epoll_wait() remain valid.
         for (int i = 0; i < count; ++i) {
-            const int fd = events[i].data.fd;
-            if (fd == listener_fd.value) [[unlikely]] {
+            auto* session = static_cast<Session*>(events[i].data.ptr);
+
+            // A null event pointer identifies the listener; accepted sockets carry their
+            // Session pointer.
+            if (!session) [[unlikely]] {
                 accept_connections(server, listener_fd.value, poller, sessions);
                 continue;
             }
-            if (const auto it = sessions.find(fd); it != sessions.end()) {
-                // Activity on an accepted socket fd.
-                // Keep live sessions registered for their next required event. Erasing a session
-                // closes its descriptor, which also removes the descriptor from epoll.
-                try {
-                    // Run the session's state machine until it either needs to wait for a
-                    // socket event or has completed and should be removed.
-                    // Unlike client, the server pump() has the following semantics:
-                    // - Returns true if the session is still active and should be called again
-                    // - Returns false if the session has completed or failed and should be removed
-                    if (!it->second->pump()) {
-                        // Remove the session from epoll
-                        sessions.erase(it);
-                    } else {
-                        // Call pump() again when the socket is ready for the next operation.
-                        poller.set(fd, it->second->socket.want);
-                    }
-                } catch (const PeerClosed& error) {
-                    if (it->second->state == Session::State::header &&
-                        !it->second->pending_input().empty()) {
-                        log_warning("Peer closed an incomplete HTTP header");
-                    } else if (it->second->state != Session::State::header) {
-                        log_warning(std::string("Peer closed an unfinished request: ") +
-                                    error.what());
-                    }
+            const int fd = session->socket.fd.value;
+            // Keep live sessions registered for their next required event. Erasing a session
+            // closes its descriptor, which also removes the descriptor from epoll.
+            try {
+                // Run the session's state machine until it either needs to wait for a
+                // socket event or has completed and should be removed.
+                // Unlike client, the server pump() has the following semantics:
+                // - Returns true if the session is still active and should be called again
+                // - Returns false if the session has completed or failed and should be removed
+                if (!session->pump()) {
+                    // Only connection teardown needs the map lookup, not normal I/O events.
                     sessions.erase(fd);
-                } catch (const std::exception& error) {
-                    log_warning(std::string("Closing failed connection: ") + error.what());
-                    sessions.erase(fd);
+                } else {
+                    // EPOLL_CTL_MOD replaces event data too, so preserve the Session pointer.
+                    poller.set(fd, session->socket.want, session);
                 }
+            } catch (const PeerClosed& error) {
+                if (session->state == Session::State::header && !session->pending_input().empty()) {
+                    log_warning("Peer closed an incomplete HTTP header");
+                } else if (session->state != Session::State::header) {
+                    log_warning(std::string("Peer closed an unfinished request: ") + error.what());
+                }
+                sessions.erase(fd);
+            } catch (const std::exception& error) {
+                log_warning(std::string("Closing failed connection: ") + error.what());
+                sessions.erase(fd);
             }
         }
         if (Clock::now() - sweep >= std::chrono::seconds(1)) {
