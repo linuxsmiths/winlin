@@ -272,6 +272,10 @@ Shutdown drains active operations and releases each worker's cached storage.
 Completion workers retrieve up to eight already-ready IOCP entries per call;
 they do not wait for a full batch. Native I/O errors and synthetic submission
 failures are decoded per entry, and shutdown processes every dequeued reference.
+The request queue uses `FILE_SKIP_SET_EVENT_ON_HANDLE` because workers consume
+IOCP packets rather than waiting on the queue handle's implicit event. Completion
+packets remain enabled even for operations that finish synchronously. Startup
+fails explicitly if Windows cannot apply the notification mode.
 
 ## Tests
 

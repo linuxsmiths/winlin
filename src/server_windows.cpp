@@ -487,6 +487,11 @@ struct Runtime {
         if (!completion_port.value) {
             throw windows_error("CreateIoCompletionPort");
         }
+        // IOCP carries every completion; no worker waits on the queue handle's implicit event.
+        // Skip that shared event's signaling without suppressing synchronous-success packets.
+        if (!SetFileCompletionNotificationModes(queue.value, FILE_SKIP_SET_EVENT_ON_HANDLE)) {
+            throw windows_error("Disable HTTP.sys request-queue event signaling");
+        }
     }
 
     // Cancel outstanding I/O and join workers before member destruction closes native handles.
