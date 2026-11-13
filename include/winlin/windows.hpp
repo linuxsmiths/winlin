@@ -15,10 +15,73 @@
 #include <psapi.h>
 #include <ws2tcpip.h>
 #include <winhttp.h>
+#include <http.h>
 
 namespace winlin {
 inline std::runtime_error windows_error(std::string message, DWORD code = GetLastError()) {
     return std::runtime_error(std::move(message) + " (Windows error " + std::to_string(code) + ")");
+}
+
+// Adapt HTTP.sys's parsed request directly to the shared Agent header representation.
+// Retain the same selected fields, header-size bound, normalization, and framing validation as
+// the previous serialized-header path, without building and parsing a second HTTP message.
+// Returned strings own their contents and remain valid after the native receive storage changes.
+inline HttpHead request_head(const HTTP_REQUEST& request) {
+    std::string_view method;
+    switch (request.Verb) {
+    case HttpVerbGET:
+        method = "GET";
+        break;
+    case HttpVerbPUT:
+        method = "PUT";
+        break;
+    case HttpVerbPOST:
+        method = "POST";
+        break;
+    default:
+        method = "UNSUPPORTED";
+        break;
+    }
+    HttpHead head;
+    head.first = std::string(method) + " " + std::string(request.pRawUrl, request.RawUrlLength) +
+                 " HTTP/" + std::to_string(request.Version.MajorVersion) + "." +
+                 std::to_string(request.Version.MinorVersion);
+
+    // Account for the request-line CRLF and final blank line, then each selected field's
+    // serialized size. This preserves the old adapter's bound without allocating that text.
+    std::size_t header_size = head.first.size() + 4;
+    if (header_size > max_header_size) {
+        throw std::invalid_argument("Invalid HTTP header");
+    }
+    const auto add_field = [&](std::string_view name, std::string_view value) {
+        header_size += name.size() + 2 + value.size() + 2;
+        if (header_size > max_header_size) {
+            throw std::invalid_argument("Invalid HTTP header");
+        }
+        add_http_field(head, name, value);
+    };
+    const std::array<std::pair<HTTP_HEADER_ID, std::string_view>, 4> names{
+        {{HttpHeaderHost, "Host"},
+         {HttpHeaderContentLength, "Content-Length"},
+         {HttpHeaderConnection, "Connection"},
+         {HttpHeaderTransferEncoding, "Transfer-Encoding"}}};
+    for (const auto& [id, name] : names) {
+        const auto& field = request.Headers.KnownHeaders[id];
+        if (field.pRawValue) {
+            add_field(name, {field.pRawValue, field.RawValueLength});
+        }
+    }
+
+    // HTTP.sys exposes the lease through UnknownHeaders. Compare names without allocating
+    // lowercase copies, and still reject repeated lease fields through shared field validation.
+    for (USHORT index = 0; index < request.Headers.UnknownHeaderCount; ++index) {
+        const auto& field = request.Headers.pUnknownHeaders[index];
+        if (http_equal({field.pName, field.NameLength}, "x-winlin-run")) {
+            add_field("X-Winlin-Run", {field.pRawValue, field.RawValueLength});
+        }
+    }
+    finish_http_head(head);
+    return head;
 }
 
 // Size in UTF-16 code units first, then convert strictly; byte counts are not wide-character

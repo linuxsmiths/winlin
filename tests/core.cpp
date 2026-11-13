@@ -87,6 +87,27 @@ int main() {
             parse_head("GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n");
         });
 
+        // Native adapters add parsed fields directly rather than serializing and parsing HTTP
+        // again. They must use the same normalization, duplicate, and framing checks.
+        HttpHead native;
+        native.first = request.first;
+        add_http_field(native, "cOnTeNt-LeNgTh", "\t256 ");
+        add_http_field(native, "Connection", " close ");
+        finish_http_head(native);
+        check(native.fields == request.fields && native.length == request.length &&
+                  native.close == request.close,
+              "Direct fields retain raw-parser normalization and framing");
+        rejects([&] {
+            add_http_field(native, "CONTENT-LENGTH", "256");
+        });
+        rejects([&] {
+            add_http_field(native, "Bad Field", "value");
+        });
+        add_http_field(native, "Transfer-Encoding", "chunked");
+        rejects([&] {
+            finish_http_head(native);
+        });
+
         // Workload parsing borrows framing fields without normalizing or copying header strings.
         const std::string_view response =
             "HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh:\t256 \r\n"
@@ -137,13 +158,13 @@ int main() {
         // already searched prefix. A body containing another delimiter is not part of the header.
         std::size_t search_from{};
         for (std::size_t received = 0; received <= response.size(); ++received) {
-            const auto end = find_response_header_end(response.substr(0, received), search_from);
+            const auto end = find_http_header_end(response.substr(0, received), search_from);
             check(end ==
                       (received == response.size() ? response.size() - 4 : std::string_view::npos),
                   "Incremental framing handles byte-at-a-time headers");
         }
         search_from = 0;
-        check(find_response_header_end(std::string(response) + "body\r\n\r\n", search_from) ==
+        check(find_http_header_end(std::string(response) + "body\r\n\r\n", search_from) ==
                   response.size() - 4,
               "Only the first header delimiter determines body framing");
 

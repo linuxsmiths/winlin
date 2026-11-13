@@ -115,8 +115,11 @@ struct Session {
         send_header,
         send_body
     } state{State::handshake};
-    std::string input, output, text_body;
-    std::array<char, 16384> buffer{};
+    std::string output, text_body;
+    // Read headers directly into reusable storage. The unread range may also contain a body
+    // or a subsequent request, so consuming bytes advances an offset rather than shifting them.
+    std::array<char, max_header_size> buffer{};
+    std::size_t input_begin{}, input_end{}, header_search{};
     std::size_t offset{}, body_remaining{}, body_size{};
     bool close{}, object_response{}, get{}, put{}, tx{}, rx{};
     std::optional<HttpHead> control_head;
@@ -130,6 +133,21 @@ struct Session {
     // Release the connection slot when the worker removes this session or shuts down.
     ~Session() {
         --server.active;
+    }
+
+    // Borrow bytes received but not yet consumed. The view is invalidated by the next buffer read
+    // or compaction; parsed HttpHead values own their strings and do not retain this view.
+    std::string_view pending_input() const {
+        return {buffer.data() + input_begin, input_end - input_begin};
+    }
+
+    // Consume a prefix without moving the remaining bytes. Reuse the full buffer immediately
+    // when it is empty; otherwise keep any already received body or next request in place.
+    void consume_input(std::size_t count) {
+        input_begin += count;
+        if (input_begin == input_end) {
+            input_begin = input_end = 0;
+        }
     }
 
     // Prepare the response but do not send it yet. Keep JSON text and serialized headers in this
@@ -162,7 +180,9 @@ struct Session {
         put = reply.kind == AgentReply::Kind::consume_put;
         if (reply.kind == AgentReply::Kind::consume_control) {
             control_head = head;
-            control_body.clear();
+            // Control JSON is bounded by Agent. Allocate its final size once so missing body
+            // bytes can be read directly into it, rather than copied through the header buffer.
+            control_body.resize(reply.size);
             body_remaining = reply.size;
             state = State::control_body;
         } else if (put) {
@@ -199,13 +219,15 @@ struct Session {
                 }
                 state = State::header;
             } else if (state == State::header) {
-                const auto end = input.find("\r\n\r\n");
+                const auto input = pending_input();
+                const auto end = find_http_header_end(input, header_search);
                 if (end != std::string::npos) {
                     // Clear accounting before parsing: parser failures bypass shared dispatch.
                     get = put = false;
                     try {
-                        const auto head = parse_head(std::string_view(input).substr(0, end + 4));
-                        input.erase(0, end + 4);
+                        const auto head = parse_head(input.substr(0, end + 4));
+                        consume_input(end + 4);
+                        header_search = 0;
                         request(head);
                     } catch (const std::invalid_argument& error) {
                         log_warning(std::string("Rejected malformed HTTP header: ") + error.what());
@@ -217,18 +239,28 @@ struct Session {
                         log_warning("HTTP header exceeds the supported size; closing connection");
                         return false;
                     }
-                    const int count = socket.read(buffer.data(), buffer.size());
+                    // A consumed prefix only needs moving when the unused tail is exhausted.
+                    // This preserves pipelined input without a prefix erase after every request.
+                    if (input_end == buffer.size() && input_begin) {
+                        std::memmove(buffer.data(), input.data(), input.size());
+                        input_end = input.size();
+                        input_begin = 0;
+                    }
+                    const int count =
+                        socket.read(buffer.data() + input_end, buffer.size() - input_end);
                     if (!count) {
                         return true;
                     }
-                    input.append(buffer.data(), count);
+                    input_end += count;
                 }
             } else if (state == State::control_body) {
                 // Header reads may already have received part of the JSON body. Consume those
                 // bytes first, then read only the missing amount before dispatching the command.
+                const auto input = pending_input();
                 const auto count = std::min(body_remaining, input.size());
-                control_body.append(input.data(), count);
-                input.erase(0, count);
+                std::copy_n(input.data(), count,
+                            control_body.data() + control_body.size() - body_remaining);
+                consume_input(count);
                 body_remaining -= count;
                 if (!body_remaining) {
                     const auto reply = server.Agent::request(
@@ -241,18 +273,18 @@ struct Session {
                     close = reply.close;
                     respond(reply.status, reply.text);
                 } else {
-                    const auto count =
-                        socket.read(buffer.data(), std::min(buffer.size(), body_remaining));
+                    const auto count = socket.read(
+                        control_body.data() + control_body.size() - body_remaining, body_remaining);
                     if (!count) {
                         return true;
                     }
-                    input.append(buffer.data(), count);
+                    body_remaining -= count;
                 }
             } else if (state == State::body) {
                 // Discard a PUT body without storing it. Account for bytes already read alongside
                 // the header, and acknowledge only after the entire declared body is consumed.
-                const auto count = std::min(body_remaining, input.size());
-                input.erase(0, count);
+                const auto count = std::min(body_remaining, pending_input().size());
+                consume_input(count);
                 body_remaining -= count;
                 if (!body_remaining) {
                     ++server.puts;
@@ -375,20 +407,32 @@ Fd listener(const std::string& bind_address, unsigned& port) {
 // to the worker's owner, which stops the server rather than silently losing part of its worker
 // pool. The optional ready callback announces that the listener is registered and this loop is
 // ready.
+//
+// Each server worker thread calls serve(). The first argument is the shared server instance.
+// It handles the listener socket and all accepted connections.
 void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = {}) {
     Epoll poller;
+    // Register the listener socket with epoll waiting for EPOLLIN events.
     poller.set(listener_fd.value, EPOLLIN, true);
     if (ready) {
         ready();
     }
+    // Accepted socket fd to Session mapping.
     std::unordered_map<int, std::unique_ptr<Session>> sessions;
     std::array<epoll_event, 256> events{};
     auto sweep = Clock::now();
+
+    // The worker loop exits when the server is stopped or a signal is received.
     while (!interrupted && !server.stop) {
+        // Wait for EPOLLIN/EPOLLOUT events on all registered sockets.
         const int count = poller.wait(events.data(), events.size(), 100);
+
+        // Process all ready sockets.
         for (int i = 0; i < count; ++i) {
             const int fd = events[i].data.fd;
             if (fd == listener_fd.value) {
+                // Ready event on listener socket means one or more new connections are
+                // waiting to be accepted.
                 // Bound each accept batch so a busy listener does not starve existing requests.
                 // Reserve a slot in the server-wide counter before creating a Session.
                 for (unsigned accepted = 0; accepted < 256; ++accepted) {
@@ -402,16 +446,22 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                         }
                         throw system_error("accept");
                     }
+                    // Do not allow more than the configured number of concurrent connections
+                    // to the server.
                     if (server.active.fetch_add(1) >= server.config.connection_limit) {
                         log_warning("Server connection limit reached; rejecting connection");
                         --server.active;
                         continue;
                     }
+
+                    // Accepted socket fd
                     const int client_fd = client.value;
                     try {
+                        // One Session per accepted connection.
                         auto session =
                             std::make_unique<Session>(std::exchange(client.value, -1), server);
                         sessions.emplace(client_fd, std::move(session));
+                        // Register this newly accepted socket fd with epoll
                         poller.set(client_fd, EPOLLIN, true);
                         ++server.connections;
                     } catch (...) {
@@ -424,16 +474,25 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                     }
                 }
             } else if (const auto it = sessions.find(fd); it != sessions.end()) {
+                // Activity on an accepted socket fd.
                 // Keep live sessions registered for their next required event. Erasing a session
                 // closes its descriptor, which also removes the descriptor from epoll.
                 try {
+                    // Run the session's state machine until it either needs to wait for a
+                    // socket event or has completed and should be removed.
+                    // Unlike client, the server pump() has the following semantics:
+                    // - Returns true if the session is still active and should be called again
+                    // - Returns false if the session has completed or failed and should be removed
                     if (!it->second->pump()) {
+                        // Remove the session from epoll
                         sessions.erase(it);
                     } else {
+                        // Call pump() again when the socket is ready for the next operation.
                         poller.set(fd, it->second->socket.want);
                     }
                 } catch (const PeerClosed& error) {
-                    if (it->second->state == Session::State::header && !it->second->input.empty()) {
+                    if (it->second->state == Session::State::header &&
+                        !it->second->pending_input().empty()) {
                         log_warning("Peer closed an incomplete HTTP header");
                     } else if (it->second->state != Session::State::header) {
                         log_warning(std::string("Peer closed an unfinished request: ") +
@@ -454,7 +513,7 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
                 const auto& session = *entry.second;
                 const bool expired = sweep - session.activity > std::chrono::seconds(60);
                 if (expired &&
-                    (session.state != Session::State::header || !session.input.empty())) {
+                    (session.state != Session::State::header || !session.pending_input().empty())) {
                     log_warning("Server session timed out with an unfinished request");
                 }
                 return expired;
@@ -606,12 +665,15 @@ int main(int argc, char** argv) {
         server.controller = &controller;
         const auto bind_address = args.get("--bind", "0.0.0.0");
         auto port = static_cast<unsigned>(number(args.get("--port", "38080"), 65535));
+        // Create a listener socket for the control endpoint, then transfer it to the control
+        // thread.
         auto control_listener = listener(bind_address, port);
         std::string failure;
         // Transfer the listener to the control thread. Main reads failure only after joining
         // that thread, so recording its terminal error does not need a mutex.
         std::jthread control_thread([&, owned = std::move(control_listener)]() mutable {
             try {
+                // Start serving requests on the control endpoint.
                 serve(server, std::move(owned));
             } catch (const std::exception& error) {
                 failure = error.what();

@@ -449,7 +449,7 @@ struct LoadConnection {
                 const std::string_view received(buffer.data(), header_received);
                 // Find the end of the HTTP response header in the received bytes,
                 // searching only new bytes and the overlap needed for a split delimiter.
-                const auto end = find_response_header_end(received, header_search);
+                const auto end = find_http_header_end(received, header_search);
                 if (end != std::string_view::npos) {
                     // OK, full header received, parse it and validate it. Note that we may
                     // have already read some of the response body bytes into buffer, which

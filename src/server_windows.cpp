@@ -268,53 +268,6 @@ ConnectionInfo connection_info(const HTTP_REQUEST& request) {
     throw std::invalid_argument("HTTP.sys did not expose negotiated TLS protocol information");
 }
 
-// Convert HTTP.sys's parsed request into the header representation expected by the shared Agent.
-// HTTP.sys still performs native HTTP framing; this adapter preserves only the fields used by our
-// routing and validation. Include the workload lease header, but never log the generated text
-// because it contains the run ID.
-HttpHead request_head(const HTTP_REQUEST& request) {
-    std::string method;
-    switch (request.Verb) {
-    case HttpVerbGET:
-        method = "GET";
-        break;
-    case HttpVerbPUT:
-        method = "PUT";
-        break;
-    case HttpVerbPOST:
-        method = "POST";
-        break;
-    default:
-        method = "UNSUPPORTED";
-        break;
-    }
-    std::string text = method + " " + std::string(request.pRawUrl, request.RawUrlLength) +
-                       " HTTP/" + std::to_string(request.Version.MajorVersion) + "." +
-                       std::to_string(request.Version.MinorVersion) + "\r\n";
-    const std::array<std::pair<HTTP_HEADER_ID, const char*>, 4> names{
-        {{HttpHeaderHost, "Host"},
-         {HttpHeaderContentLength, "Content-Length"},
-         {HttpHeaderConnection, "Connection"},
-         {HttpHeaderTransferEncoding, "Transfer-Encoding"}}};
-    for (const auto& [id, name] : names) {
-        const auto& header = request.Headers.KnownHeaders[id];
-        if (header.pRawValue) {
-            text += std::string(name) + ": " +
-                    std::string(header.pRawValue, header.RawValueLength) + "\r\n";
-        }
-    }
-    // HTTP.sys exposes the workload lease header through UnknownHeaders, not KnownHeaders.
-    for (USHORT index = 0; index < request.Headers.UnknownHeaderCount; ++index) {
-        const auto& header = request.Headers.pUnknownHeaders[index];
-        if (lower(std::string(header.pName, header.NameLength)) == "x-winlin-run") {
-            text +=
-                "X-Winlin-Run: " + std::string(header.pRawValue, header.RawValueLength) + "\r\n";
-        }
-    }
-    text += "\r\n";
-    return parse_head(text);
-}
-
 struct Runtime;
 
 // Carry one HTTP request through an asynchronous receive -> optional body reads -> response send.

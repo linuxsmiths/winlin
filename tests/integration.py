@@ -127,6 +127,62 @@ class Workload:
         return response.status, response.read()
 
 
+def exercise_receive_buffer(lease):
+    """Keep request/body boundaries intact across fragmented and pipelined HTTP/TLS input."""
+    raw = socket.create_connection(("127.0.0.1", lease["port"]), timeout=5)
+    if lease["transport"] == "https":
+        raw = tls_context().wrap_socket(raw, server_hostname="localhost")
+    try:
+        with raw.makefile("rb") as reader:
+            def read_response(size):
+                """Use one reader for the pipeline so prefetched responses are not lost."""
+                assert reader.readline().startswith(b"HTTP/1.1 200 ")
+                headers = {}
+                while True:
+                    line = reader.readline()
+                    assert line, "Connection closed inside a response header"
+                    if line == b"\r\n":
+                        break
+                    name, value = line.split(b":", 1)
+                    headers[name.lower()] = value.strip()
+                assert int(headers[b"content-length"]) == size
+                assert len(reader.read(size)) == size
+
+            run_header = f"Host: localhost\r\nX-Winlin-Run: {lease['run_id']}\r\n".encode()
+            get = b"GET /v1/object?size=256 HTTP/1.1\r\n" + run_header + b"\r\n"
+            prefix = (b"PUT /v1/object HTTP/1.1\r\n" + run_header +
+                      b"Content-Length: 65536\r\nX-Pad: ")
+            put = prefix + b"x" * (16384 - len(prefix) - 4) + b"\r\n\r\n"
+
+            # Leave a partial next header after the first request. Completing an exactly
+            # maximum-sized header then requires recovering space from the consumed prefix.
+            raw.sendall(get + put[:30])
+            read_response(256)
+            raw.sendall(put[30:] + b"x" * 65536 + get)
+            read_response(0)
+            read_response(256)
+
+            # Delimiter bytes can arrive separately, including across TLS records.
+            for split in (1, 2, 3):
+                raw.sendall(get[:-split])
+                time.sleep(.005)
+                raw.sendall(get[-split:])
+                read_response(256)
+
+            # Repeated pipelined requests retain unread bytes when each response completes.
+            raw.sendall(get * 128)
+            for _ in range(128):
+                read_response(256)
+
+            # A full buffer without a delimiter must still close instead of reading beyond
+            # the header limit or treating the following bytes as a valid request.
+            oversized_prefix = b"GET /v1/object HTTP/1.1\r\nX-Pad: "
+            raw.sendall(oversized_prefix + b"x" * (16384 - len(oversized_prefix)))
+            assert reader.read(1) == b""
+    finally:
+        raw.close()
+
+
 with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     directory = Path(temporary)
     controller = Controller(directory)
@@ -247,6 +303,17 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             data.connection.close()
             controller.finish(lease)
         assert controller.request("GET", "/v1/benchmark/telemetry?run_id=" + lease["run_id"])[0] == 409
+
+        for mode in ("off", "on"):
+            lease = controller.start(tls=mode, workers=1)
+            try:
+                exercise_receive_buffer(lease)
+                measured = controller.telemetry(lease)
+                assert measured["get_completed"] == 133, measured
+                assert measured["put_completed"] == 1, measured
+                assert measured["put_bytes"] == 65536, measured
+            finally:
+                controller.finish(lease)
 
         for mode, workers in (("on", 1), ("off", 4), ("on", 2)):
             output = directory / f"{mode}-{workers}.json"

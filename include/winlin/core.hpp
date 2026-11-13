@@ -143,6 +143,36 @@ struct HttpHead {
     bool close{};
 };
 
+// Normalize one field into owned storage, using the same validation for raw HTTP parsing and
+// already parsed native headers. Duplicate names are rejected case-insensitively.
+inline void add_http_field(HttpHead& head, std::string_view field_name, std::string_view value) {
+    auto name = lower(std::string(field_name));
+    if (name.empty()) {
+        throw std::invalid_argument("Invalid HTTP field name");
+    }
+    for (unsigned char ch : name) {
+        if (!std::isalnum(ch) && ch != '-') {
+            throw std::invalid_argument("Invalid HTTP field name");
+        }
+    }
+    if (!head.fields.emplace(std::move(name), trim(value)).second) {
+        throw std::invalid_argument("Duplicate HTTP field");
+    }
+}
+
+// Derive body length and connection lifetime only after all fields have been added.
+// Both native transports must reject unsupported framing before accepting a request body.
+inline void finish_http_head(HttpHead& head) {
+    if (head.fields.contains("transfer-encoding")) {
+        throw std::invalid_argument("Transfer-Encoding is not supported");
+    }
+    if (head.fields.contains("content-length")) {
+        head.length = number(head.fields.at("content-length"), max_object_size);
+    }
+    head.close =
+        head.fields.contains("connection") && lower(head.fields.at("connection")) == "close";
+}
+
 // Parse one complete, bounded header. Duplicate fields and chunked framing are deliberately
 // rejected so the two native server stacks cannot disagree about request-body boundaries.
 inline HttpHead parse_head(std::string_view text) {
@@ -160,25 +190,10 @@ inline HttpHead parse_head(std::string_view text) {
         if (colon == std::string_view::npos || colon == 0) {
             throw std::invalid_argument("Invalid HTTP field");
         }
-        auto name = lower(std::string(line.substr(0, colon)));
-        for (unsigned char ch : name) {
-            if (!std::isalnum(ch) && ch != '-') {
-                throw std::invalid_argument("Invalid HTTP field name");
-            }
-        }
-        if (!head.fields.emplace(std::move(name), trim(line.substr(colon + 1))).second) {
-            throw std::invalid_argument("Duplicate HTTP field");
-        }
+        add_http_field(head, line.substr(0, colon), line.substr(colon + 1));
         position = end + 2;
     }
-    if (head.fields.contains("transfer-encoding")) {
-        throw std::invalid_argument("Transfer-Encoding is not supported");
-    }
-    if (head.fields.contains("content-length")) {
-        head.length = number(head.fields.at("content-length"), max_object_size);
-    }
-    head.close =
-        head.fields.contains("connection") && lower(head.fields.at("connection")) == "close";
+    finish_http_head(head);
     return head;
 }
 
@@ -208,8 +223,8 @@ inline bool http_equal(std::string_view left, std::string_view right) {
 }
 
 // Search only new bytes and the three-byte overlap needed for a split CRLFCRLF delimiter.
-// Callers reset search_from for each response and retain the accumulated bytes until completion.
-inline std::size_t find_response_header_end(std::string_view bytes, std::size_t& search_from) {
+// Callers reset search_from for each header and retain the accumulated bytes until completion.
+inline std::size_t find_http_header_end(std::string_view bytes, std::size_t& search_from) {
     const auto end = bytes.find("\r\n\r\n", search_from);
     if (end == std::string_view::npos) {
         search_from = bytes.size() > 3 ? bytes.size() - 3 : 0;
