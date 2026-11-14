@@ -61,6 +61,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/v1/benchmark/telemetry?run_id="):
             self.server.telemetry_samples += 1
             self.respond({
+                "get_response_data": self.server.current_get_response_data,
                 "process": {
                     "user_cpu_seconds": self.server.telemetry_samples * 0.000123456789,
                     "system_cpu_seconds": 0, "peak_rss_bytes": 0,
@@ -99,6 +100,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.server.capability_queries += 1
             payload = {
                 "supported_tls_modes": ["on", "off"],
+                "supported_get_response_data_modes": self.server.get_response_data_modes,
                 "supported_ciphers": ["TLS_AES_128_GCM_SHA256"],
                 "server_workers": {"min": 1, "max": 256},
                 "limits": {"max_connections": 65536},
@@ -113,15 +115,21 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/benchmark/start":
             settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert "max_connections" not in settings
+            assert settings["get_response_data"] in ("shared", "copy")
+            self.server.current_get_response_data = settings["get_response_data"]
             if settings["tls"] == "off":
                 settings["cipher"] = None
             data = self.server.plain if settings["tls"] == "off" else self.server.secure
+            applied = dict(settings)
+            if self.server.misreport_workers:
+                applied["workers"] += 1
+            if self.server.misreport_get_response_data:
+                applied["get_response_data"] = "shared"
             self.respond({
                 "run_id": "aa" * 32, "port": data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
                 "backend": "test",
-                "settings": (dict(settings, workers=settings["workers"] + 1)
-                             if self.server.misreport_workers else settings),
+                "settings": applied,
             })
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
             self.respond({"stopped": True})
@@ -171,10 +179,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.reference_available = False
         endpoint.host_cpu_available = True
         endpoint.network_available = True
+        endpoint.get_response_data_modes = ["shared", "copy"]
+        endpoint.current_get_response_data = "shared"
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
     server.misreport_workers = False
+    server.misreport_get_response_data = False
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
@@ -218,10 +229,10 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "TLS 1.3 cipher" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
 
-        for method, tls, size_input, expected_gets, expected_puts in (
-            ("get", "off", "512\n", 2, 0),
-            ("put", "off", "256\n", 0, 2),
-            ("mixed", "on", "512\n256\n50\n", 1, 1),
+        for method, tls, data_mode, size_input, expected_gets, expected_puts in (
+            ("get", "off", "shared", "512\n\n", 2, 0),
+            ("put", "off", "shared", "256\n", 0, 2),
+            ("mixed", "on", "copy", "512\ncopy\n256\n50\n", 1, 1),
         ):
             output = directory / f"menu-{method} 'quoted' $literal.json"
             tls_input = f"{tls}\n" + ("\n" if tls != "off" else "")
@@ -235,6 +246,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert result.returncode == 0, result.stdout + result.stderr
             assert ("GET size" in result.stdout) == (method != "put")
             assert ("PUT size" in result.stdout) == (method != "get")
+            assert ("GET response data:" in result.stdout) == (method != "put")
             report = json.loads(output.read_text())
             assert report["status"] == "completed", report
             if method != "put":
@@ -243,6 +255,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 assert report["configuration"]["put_size_bytes"] == 256
             assert report["results"][0]["get_completed"] == expected_gets
             assert report["results"][0]["put_completed"] == expected_puts
+            assert report["configuration"]["get_response_data"] == data_mode
+            assert report["server_run"]["get_response_data"] == data_mode
 
             # The printed command must retain every setting and preserve literal shell arguments.
             displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
@@ -255,7 +269,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 replay_arguments.index("--target") + 1]
             assert ("--cipher" in replay_arguments) == (tls != "off")
             assert all(option in replay_arguments for option in (
-                "--tls", "--server-workers", "--method", "--get-size", "--put-size",
+                "--tls", "--server-workers", "--method", "--get-response-data",
+                "--get-size", "--put-size",
                 "--get-percent", "--connections", "--workers", "--warmup", "--duration",
                 "--requests", "--repetitions", "--timeout",
             ))
@@ -345,7 +360,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             proposed_output = console_directory / "nested" / "declined.json"
             result = subprocess.run(
                 [str(menu_client)],
-                input=(f"3\n1\noff\n1\nget\n512\n1\n1\n0\n1\n2\n1\n"
+                input=(f"3\n1\noff\n1\nget\n512\nshared\n1\n1\n0\n1\n2\n1\n"
                        f"{proposed_output}\n{answer}\n0\n"),
                 cwd=console_directory, env=menu_environment,
                 capture_output=True, text=True, timeout=15,
@@ -358,6 +373,22 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert "--output" not in shlex.split(displayed.group(1))
             assert "Results saved" not in result.stdout
             assert not list(console_directory.iterdir())
+
+        # Reject invalid or unadvertised modes before creating a workload or report.
+        result = subprocess.run(
+            [*benchmark, "--get-response-data", "generated"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1
+        assert "GET response data mode must be shared or copy" in result.stderr
+        server.get_response_data_modes = ["shared"]
+        result = subprocess.run(
+            [*benchmark, "--get-response-data", "copy"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1
+        assert "does not support requested GET response data mode" in result.stderr
+        server.get_response_data_modes = ["shared", "copy"]
 
         # An explicitly empty filename is an error, not an implicit request to disable saving.
         result = subprocess.run(
@@ -523,6 +554,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "did not apply the requested benchmark settings" in result.stderr
         assert not list(console_directory.iterdir())
         server.misreport_workers = False
+        server.misreport_get_response_data = True
+        result = subprocess.run(
+            [*benchmark, "--get-response-data", "copy"], cwd=console_directory,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "did not apply the requested benchmark settings" in result.stderr
+        assert not list(console_directory.iterdir())
+        server.misreport_get_response_data = False
         assert not plain.metadata_requests and not secure.metadata_requests
 
         rejected = directory / "rejected.json"

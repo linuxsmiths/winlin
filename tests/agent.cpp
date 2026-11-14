@@ -41,13 +41,46 @@ struct TestBenchmark : BenchmarkInstance {
         if (fail_sample) {
             throw BenchmarkError(503, "test workload failed");
         }
-        return {{"workers", options.workers}};
+        return {{"workers", options.workers}, {"get_response_data", options.get_response_data}};
     }
 };
+
+// Verify real payload copying and ownership, not merely mode metadata or identical wire bytes.
+void test_get_response_payload() {
+    std::vector<char> source{'a', 'b', 'c', 'd'};
+    GetResponsePayload first;
+    const auto* shared = first.prepare(source, source.size(), true);
+    require(shared == source.data(), "Shared mode borrows the original payload");
+    const auto* copied = first.prepare(source, source.size(), false);
+    require(copied != source.data() && std::string_view(copied, source.size()) == "abcd",
+            "Copy mode creates response-private data");
+    source[0] = 'z';
+    require(copied[0] == 'a' && shared[0] == 'z', "Copied data does not alias the shared source");
+    require(first.prepare(source, source.size(), false) == copied &&
+                std::string_view(copied, source.size()) == "zbcd",
+            "Same-size responses refresh the reused buffer on every copy");
+    source[3] = 'q';
+    const auto* reused = first.prepare(source, 2, false);
+    require(reused == copied && std::string_view(reused, 2) == "zb" && reused[3] == 'd',
+            "Smaller responses copy only their requested bytes without reallocating");
+    GetResponsePayload second;
+    require(second.prepare(source, source.size(), false) != copied,
+            "Outstanding responses own independent private storage");
+    GetResponsePayload empty;
+    empty.prepare({}, 0, false);
+    require(first.prepare(source, source.size(), true) == source.data(),
+            "Shared mode remains available after a previous private copy");
+    try {
+        first.prepare(source, source.size() + 1, false);
+        require(false, "Oversized copies must not read beyond the source");
+    } catch (const std::invalid_argument&) {
+    }
+}
 }
 
 int main() {
     try {
+        test_get_response_payload();
         const std::string access(64, 'b');
         AgentConfig config;
         config.backend = "httpsys-schannel";
@@ -64,6 +97,8 @@ int main() {
         require(discovery.contains("supported_backends") &&
                     discovery.at("supported_transports") == Json({"http", "https"}),
                 "Discovery describes supported workload choices");
+        require(discovery.at("supported_get_response_data_modes") == Json({"shared", "copy"}),
+                "Both GET payload modes are advertised");
         for (const auto* key :
              {"backend", "transport", "cipher", "tls_version", "workers", "max_connections",
               "ktls_tx", "ktls_rx", "benchmark_control", "run"}) {
@@ -150,6 +185,8 @@ int main() {
                 "Control JSON must be fully buffered before starting workers");
         auto started = open.request(start, tls, settings);
         require(started.status == 200 && live == 1, "Starting creates exactly one workload");
+        require(Json::parse(started.text).at("settings").at("get_response_data") == "shared",
+                "Omitted GET data settings preserve the shared baseline");
         require(open.request(start, tls, settings).status == 409, "Overlapping runs are rejected");
         require(open.request(head("GET", "/v1/object?size=512", ""), tls).status == 404,
                 "Permanent control endpoint never serves benchmark objects");
@@ -160,6 +197,17 @@ int main() {
                 "Runtime settings reach the adapter");
         controller.stop(access);
         require(live == 0, "Stopping joins and releases the active runtime");
+        const auto copied_run = controller.start({{"tls", "off"}, {"get_response_data", "copy"}});
+        require(copied_run.at("settings").at("get_response_data") == "copy",
+                "Selected GET data settings reach the run contract");
+        require(controller.telemetry(access).at("get_response_data") == "copy",
+                "The native adapter receives the selected payload mode");
+        controller.stop(access);
+        try {
+            controller.start({{"get_response_data", "generated"}});
+            require(false, "Unknown GET data modes must not silently fall back");
+        } catch (const std::invalid_argument&) {
+        }
         fail_sample = true;
         controller.start({{"workers", 1}});
         try {

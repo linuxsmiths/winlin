@@ -50,6 +50,7 @@ AgentConfig workload_config(const BenchmarkOptions& options) {
                                              : "openssl";
     config.cipher = options.cipher;
     config.workers = options.workers;
+    config.shared_get_data = options.get_response_data == "shared";
     return config;
 }
 
@@ -170,6 +171,8 @@ struct Session {
     std::size_t offset{}, body_remaining{}, body_size{};
     bool close{}, object_response{}, get{}, put{};
     ConnectionInfo connection;
+    GetResponsePayload get_payload;
+    const char* get_data{};
     std::string control_header, control_body;
     Clock::time_point activity{Clock::now()};
 
@@ -199,11 +202,16 @@ struct Session {
     }
 
     // Prepare the response but do not send it yet. Keep JSON text and serialized headers in this
-    // session until pump() finishes writing; object bodies instead borrow Server's GET payload.
+    // session until pump() finishes writing; GET bodies use shared or response-private payload
+    // storage.
     void respond(int status, std::string body = {}, bool object = false, std::size_t size = 0) {
         text_body = std::move(body);
         object_response = object;
         body_size = object ? size : text_body.size();
+        if (object_response) {
+            get_data =
+                get_payload.prepare(server.payload, body_size, server.config.shared_get_data);
+        }
 
         // Retain the header buffer's capacity across requests. Building directly into it avoids
         // allocating a separate concatenation result and replacing the previous buffer each time.
@@ -323,7 +331,7 @@ struct Session {
                 // persistent response returns to header processing and may use already buffered
                 // input.
                 if (offset < body_size) {
-                    const char* data = object_response ? server.payload.data() : text_body.data();
+                    const char* data = object_response ? get_data : text_body.data();
                     const int bytes = socket.write(data + offset, body_size - offset);
                     if (!bytes) {
                         return true;

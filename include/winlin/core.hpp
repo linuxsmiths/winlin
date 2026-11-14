@@ -468,6 +468,8 @@ struct RunConfig {
     unsigned server_workers{8};
     // The HTTP method to benchmark, or "mixed" for a mix of GET and PUT.
     std::string method{"get"};
+    // Select direct shared payload sends or a fresh copy into reusable response-private storage.
+    std::string get_response_data{"shared"};
     // The size of the GET response and PUT request bodies, in bytes.
     std::size_t get_size{4096};
     std::size_t put_size{4096};
@@ -496,6 +498,9 @@ struct RunConfig {
         if (method != "get" && method != "put" && method != "mixed") {
             throw std::invalid_argument("Method must be get, put or mixed");
         }
+        if (get_response_data != "shared" && get_response_data != "copy") {
+            throw std::invalid_argument("GET response data mode must be shared or copy");
+        }
         if (!connections || connections > 16384 || !workers || workers > 256 ||
             workers > connections || !repetitions || repetitions > 1000 || duration <= 0 ||
             !std::isfinite(duration) || duration > 86400 || warmup < 0 || !std::isfinite(warmup) ||
@@ -513,6 +518,7 @@ struct RunConfig {
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
                 {"server_workers", server_workers},
                 {"method", method},
+                {"get_response_data", get_response_data},
                 {"get_size_bytes", get_size},
                 {"put_size_bytes", put_size},
                 {"get_percent", get_percent},

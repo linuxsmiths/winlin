@@ -3,6 +3,7 @@
 #include "winlin/benchmark.hpp"
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <thread>
 
@@ -24,6 +25,7 @@ struct AgentConfig {
     static constexpr unsigned connection_limit = server_connection_limit;
     unsigned workers{};
     bool connection_metrics{true};
+    bool shared_get_data{true};
     Json environment;
     std::vector<std::string> unavailable_metrics{
         "hardware_cycles", "instructions",     "cache_misses", "memory_bandwidth",
@@ -39,6 +41,33 @@ struct AgentConfig {
         result.tls = false;
         result.workers = 1;
         return result;
+    }
+};
+
+// Prepare GET data without changing transport framing. Each Linux Session or Windows Request
+// owns one instance; only its current response may use the private buffer. Keep the shared source
+// alive and immutable through send completion. Private storage retains its largest size for reuse
+// and must not be prepared again while a partial/asynchronous send still references it.
+class GetResponsePayload {
+    std::vector<char> private_data_;
+
+public:
+    // Borrow shared data or copy exactly the requested prefix into response-private storage.
+    // Allocation occurs only when the private high-water size grows; invalid sizes are rejected.
+    const char* prepare(const std::vector<char>& source, std::size_t size, bool use_shared) {
+        if (size > source.size()) {
+            throw std::invalid_argument("GET response exceeds the prepared source payload");
+        }
+        if (use_shared) {
+            return source.data();
+        }
+        if (private_data_.size() < size) {
+            private_data_.resize(size);
+        }
+        if (size) {
+            std::memcpy(private_data_.data(), source.data(), size);
+        }
+        return private_data_.data();
     }
 };
 
@@ -99,6 +128,7 @@ public:
             {"host", host_usage_ ? host_usage_() : Json::object()},
             {"network", network_usage_ ? network_usage_() : Json::object()},
             {"process_cpu_scope", config.process_cpu_scope},
+            {"get_response_data", config.shared_get_data ? "shared" : "copy"},
             {"accepted_connections",
              config.connection_metrics ? Json(connections.load()) : Json(nullptr)},
             {"active_connections", config.connection_metrics ? Json(active.load()) : Json(nullptr)},
@@ -135,6 +165,7 @@ public:
                     {"supported_ciphers", config.supported_ciphers},
                     {"supported_http_versions", {"1.1"}},
                     {"supported_methods", {"get", "put", "mixed"}},
+                    {"supported_get_response_data_modes", {"shared", "copy"}},
                     {"supported_load_modes", {"closed_loop"}},
                     {"server_workers", {{"min", 1}, {"max", 256}}},
                     {"limits",

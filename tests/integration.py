@@ -307,7 +307,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert controller.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
         data = Workload(lease)
         try:
-            assert lease["settings"] == {"tls": "off", "cipher": None, "workers": 3}
+            assert lease["settings"] == {
+                "tls": "off", "cipher": None, "workers": 3, "get_response_data": "shared",
+            }
             assert data.request("GET", "/v1/capabilities")[0] == 404
             assert data.request("GET", "/v1/capabilities", include_run=False)[0] == 404
             assert data.request("GET", "/v1/object?size=256", include_run=False)[0] == 409
@@ -343,12 +345,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             controller.finish(lease)
         assert controller.request("GET", "/v1/benchmark/telemetry?run_id=" + lease["run_id"])[0] == 409
 
-        for mode in ("off", "on"):
-            lease = controller.start(tls=mode, workers=1)
+        for mode, data_mode in (
+            ("off", "shared"), ("on", "shared"), ("off", "copy"), ("on", "copy"),
+        ):
+            lease = controller.start(tls=mode, workers=1, get_response_data=data_mode)
             pending = []
             try:
                 exercise_receive_buffer(lease)
                 measured = controller.telemetry(lease)
+                assert measured["get_response_data"] == data_mode
                 assert measured["get_completed"] == 133, measured
                 assert measured["put_completed"] == 1, measured
                 assert measured["put_bytes"] == 65536, measured
@@ -364,11 +369,14 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                     for connection in pending:
                         connection.close()
 
-        for mode, workers in (("on", 1), ("off", 4), ("on", 2)):
+        for mode, workers, data_mode in (
+            ("on", 1, "shared"), ("off", 4, "copy"), ("on", 2, "copy"),
+        ):
             output = directory / f"{mode}-{workers}.json"
             invocation = command(
                 CLIENT, "run", "--target", target, "--tls", mode, "--server-workers", workers,
                 "--method", "mixed",
+                "--get-response-data", data_mode,
                 "--get-size", "512", "--put-size", "256", "--connections", "4", "--workers", "2",
                 "--warmup", "0.02", "--duration", "1", "--requests", "100", "--repetitions", "2",
                 "--output", output,
@@ -379,6 +387,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                     report["server_capabilities"]["environment"]["allocator"] ==
                     capabilities["environment"]["allocator"])
             assert report["server_configuration"]["workers"] == workers
+            assert report["configuration"]["get_response_data"] == data_mode
+            assert report["server_configuration"]["get_response_data"] == data_mode
             assert report["server_run"]["transport"] == ("http" if mode == "off" else "https")
             assert "control_capabilities" not in report
             assert report["benchmark"] == ("http" if mode == "off" else "https")
@@ -392,6 +402,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             assert next(iter(report["server_capabilities"])) == "environment"
             assert list(report["server_capabilities"]["environment"])[:2] == ["os", "kernel"]
             for repetition in report["results"]:
+                assert repetition["server_before"]["get_response_data"] == data_mode
+                assert repetition["server_after"]["get_response_data"] == data_mode
                 assert repetition["completed"] == repetition["issued"] == 100
                 assert repetition["errors"] == 0
                 assert repetition["latency"]["samples"] == 100
@@ -440,6 +452,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         ktls = subprocess.run(
             [CLIENT, "run", "--target", str(target), "--tls", "ktls", "--server-workers", "2",
              "--method", "get", "--get-size", "64KiB", "--connections", "2", "--workers", "1",
+             "--get-response-data", "copy",
              "--warmup", "0", "--duration", "1", "--requests", "10", "--repetitions", "1",
              "--output", str(output)],
             capture_output=True, text=True, timeout=30,
@@ -447,6 +460,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         report = json.loads(output.read_text())
         if ktls.returncode == 0:
             assert report["server_run"]["backend"] == "openssl-ktls"
+            assert report["server_final_telemetry"]["get_response_data"] == "copy"
             assert report["server_final_telemetry"]["ktls_tx_connections"] >= 2
         else:
             assert report["status"] in ("failed", "completed_with_errors")
@@ -471,7 +485,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n2\n1\n"
-                           f"3\n1\noff\n2\nget\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\nyes\n0\n"),
+                           f"3\n1\noff\n2\nget\n256\ncopy\n1\n1\n0\n1\n2\n1\n{menu_output}\nyes\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout
@@ -482,6 +496,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_report = json.loads(menu_output.read_text())
         assert menu_report["benchmark"] == "http"
         assert menu_report["server_configuration"]["workers"] == 2
+        assert menu_report["server_configuration"]["get_response_data"] == "copy"
     finally:
         controller.stop()
 

@@ -12,6 +12,7 @@ namespace winlin {
 // Describe only per-run tuning. Bind addresses, ports, certificates and OS permissions stay local.
 struct BenchmarkOptions {
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
+    std::string get_response_data{"shared"};
     unsigned workers{8}, lease_seconds{300};
 
     // Reject unknown or out-of-range settings rather than silently changing the requested run.
@@ -20,13 +21,15 @@ struct BenchmarkOptions {
             throw std::invalid_argument("Benchmark settings must be a JSON object");
         }
         for (const auto& [key, ignored] : value.items()) {
-            if (key != "tls" && key != "cipher" && key != "workers" && key != "lease_seconds") {
+            if (key != "tls" && key != "cipher" && key != "workers" && key != "lease_seconds" &&
+                key != "get_response_data") {
                 throw std::invalid_argument("Unknown benchmark setting: " + key);
             }
         }
         BenchmarkOptions result;
         result.tls = value.value("tls", result.tls);
         result.cipher = value.value("cipher", result.cipher);
+        result.get_response_data = value.value("get_response_data", result.get_response_data);
         auto bounded = [&](const char* key, unsigned fallback, unsigned maximum) {
             if (value.contains(key) && !value.at(key).is_number_integer()) {
                 throw std::invalid_argument(std::string(key) + " must be an integer");
@@ -42,6 +45,9 @@ struct BenchmarkOptions {
         if (result.tls != "on" && result.tls != "off" && result.tls != "ktls") {
             throw std::invalid_argument("TLS mode must be on, off, or ktls");
         }
+        if (result.get_response_data != "shared" && result.get_response_data != "copy") {
+            throw std::invalid_argument("GET response data mode must be shared or copy");
+        }
         if (result.tls == "off") {
             result.cipher.clear();
         }
@@ -52,6 +58,7 @@ struct BenchmarkOptions {
     Json json() const {
         return {{"tls", tls},
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
+                {"get_response_data", get_response_data},
                 {"workers", workers}};
     }
 };

@@ -212,6 +212,7 @@ AgentConfig workload_config(const AgentConfig& host, const BenchmarkOptions& opt
     config.backend = config.tls ? "httpsys-schannel" : "httpsys";
     config.cipher = options.cipher;
     config.workers = options.workers;
+    config.shared_get_data = options.get_response_data == "shared";
     return config;
 }
 
@@ -311,6 +312,7 @@ struct Request {
     std::array<HTTP_UNKNOWN_HEADER, 2> extra_headers{};
     HTTP_CACHE_POLICY cache_policy{HttpCachePolicyNocache, 0};
     std::string content_length;
+    GetResponsePayload get_payload;
 
     explicit Request(Runtime& owner);
 
@@ -333,7 +335,7 @@ static_assert(offsetof(Request::Operation, overlapped) == 0);
 // Retain a small hot set of whole requests, including their 64 KiB receive and 16 KiB body buffers.
 // Only the owning IOCP worker accesses this cache, so checkout/return needs no shared pool lock.
 // At most 16 idle requests remain per worker: about 1.3 MiB of native/body buffers, plus metadata
-// and any retained control JSON capacity. Active requests are not capped here.
+// and any retained control JSON/private GET payload capacity. Active requests are not capped here.
 // Worker exit destroys idle storage before Runtime joins the thread and releases native handles.
 struct RequestCache {
     std::array<std::unique_ptr<Request>, 16> idle;
@@ -781,7 +783,7 @@ void Request::read_body() {
 
 // Build a native HTTP_RESPONSE and submit it to HTTP.sys, which serializes the wire headers and
 // performs the selected transport's send/TLS work. Do not assume the structure determines a fixed
-// wire header length. GET data borrows Runtime's immutable payload; JSON data belongs to reply.
+// wire header length. GET data uses shared or response-private storage; JSON data belongs to reply.
 //
 // Keep all referenced headers, body data, and OVERLAPPED storage alive until send completion.
 // Disable caching both in the response and the HTTP.sys cache policy so repeated GETs still use
@@ -815,8 +817,14 @@ void Request::send() {
     if (size) {
         chunk = {};
         chunk.DataChunkType = HttpDataChunkFromMemory;
-        chunk.FromMemory.pBuffer =
-            reply.kind == AgentReply::Kind::object ? runtime.payload.data() : reply.text.data();
+        if (reply.kind == AgentReply::Kind::object) {
+            const auto* data =
+                get_payload.prepare(runtime.payload, size, runtime.agent.config.shared_get_data);
+            // HTTP.sys reads this storage despite the API's non-const buffer pointer type.
+            chunk.FromMemory.pBuffer = const_cast<char*>(data);
+        } else {
+            chunk.FromMemory.pBuffer = reply.text.data();
+        }
         chunk.FromMemory.BufferLength = static_cast<ULONG>(size);
         response.EntityChunkCount = 1;
         response.pEntityChunks = &chunk;

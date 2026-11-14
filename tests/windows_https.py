@@ -102,9 +102,10 @@ def data_connection(mode):
     return http.client.HTTPConnection("127.0.0.1", HTTP_PORT, timeout=5)
 
 
-def exercise_run(agent, cipher, mode, workers):
+def exercise_run(agent, cipher, mode, workers, data_mode):
     """Switch transport/workers without restarting control; exercise actual leased data I/O."""
-    settings = {"tls": mode, "cipher": cipher, "workers": workers}
+    settings = {"tls": mode, "cipher": cipher, "workers": workers,
+                "get_response_data": data_mode}
     run = agent.start(settings)
     run_id = run["run_id"]
     assert len(run_id) == 64
@@ -112,6 +113,7 @@ def exercise_run(agent, cipher, mode, workers):
     assert run["transport"] == ("https" if mode == "on" else "http")
     assert run["backend"] == ("httpsys-schannel" if mode == "on" else "httpsys")
     assert run["settings"]["workers"] == workers
+    assert run["settings"]["get_response_data"] == data_mode
     assert run["settings"]["cipher"] == (cipher if mode == "on" else None)
     assert agent.request("POST", "/v1/benchmark/start", json.dumps(settings))[0] == 409
     assert agent.request("POST", "/v1/benchmark/stop?run_id=wrong")[0] == 409
@@ -184,6 +186,7 @@ def exercise_run(agent, cipher, mode, workers):
 
     status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
     telemetry = json.loads(payload)
+    assert telemetry["get_response_data"] == data_mode
     assert status == 200 and telemetry["get_completed"] >= 8 and telemetry["put_completed"] >= 9
     assert telemetry["active_connections"] is None and telemetry["tls_handshakes"] is None
     assert telemetry["process"]["voluntary_context_switches"] is None
@@ -233,6 +236,7 @@ try:
     assert status == 200
     assert "authentication" not in capabilities
     assert capabilities["supported_tls_modes"] == ["on", "off"]
+    assert capabilities["supported_get_response_data_modes"] == ["shared", "copy"]
     assert capabilities["environment"]["system_ram_bytes"] > 0
     assert capabilities["environment"]["fd_limit"]["soft"] is None
     for key in ("backend", "transport", "tls_version", "cipher", "workers", "run"):
@@ -242,6 +246,8 @@ try:
     assert agent.request("POST", "/v1/benchmark/start", '{"tls":"on","cipher":"bad"}')[0] == 400
     assert agent.request("POST", "/v1/benchmark/start", " " * 65537)[0] == 400
     assert agent.request("POST", "/v1/benchmark/start", '{"max_connections":32}')[0] == 400
+    assert agent.request("POST", "/v1/benchmark/start",
+                         '{"get_response_data":"generated"}')[0] == 400
 
     # Split JSON across receives: no workload may start from a partial control body.
     body = json.dumps({"tls": "off", "workers": 1})
@@ -263,8 +269,10 @@ try:
     assert response.status == 200, run
     assert agent.request("POST", f"/v1/benchmark/stop?run_id={run['run_id']}")[0] == 200
 
-    for mode, workers in (("off", 1), ("on", 3), ("off", 3), ("on", 1)):
-        exercise_run(agent, cipher, mode, workers)
+    for mode, workers, data_mode in (
+        ("off", 1, "shared"), ("on", 3, "shared"), ("off", 3, "copy"), ("on", 1, "copy"),
+    ):
+        exercise_run(agent, cipher, mode, workers, data_mode)
 
     # Changing the run cipher must change validation, not rewrite machine-wide Schannel policy.
     other_cipher = ("TLS_AES_256_GCM_SHA384" if cipher == "TLS_AES_128_GCM_SHA256"

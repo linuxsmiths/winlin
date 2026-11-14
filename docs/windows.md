@@ -265,14 +265,20 @@ See [measurement scope and platform differences](https.md#results-and-limitation
 
 HTTP.sys performs native request parsing and buffering; malformed requests can
 be rejected by the kernel before reaching the shared agent. Every workload
-response explicitly disables HTTP.sys response caching. Both servers reuse a
-pre-generated payload and fully consume PUT bodies before acknowledging them.
+response explicitly disables HTTP.sys response caching. Both servers use
+pre-generated payload bytes and fully consume PUT bodies before acknowledging
+them. GET defaults to shared data; `--get-response-data copy` copies each response
+into private storage without changing native response submission.
 
 Windows workers also reuse whole request contexts, including their 64 KiB native
 receive buffers and 16 KiB body buffers. Each worker retains at most 16 idle
 contexts; this is a cache bound, not a connection or active-request limit.
 Warm reuse resets metadata without clearing those large buffers. Additional
 contexts are allocated on cache misses and freed when the idle cache is full.
+Copy-mode GET storage also belongs to these request contexts, not TCP connections.
+It retains the largest copied size across reuse and adds to the native/body buffer
+footprint; the 16-context idle bound is not a byte limit. Shared mode does not
+allocate private GET payloads. First use and growth can affect cold-run results.
 Small atomic reference counts protect submissions and completions that overlap
 across workers; contexts cannot be reused until every reference finishes.
 Shutdown drains active operations and releases each worker's cached storage.
