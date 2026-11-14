@@ -196,7 +196,11 @@ per endpoint, advertised in `limits.max_connections`; it is not a run setting.
 Client `--connections` still selects offered load concurrency (up to 16,384).
 OS resources may impose a lower practical capacity; the ceiling is not a throughput
 or resource-availability guarantee.
-The interactive benchmark menu exposes these same settings.
+The interactive benchmark menu exposes these same settings. After the final
+prompt it prints a shell-quoted `winlin run` command with the selected target,
+result path, and effective settings, including defaults. Use it to reproduce the
+configuration noninteractively from the same working directory. Choose a fresh
+`--output` path when repeating a run: existing result files are not overwritten.
 
 `--get-percent` specifies the GET share by **issued request count**, not bytes.
 Mixed requests are interleaved deterministically and the ratio is exact for each

@@ -6,7 +6,9 @@
 #include <iomanip>
 #include <iostream>
 #include <latch>
+#include <limits>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 
 namespace {
@@ -1240,8 +1242,50 @@ std::string select_target() {
     return paths[index - 1];
 }
 
+// Quote a literal argument for POSIX shells, preserving spaces, apostrophes and metacharacters.
+std::string shell_argument(std::string_view value) {
+    std::string quoted{"'"};
+    for (const auto character : value) {
+        if (character == '\'') {
+            quoted.append("'\\''");
+        } else {
+            quoted.push_back(character);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+// Render the effective configuration without relying on CLI defaults or exposing target contents.
+// Preserve floating-point settings exactly so fractional durations survive a noninteractive rerun.
+std::string benchmark_command(std::string_view executable, const std::string& target,
+                              const RunConfig& config, const std::string& output) {
+    std::ostringstream command;
+    command << std::setprecision(std::numeric_limits<double>::max_digits10);
+    command << shell_argument(executable) << " run";
+    command << " --target " << shell_argument(target);
+    command << " --tls " << shell_argument(config.tls);
+    command << " --server-workers " << config.server_workers;
+    command << " --method " << shell_argument(config.method);
+    command << " --get-size " << config.get_size;
+    command << " --put-size " << config.put_size;
+    command << " --get-percent " << config.get_percent;
+    command << " --connections " << config.connections;
+    command << " --workers " << config.workers;
+    command << " --warmup " << config.warmup;
+    command << " --duration " << config.duration;
+    command << " --requests " << config.requests;
+    command << " --repetitions " << config.repetitions;
+    command << " --timeout " << config.timeout;
+    if (config.tls != "off") {
+        command << " --cipher " << shell_argument(config.cipher);
+    }
+    command << " --output " << shell_argument(output);
+    return command.str();
+}
+
 // Keep recoverable input/run failures local to the menu; CLI fatal failures instead exit nonzero.
-void interactive() {
+void interactive(std::string_view executable) {
     while (std::cin) {
         std::cout
             << "\nWinlin\n1. Add server\n2. Inspect server\n3. Run HTTP/HTTPS benchmark\n0. Exit\n";
@@ -1260,7 +1304,8 @@ void interactive() {
                 const auto target = load_target(select_target());
                 std::cout << control(target, "/v1/capabilities").dump(2) << '\n';
             } else if (action == "3") {
-                const auto target = load_target(select_target());
+                const auto target_path = select_target();
+                const auto target = load_target(target_path);
                 RunConfig config;
                 config.tls = lower(prompt("Benchmark TLS: on / off / ktls", "on"));
                 if (config.tls != "off") {
@@ -1292,7 +1337,12 @@ void interactive() {
                 config.requests = number(prompt("Request limit (0 = duration only)", "0"));
                 config.repetitions = number(prompt("Repetitions", "3"), 1000);
                 config.validate();
-                run(target, config, prompt("Result file", default_output(config)));
+                const auto output = prompt("Result file", default_output(config));
+                std::cout << "\nNoninteractive command:\n"
+                          << benchmark_command(executable, target_path, config, output)
+                          << "\nFor another run, choose a new --output path; existing result files "
+                             "are not overwritten.\n\n";
+                run(target, config, output);
             } else {
                 std::cout << "Unknown selection\n";
             }
@@ -1309,7 +1359,7 @@ int main(int argc, char** argv) {
         std::signal(SIGPIPE, SIG_IGN);
         // If started w/o options, start interactive mode.
         if (argc == 1) {
-            interactive();
+            interactive(argv[0]);
             return 0;
         }
         const std::string command = argv[1];

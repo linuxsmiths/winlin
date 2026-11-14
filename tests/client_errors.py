@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import ssl
 import subprocess
@@ -149,6 +150,9 @@ class RegistrationHandler(BaseHTTPRequestHandler):
 fixtures = Path(__file__).resolve().parents[1] / "certs/benchmark"
 with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as temporary:
     directory = Path(temporary)
+    menu_client = directory / "menu client 'quoted' $literal"
+    menu_client.symlink_to(Path(client).resolve())
+    menu_environment = dict(os.environ, XDG_STATE_HOME=str(directory / "state 'quoted' $literal"))
     server = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     plain = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
     secure = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationHandler)
@@ -205,7 +209,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         result = subprocess.run(
             [client], input=f"1\n127.0.0.1\n{port}\n2\n1\n0\n",
             capture_output=True, text=True, timeout=15,
-            env=dict(os.environ, XDG_STATE_HOME=str(directory / "state")),
+            env=menu_environment,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "Target saved" in result.stdout, result.stdout + result.stderr
@@ -214,18 +218,19 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert "TLS 1.3 cipher" not in result.stdout
         assert server.authorizations and all(value is None for value in server.authorizations)
 
-        for method, size_input, expected_gets, expected_puts in (
-            ("get", "512\n", 2, 0),
-            ("put", "256\n", 0, 2),
-            ("mixed", "512\n256\n50\n", 1, 1),
+        for method, tls, size_input, expected_gets, expected_puts in (
+            ("get", "off", "512\n", 2, 0),
+            ("put", "off", "256\n", 0, 2),
+            ("mixed", "on", "512\n256\n50\n", 1, 1),
         ):
-            output = directory / f"menu-{method}.json"
+            output = directory / f"menu-{method} 'quoted' $literal.json"
+            tls_input = f"{tls}\n" + ("\n" if tls != "off" else "")
             result = subprocess.run(
-                [client],
-                input=(f"3\n1\noff\n1\n{method}\n{size_input}"
-                       f"1\n1\n0\n1\n2\n1\n{output}\n0\n"),
+                [str(menu_client)],
+                input=(f"3\n1\n{tls_input}1\n{method}\n{size_input}"
+                       f"1\n1\n0\n0.12345678912345678\n2\n1\n{output}\n0\n"),
                 capture_output=True, text=True, timeout=15,
-                env=dict(os.environ, XDG_STATE_HOME=str(directory / "state")),
+                env=menu_environment,
             )
             assert result.returncode == 0, result.stdout + result.stderr
             assert ("GET size" in result.stdout) == (method != "put")
@@ -238,6 +243,33 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 assert report["configuration"]["put_size_bytes"] == 256
             assert report["results"][0]["get_completed"] == expected_gets
             assert report["results"][0]["put_completed"] == expected_puts
+
+            # The printed command must retain every setting and preserve literal shell arguments.
+            displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+            assert displayed, result.stdout
+            assert result.stdout.index("Noninteractive command:") < result.stdout.index("Run  ")
+            replay_arguments = shlex.split(displayed.group(1))
+            assert replay_arguments[:2] == [str(menu_client), "run"]
+            assert replay_arguments[replay_arguments.index("--output") + 1] == str(output)
+            assert "state 'quoted' $literal" in replay_arguments[
+                replay_arguments.index("--target") + 1]
+            assert ("--cipher" in replay_arguments) == (tls != "off")
+            assert all(option in replay_arguments for option in (
+                "--tls", "--server-workers", "--method", "--get-size", "--put-size",
+                "--get-percent", "--connections", "--workers", "--warmup", "--duration",
+                "--requests", "--repetitions", "--timeout",
+            ))
+            replay_output = directory / f"replay-{method}.json"
+            replay_arguments[replay_arguments.index("--output") + 1] = str(replay_output)
+            replay = subprocess.run(
+                replay_arguments, capture_output=True, text=True, timeout=15,
+            )
+            assert replay.returncode == 0, replay.stdout + replay.stderr
+            replay_report = json.loads(replay_output.read_text())
+            assert replay_report["configuration"] == report["configuration"]
+            assert replay_report["results"][0]["get_completed"] == expected_gets
+            assert replay_report["results"][0]["put_completed"] == expected_puts
+            assert "Noninteractive command:" not in replay.stdout
 
         benchmark = [
             client, "run", "--target", str(target), "--get-size", "256",
