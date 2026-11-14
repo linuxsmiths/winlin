@@ -357,6 +357,20 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert measured["get_completed"] == 133, measured
                 assert measured["put_completed"] == 1, measured
                 assert measured["put_bytes"] == 65536, measured
+                assert measured["get_response_source_access"] == (
+                    "hot-prefix" if data_mode == "shared" else "rotating-objects")
+                assert measured["get_response_source_pool_bytes"] == (
+                    64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
+                data = Workload(lease)
+                try:
+                    bodies = []
+                    for _ in range(3):
+                        status, body = data.request("GET", "/v1/object?size=4096")
+                        assert status == 200 and len(body) == 4096
+                        bodies.append(body)
+                    assert (len(set(bodies)) == 1) == (data_mode == "shared")
+                finally:
+                    data.connection.close()
                 exercise_session_events(lease)
                 puts_before = controller.telemetry(lease)["put_completed"]
                 exercise_request_reuse(lambda: Workload(lease).connection, lease["run_id"])
@@ -404,6 +418,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             for repetition in report["results"]:
                 assert repetition["server_before"]["get_response_data"] == data_mode
                 assert repetition["server_after"]["get_response_data"] == data_mode
+                assert repetition["server_before"]["get_response_source_pool_bytes"] == (
+                    64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
                 assert repetition["completed"] == repetition["issued"] == 100
                 assert repetition["errors"] == 0
                 assert repetition["latency"]["samples"] == 100
@@ -485,7 +501,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n2\n1\n"
-                           f"3\n1\noff\n2\nget\n256\ncopy\n1\n1\n0\n1\n2\n1\n{menu_output}\nyes\n0\n"),
+                           f"3\n1\noff\n2\nget\n256\ncopy\n1\n1\n0\n1\n2\n1\nyes\n{menu_output}\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout

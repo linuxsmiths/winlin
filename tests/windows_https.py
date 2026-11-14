@@ -131,6 +131,12 @@ def exercise_run(agent, cipher, mode, workers, data_mode):
             status, payload = request(connection, "GET", f"/v1/object?size={size}", run_id)
             assert status == 200 and len(payload) == size
             assert request(connection, "PUT", "/v1/object", run_id, b"x" * size) == (200, b"")
+        bodies = []
+        for _ in range(3):
+            status, payload = request(connection, "GET", "/v1/object?size=4096", run_id)
+            assert status == 200 and len(payload) == 4096
+            bodies.append(payload)
+        assert (len(set(bodies)) == 1) == (data_mode == "shared")
         # A partial PUT must not be acknowledged or counted before all bytes have arrived.
         connection.putrequest("PUT", "/v1/object")
         connection.putheader("X-Winlin-Run", run_id)
@@ -187,6 +193,10 @@ def exercise_run(agent, cipher, mode, workers, data_mode):
     status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
     telemetry = json.loads(payload)
     assert telemetry["get_response_data"] == data_mode
+    assert telemetry["get_response_source_access"] == (
+        "hot-prefix" if data_mode == "shared" else "rotating-objects")
+    assert telemetry["get_response_source_pool_bytes"] == (
+        64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
     assert status == 200 and telemetry["get_completed"] >= 8 and telemetry["put_completed"] >= 9
     assert telemetry["active_connections"] is None and telemetry["tls_handshakes"] is None
     assert telemetry["process"]["voluntary_context_switches"] is None

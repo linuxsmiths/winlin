@@ -425,7 +425,8 @@ struct Runtime {
                 [this] {
                     return network_usage(address);
                 }),
-          payload(max_object_size), address(std::move(bind_address)), port(bind_port) {
+          payload(agent.config.get_source_pool_size()), address(std::move(bind_address)),
+          port(bind_port) {
         initialize();
     }
 
@@ -690,13 +691,15 @@ struct Runtime {
 // Allocate receive/body storage once per context, not once per HTTP request on a warm cache.
 // Native I/O keeps the same aligned buffer address until the context's final reference is released.
 Request::Request(Runtime& owner)
-    : runtime(owner), storage((65536 + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t)) {
+    : runtime(owner), storage((65536 + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t)),
+      get_payload(owner.agent.reserve_get_payload_stream()) {
     operation.request = this;
 }
 
 // Reset only per-request metadata after exclusive checkout. Do not clear the large receive/body
 // buffers: HTTP.sys writes the returned bytes, and body consumers read only completed byte counts.
 // Clear the native request ID explicitly so a failed receive cannot cancel a previous request.
+// Keep the GET buffer and source cursor across reuse so pooled requests do not restart at one blob.
 void Request::prepare() {
     id = HTTP_NULL_ID;
     header()->RequestId = HTTP_NULL_ID;

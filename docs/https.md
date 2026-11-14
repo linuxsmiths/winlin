@@ -199,16 +199,21 @@ OS resources may impose a lower practical capacity; the ceiling is not a through
 or resource-availability guarantee.
 The interactive benchmark menu exposes these same settings. After the final
 prompt it prints a shell-quoted `winlin run` command with the selected target
-and effective settings, including defaults. The menu proposes a result filename
-and asks whether to save detailed telemetry (yes/no, default no). The printed
+and effective settings, including defaults. The menu first asks whether to save
+detailed telemetry (yes/no, default no), then proposes a result filename only
+when saving is selected. The printed
 command includes `--output` only when saving is selected. Use it to reproduce the
 configuration noninteractively from the same working directory. When saving,
 choose a fresh `--output` path: existing result files are not overwritten.
 
 `--get-response-data shared|copy` controls server GET payload handling independently
 of TLS. `shared` is the unchanged default: responses borrow a startup-generated
-buffer. `copy` copies the requested bytes into private, reusable storage for every
-GET, even when the object size is unchanged; it does not generate new random data.
+buffer and always sends its prefix: this remains the hot-object baseline.
+`copy` uses a **fixed 1 GiB source pool**, allocated and populated before requests
+are accepted. It copies changing object-sized regions into private, reusable
+storage for every GET, even when the object size is unchanged. The pool is shared
+by all server workers, not allocated per connection, and is not configurable.
+There is no per-request random-data generation.
 The menu asks **GET response data: shared / copy** after the GET-size prompt for
 GET and mixed workloads, not PUT-only workloads. PUT handling is unchanged.
 The printed command, applied server settings, and detailed reports include this
@@ -258,8 +263,23 @@ sends and retains its largest used size for reuse. First use or growth includes
 allocation and initialization costs; use warmup for steady-state comparisons.
 Retained memory scales with connections or active/cached Windows request contexts
 and can be substantial for large objects. Both modes retain the shared source.
-This experiment changes application copying only: Linux still submits headers
-and bodies separately, and Windows still uses the same HTTP.sys response API.
+Copy mode retains a 1 GiB source pool in addition to these private buffers;
+shared mode retains its original 64 MiB source allocation and reads only the
+requested prefix. For 4 KiB objects the copy pool contains 262,144 whole objects;
+for 64 KiB objects it contains 16,384.
+Each connection/request context uses a seeded, deterministic source walk with
+its own stride. A stride coprime with the object count visits every whole object
+before wrapping; unused tail bytes are excluded for custom sizes. Changing the
+object size restarts that context's walk. Zero-byte GETs do not advance it.
+Seeds are reserved only at context creation, so there is no new shared counter
+or RNG on every GET. Interleaving still depends on native scheduling, and a short
+run need not visit the entire pool or establish that every read missed CPU caches.
+Telemetry records `get_response_source_access` and `get_response_source_pool_bytes`.
+
+**Comparing shared and copy now changes source-cache behavior as well as copying;
+it does not isolate the cost of memcpy.** Transport framing remains unchanged:
+Linux still submits headers and bodies separately, and Windows still uses the
+same HTTP.sys response API.
 Header/body coalescing and file-backed kTLS sends are separate future experiments.
 
 ### Cipher selection and kTLS
@@ -372,8 +392,9 @@ Cache misses, instructions, memory bandwidth and CPU profiling are not collected
 Detailed JSON reports are **opt-in**: `--output FILE` saves one; without that
 option the client displays the console table and warnings but writes no report
 or results directory. Telemetry needed for the console metrics is still collected.
-The interactive menu suggests a unique filename under `results/` and asks whether
-to save. Existing output files are not overwritten on startup.
+The interactive menu asks whether to save first, and suggests a unique filename
+under `results/` only if you choose yes. Existing output files are not overwritten
+on startup.
 When saving is enabled, completed repetitions are saved as the run progresses,
 and a caught run failure is recorded with `status: failed`. Abrupt termination may
 leave `status: running`. Exit statuses and failure diagnostics are preserved even

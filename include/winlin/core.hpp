@@ -27,6 +27,7 @@ namespace winlin {
 using Json = nlohmann::ordered_json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_object_size = 64 * 1024 * 1024;
+constexpr std::size_t copy_get_working_set_size = std::size_t{1024} * 1024 * 1024;
 constexpr std::size_t max_header_size = 16384;
 constexpr unsigned server_connection_limit = 65536;
 // This pin identifies the deliberately public test fixture, not an authenticated server identity.

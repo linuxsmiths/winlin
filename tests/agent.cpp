@@ -76,11 +76,57 @@ void test_get_response_payload() {
     } catch (const std::invalid_argument&) {
     }
 }
+
+// Check source rotation independently of random production data, including wrap and unused
+// tails.
+void test_rotating_get_source() {
+    const std::string contents = "abcdefghijklmnopqr!";
+    const std::vector<char> source(contents.begin(), contents.end());
+    GetResponsePayload payload(5);
+    std::vector<std::string> objects;
+    for (unsigned index = 0; index < 6; ++index) {
+        objects.emplace_back(payload.prepare(source, 3, false), 3);
+    }
+    const auto first = objects.front();
+    const auto second = objects[1];
+    std::sort(objects.begin(), objects.end());
+    require(objects == std::vector<std::string>{"abc", "def", "ghi", "jkl", "mno", "pqr"},
+            "Rotation covers every whole object without copying the partial source tail");
+    require(std::string_view(payload.prepare(source, 3, false), 3) == first,
+            "The source walk wraps only after a full cycle");
+    payload.prepare(source, 0, false);
+    require(std::string_view(payload.prepare(source, 3, false), 3) == second,
+            "Zero-byte GETs do not restart or advance the source cursor");
+    require(payload.prepare(source, 3, true) == source.data(),
+            "Shared mode continues to borrow the hot prefix after rotated copies");
+
+    // Distinct context streams must not simply walk one common sequence at adjacent positions.
+    std::vector<char> larger_source(128 * 4);
+    for (unsigned index = 0; index < 128; ++index) {
+        larger_source[index * 4] = static_cast<char>(index);
+    }
+    GetResponsePayload first_stream(0), second_stream(1);
+    std::vector<unsigned> first_objects, second_objects;
+    for (unsigned index = 0; index < 8; ++index) {
+        first_objects.push_back(
+            static_cast<unsigned char>(*first_stream.prepare(larger_source, 4, false)));
+        second_objects.push_back(
+            static_cast<unsigned char>(*second_stream.prepare(larger_source, 4, false)));
+    }
+    require(first_objects != second_objects, "Context seeds select different objects");
+    require((first_objects[1] + 128 - first_objects[0]) % 128 !=
+                (second_objects[1] + 128 - second_objects[0]) % 128,
+            "Context streams have different strides rather than a shared sliding window");
+    require(first_stream.prepare(larger_source, larger_source.size(), false) !=
+                larger_source.data(),
+            "Changing object size safely reconfigures the source walk");
+}
 }
 
 int main() {
     try {
         test_get_response_payload();
+        test_rotating_get_source();
         const std::string access(64, 'b');
         AgentConfig config;
         config.backend = "httpsys-schannel";

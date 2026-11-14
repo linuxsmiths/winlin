@@ -89,7 +89,7 @@ struct Server : Agent {
           tls(options && options->tls != "off"
                   ? context(true, options->cipher, options->tls == "ktls")
                   : Context(nullptr, SSL_CTX_free)),
-          payload(options ? max_object_size : 0), ktls(options && options->tls == "ktls") {
+          payload(config.get_source_pool_size()), ktls(options && options->tls == "ktls") {
         if (tls &&
             (SSL_CTX_use_certificate_chain_file(tls.get(), args.require("--cert").c_str()) != 1 ||
              SSL_CTX_use_PrivateKey_file(tls.get(), args.require("--key").c_str(),
@@ -177,7 +177,9 @@ struct Session {
     Clock::time_point activity{Clock::now()};
 
     // Take ownership of an accepted socket and borrow the worker's shared Server resources.
-    Session(int fd, Server& owner) : socket(fd, owner.tls.get()), server(owner) {
+    Session(int fd, Server& owner)
+        : socket(fd, owner.tls.get()), server(owner),
+          get_payload(owner.reserve_get_payload_stream()) {
         server.record_network_address(fd);
     }
 
@@ -327,7 +329,7 @@ struct Session {
                     state = State::send_body;
                 }
             } else if (state == State::send_body) {
-                // Send either the shared dummy object or the session's JSON response. A completed
+                // Send the prepared GET data or the session's JSON response. A completed
                 // persistent response returns to header processing and may use already buffered
                 // input.
                 if (offset < body_size) {

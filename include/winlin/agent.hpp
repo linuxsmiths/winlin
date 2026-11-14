@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <numeric>
 #include <thread>
 
 namespace winlin {
@@ -32,6 +33,15 @@ struct AgentConfig {
         "kernel_profiles", "network_counters", "numa_topology"};
     std::string process_cpu_scope{"server process only"};
 
+    // Control has no object source. Shared workloads retain their original payload allocation;
+    // copied workloads populate a fixed, worker-shared 1 GiB source before accepting requests.
+    std::size_t get_source_pool_size() const {
+        if (role == Role::control) {
+            return 0;
+        }
+        return shared_get_data ? max_object_size : copy_get_working_set_size;
+    }
+
     // Start only a single plain-HTTP control worker. Workload adapters replace the worker count
     // with the client's per-run selection when constructing a separate workload endpoint.
     static AgentConfig control_config(std::string backend) {
@@ -47,26 +57,67 @@ struct AgentConfig {
 // Prepare GET data without changing transport framing. Each Linux Session or Windows Request
 // owns one instance; only its current response may use the private buffer. Keep the shared source
 // alive and immutable through send completion. Private storage retains its largest size for reuse
-// and must not be prepared again while a partial/asynchronous send still references it.
+// and must not be prepared again while a partial/asynchronous send still references it. Each
+// copy context has its own deterministic source cursor; neither this cursor nor its buffer is
+// thread-safe. Native references/session ownership prevent concurrent preparation.
 class GetResponsePayload {
     std::vector<char> private_data_;
+    std::uint64_t stream_id_{};
+    std::size_t source_size_{}, object_size_{}, object_count_{}, object_index_{}, object_stride_{};
 
 public:
-    // Borrow shared data or copy exactly the requested prefix into response-private storage.
+    // Seed one stream for this context's lifetime, including Windows request-cache reuse.
+    explicit GetResponsePayload(std::uint64_t stream_id = 0) : stream_id_(stream_id) {
+    }
+
+    // Borrow the hot shared prefix or copy a changing object into response-private storage.
     // Allocation occurs only when the private high-water size grows; invalid sizes are rejected.
     const char* prepare(const std::vector<char>& source, std::size_t size, bool use_shared) {
         if (size > source.size()) {
             throw std::invalid_argument("GET response exceeds the prepared source payload");
         }
+
         if (use_shared) {
             return source.data();
         }
+
+        if (!size) {
+            return private_data_.data();
+        }
+
         if (private_data_.size() < size) {
             private_data_.resize(size);
         }
-        if (size) {
-            std::memcpy(private_data_.data(), source.data(), size);
+
+        // Divide the source into whole objects of the requested size. A partial tail is unused,
+        // so even non-power-of-two sizes cannot make a copy cross the end of the pool.
+        if (source_size_ != source.size() || object_size_ != size) {
+            source_size_ = source.size();
+            object_size_ = size;
+            object_count_ = source_size_ / object_size_;
+
+            // A fixed large prime seeds jumps across the pool. Different context seeds and strides
+            // avoid having every connection walk the same sequence one request apart. Adjust
+            // the stride to be coprime with the object count so every object is visited before
+            // a stream repeats; this work occurs only when the source/object size changes.
+            constexpr std::uint64_t stride_seed = 104729;
+            const auto seed = stream_id_ % object_count_;
+            object_index_ = static_cast<std::size_t>((seed * stride_seed) % object_count_);
+            object_stride_ = static_cast<std::size_t>((stride_seed + 2 * seed) % object_count_);
+            while (std::gcd(object_stride_, object_count_) != 1) {
+                ++object_stride_;
+            }
         }
+
+        std::memcpy(private_data_.data(), source.data() + object_index_ * object_size_, size);
+
+        // The index and stride are each below the object count, so one subtraction wraps the
+        // cursor. Zero-byte GETs do not advance it, and a one-object pool naturally repeats.
+        object_index_ += object_stride_;
+        if (object_index_ >= object_count_) {
+            object_index_ -= object_count_;
+        }
+
         return private_data_.data();
     }
 };
@@ -102,6 +153,7 @@ class Agent {
     std::function<Json()> process_usage_;
     std::function<Json()> host_usage_;
     std::function<Json()> network_usage_;
+    std::atomic<std::uint64_t> next_get_payload_stream_{};
 
 public:
     AgentConfig config;
@@ -120,6 +172,15 @@ public:
         }
     }
 
+    // Reserve a stream only when a copy-mode connection/request context is created. Warm GETs
+    // use private cursors, not a new contended atomic increment on every response.
+    std::uint64_t reserve_get_payload_stream() {
+        if (config.shared_get_data) {
+            return 0;
+        }
+        return next_get_payload_stream_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Keep host CPU accounting separate from process profiling; whole-host attribution needs an
     // otherwise idle server, not merely an exclusive Winlin benchmark lease.
     Json telemetry() const {
@@ -129,6 +190,11 @@ public:
             {"network", network_usage_ ? network_usage_() : Json::object()},
             {"process_cpu_scope", config.process_cpu_scope},
             {"get_response_data", config.shared_get_data ? "shared" : "copy"},
+            {"get_response_source_access",
+             config.role == AgentConfig::Role::control
+                 ? Json(nullptr)
+                 : Json(config.shared_get_data ? "hot-prefix" : "rotating-objects")},
+            {"get_response_source_pool_bytes", config.get_source_pool_size()},
             {"accepted_connections",
              config.connection_metrics ? Json(connections.load()) : Json(nullptr)},
             {"active_connections", config.connection_metrics ? Json(active.load()) : Json(nullptr)},
@@ -166,6 +232,7 @@ public:
                     {"supported_http_versions", {"1.1"}},
                     {"supported_methods", {"get", "put", "mixed"}},
                     {"supported_get_response_data_modes", {"shared", "copy"}},
+                    {"copy_get_working_set_bytes", copy_get_working_set_size},
                     {"supported_load_modes", {"closed_loop"}},
                     {"server_workers", {{"min", 1}, {"max", 256}}},
                     {"limits",

@@ -62,6 +62,11 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.server.telemetry_samples += 1
             self.respond({
                 "get_response_data": self.server.current_get_response_data,
+                "get_response_source_access": ("hot-prefix" if self.server.current_get_response_data
+                                               == "shared" else "rotating-objects"),
+                "get_response_source_pool_bytes": (64 * 1024 * 1024
+                                                  if self.server.current_get_response_data
+                                                  == "shared" else 1024 * 1024 * 1024),
                 "process": {
                     "user_cpu_seconds": self.server.telemetry_samples * 0.000123456789,
                     "system_cpu_seconds": 0, "peak_rss_bytes": 0,
@@ -109,6 +114,8 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                     "unavailable_metrics": ["voluntary_context_switches"],
                 },
             }
+            if self.server.copy_working_set_bytes is not None:
+                payload["copy_get_working_set_bytes"] = self.server.copy_working_set_bytes
             self.respond(payload)
 
     def do_POST(self):
@@ -181,6 +188,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.network_available = True
         endpoint.get_response_data_modes = ["shared", "copy"]
         endpoint.current_get_response_data = "shared"
+        endpoint.copy_working_set_bytes = 1024 * 1024 * 1024
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
@@ -239,11 +247,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             result = subprocess.run(
                 [str(menu_client)],
                 input=(f"3\n1\n{tls_input}1\n{method}\n{size_input}"
-                       f"1\n1\n0\n0.12345678912345678\n2\n1\n{output}\nyes\n0\n"),
+                       f"1\n1\n0\n0.12345678912345678\n2\n1\nyes\n{output}\n0\n"),
                 capture_output=True, text=True, timeout=15,
                 env=menu_environment,
             )
             assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stdout.index("Save detailed telemetry?") < result.stdout.index("Result file")
             assert ("GET size" in result.stdout) == (method != "put")
             assert ("PUT size" in result.stdout) == (method != "get")
             assert ("GET response data:" in result.stdout) == (method != "put")
@@ -357,16 +366,16 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
 
         # Both an explicit no and the default answer omit --output from the reproducible command.
         for answer in ("no", ""):
-            proposed_output = console_directory / "nested" / "declined.json"
             result = subprocess.run(
                 [str(menu_client)],
                 input=(f"3\n1\noff\n1\nget\n512\nshared\n1\n1\n0\n1\n2\n1\n"
-                       f"{proposed_output}\n{answer}\n0\n"),
+                       f"{answer}\n0\n"),
                 cwd=console_directory, env=menu_environment,
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 0, result.stdout + result.stderr
             assert "Save detailed telemetry?" in result.stdout
+            assert "Result file" not in result.stdout
             assert len(table_row.findall(result.stdout)) == 1
             displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
             assert displayed, result.stdout
@@ -389,6 +398,16 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert result.returncode == 1
         assert "does not support requested GET response data mode" in result.stderr
         server.get_response_data_modes = ["shared", "copy"]
+        for advertised_size in (None, 64 * 1024 * 1024):
+            server.copy_working_set_bytes = advertised_size
+            result = subprocess.run(
+                [*benchmark, "--get-response-data", "copy"], cwd=console_directory,
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1
+            assert "Copy-mode source capabilities are outdated" in result.stderr
+            assert not list(console_directory.iterdir())
+        server.copy_working_set_bytes = 1024 * 1024 * 1024
 
         # An explicitly empty filename is an error, not an implicit request to disable saving.
         result = subprocess.run(
