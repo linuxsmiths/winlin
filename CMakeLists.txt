@@ -105,17 +105,24 @@ if(BUILD_TESTING)
   add_test(NAME agent COMMAND winlin-agent-tests)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    # Faults affect only explicitly preloaded test children, never the benchmark binaries.
+    add_library(winlin-test-faults SHARED tests/linux_faults.cpp)
+    target_compile_features(winlin-test-faults PRIVATE cxx_std_23)
+    target_compile_options(winlin-test-faults PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(winlin-test-faults PRIVATE ${CMAKE_DL_LIBS})
     add_test(NAME scripts COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts.py")
     if(TARGET winlin)
       add_test(NAME client-errors COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/client_errors.py" "$<TARGET_FILE:winlin>")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/client_errors.py" "$<TARGET_FILE:winlin>"
+        "$<TARGET_FILE:winlin-test-faults>")
     endif()
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET winlin-server AND TARGET winlin)
     add_test(NAME https-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py"
-      "$<TARGET_FILE:winlin-server>" "$<TARGET_FILE:winlin>")
+      "$<TARGET_FILE:winlin-server>" "$<TARGET_FILE:winlin>"
+      "$<TARGET_FILE:winlin-test-faults>")
     set_tests_properties(https-integration PROPERTIES TIMEOUT 90)
   endif()
   if(WIN32)

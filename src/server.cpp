@@ -509,7 +509,28 @@ accept_connections(Server& server, int listener_fd, Epoll& poller,
             if (errno == EINTR) {
                 continue;
             }
-            throw system_error("accept");
+            // Linux can return a pending connection's network error from accept4().
+            // Discard that connection failure, not the healthy listener or worker pool.
+            // Resource exhaustion and invalid listener errors must still reach the owner.
+            switch (errno) {
+            case ECONNABORTED:
+            case ENETDOWN:
+            case EPROTO:
+            case ENOPROTOOPT:
+            case EHOSTDOWN:
+            case ENONET:
+            case EHOSTUNREACH:
+            case EOPNOTSUPP:
+            case ENETUNREACH: {
+                const auto error = system_error("accept4");
+                log_warning(
+                    std::string("Retrying listener after connection-local accept failure: ") +
+                    error.what());
+                continue;
+            }
+            default:
+                throw system_error("accept4");
+            }
         }
         // Do not allow more than the configured number of concurrent connections
         // to the server.

@@ -326,8 +326,11 @@ The console shows a compact per-run table of throughput, p50/p90/p99 latency, er
 server-interface network throughput (`Net Gbps`), average client-process CPU
 (`Client CPU(%)`), average whole-server CPU utilization (`Avg CPU(%)`), and estimated
 reference cycles per I/O (`Ref CPIO`). Server CPU utilization is averaged over each
-repetition's server-side telemetry interval; client CPU uses the measured client
-interval. Both use 100% per logical CPU. Unavailable server measurements
+repetition's server-side telemetry interval; process CPU uses timestamps captured
+next to its CPU counter reads. Each `client_process` and `server_process` records
+its `elapsed_seconds` and `elapsed_source`; legacy servers without process
+timestamps explicitly use the workload interval. Both use 100% per logical CPU.
+Unavailable server measurements
 appear as `N/A`. Decimal table values use two decimal places;
 JSON retains measurement precision. The console also shows run-specific warnings,
 such as load-generator CPU saturation or failed requests. General methodology
@@ -455,6 +458,11 @@ Important limitations:
 - Server telemetry is process-wide; the server enforces one active benchmark
   lease. Unrelated control requests can still add overhead. Sampling uses the control channel, so CPU and
   counter boundaries slightly exceed the client load interval.
+- Workers retain their healthy connections and wait while final client/server
+  telemetry is sampled. Connection teardown, thread joins, and histogram merging
+  happen afterward and are excluded from those counters. Sampling and boundary
+  synchronization still add small overhead; throughput continues to use the
+  request interval, including draining, rather than the wider sampling interval.
 - CPU utilization is reported as core equivalents, not a percentage of the entire
   machine. Peak RSS is the process-lifetime high-water mark, not a run-local peak.
   Load-generator CPU saturation is flagged heuristically, not conclusively ruled

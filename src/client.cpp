@@ -404,7 +404,7 @@ struct LoadConnection {
     // payload: outgoing PUT request body, passed by reference to avoid copying. It must be
     //          at least config.put_size bytes long.
     bool pump(const Target& target, const RunConfig& config, const std::vector<char>& payload,
-              Stats& stats) {
+              Stats& stats, Clock::duration request_timeout) {
         // Every pump() call makes forward progress on the current request.
         // It returns true when the request is complete and the connection is idle, or false
         // when more processing is needed. The caller must wait for the socket to be ready
@@ -525,10 +525,14 @@ struct LoadConnection {
                     }
                     remaining -= count;
                 } else {
-                    // All response body bytes have been read and the request is complete,
-                    // we can record the latency and update the stats.
+                    // A pump can cross the deadline while processing already-readable bytes.
+                    // Validate the same timestamp used for latency before counting any success.
+                    const auto request_elapsed = Clock::now() - started;
+                    if (request_elapsed >= request_timeout) {
+                        throw std::runtime_error("Request timed out");
+                    }
                     const auto ns =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(request_elapsed)
                             .count();
                     stats.latency.record(ns);
                     (get ? stats.get_latency : stats.put_latency).record(ns);
@@ -588,6 +592,7 @@ class LoadWorker {
     const RunConfig& config_;
     const std::vector<char>& payload_;
     const LoadHeaders& headers_;
+    const Clock::duration request_timeout_;
     Epoll poller_;
     // All the LoadConnection instances managed by this LoadWorker.
     // connections_ maps each connection's socket fd to its LoadConnection instance.
@@ -602,7 +607,9 @@ public:
     // headers: Immutable trial headers, kept alive with target, config and payload until join.
     LoadWorker(const Target& target, const RunConfig& config, const std::vector<char>& payload,
                const LoadHeaders& headers)
-        : target_(target), config_(config), payload_(payload), headers_(headers) {
+        : target_(target), config_(config), payload_(payload), headers_(headers),
+          request_timeout_(
+              std::chrono::ceil<Clock::duration>(std::chrono::duration<double>(config.timeout))) {
     }
 
     // Complete and pin every handshake before warmup, keeping connection setup out of measured
@@ -634,7 +641,7 @@ public:
                 }
                 // Advance TCP/TLS setup; more readiness events and pump() calls may be needed.
                 // payload_ is not used here, but we pass it to satisfy the pump() signature.
-                if (connection.pump(target_, config_, payload_, unused)) {
+                if (connection.pump(target_, config_, payload_, unused, request_timeout_)) {
                     ++ready;
                     poller_.set(connection.socket.fd.value, 0);
                 } else {
@@ -691,13 +698,46 @@ public:
             }
         }
 
+        // Retire each failed request once, regardless of whether readiness or a deadline
+        // sweep discovers it. Closing removes the socket from epoll without replacing it.
+        auto fail_connection = [&](LoadConnection& connection, const std::string& message) {
+            stats.fail(message);
+            log_warning("Workload connection fd " + std::to_string(connection.socket.fd.value) +
+                        " became dead: " + message +
+                        ". Closing it without replacement; remaining connections continue.");
+            connection.alive = false;
+            connection.socket.fd = Fd{};
+            --active;
+        };
+
         // The main loop of the phase. It continues until there are no more active requests,
         // either because issuance has stopped and outstanding requests have been drained,
         // or because all connections have failed.
         while (active) {
-            // Each active connection has one outstanding request. Wait for socket readiness
-            // so those requests can make progress; other connections may be idle or dead.
-            const int count = poller_.wait(events_.data(), events_.size(), 10);
+            // Expire requests before handling readiness, and never deliberately sleep past
+            // the nearest deadline. Millisecond rounding reflects epoll_wait's resolution.
+            const auto now = Clock::now();
+            auto nearest_deadline = Clock::time_point::max();
+            for (auto& [fd, connection] : connections_) {
+                (void)fd;
+                if (!connection->alive || connection->state == LoadConnection::State::idle) {
+                    continue;
+                }
+                const auto request_deadline = connection->started + request_timeout_;
+                if (now >= request_deadline) {
+                    fail_connection(*connection, "Request timed out");
+                } else {
+                    nearest_deadline = std::min(nearest_deadline, request_deadline);
+                }
+            }
+            if (!active) {
+                break;
+            }
+            const auto wait_ms =
+                std::chrono::ceil<std::chrono::milliseconds>(nearest_deadline - Clock::now())
+                    .count();
+            const int timeout_ms = static_cast<int>(std::clamp<std::int64_t>(wait_ms, 0, 10));
+            const int count = poller_.wait(events_.data(), events_.size(), timeout_ms);
             // Process each ready connection. pump() will advance the state machine for that
             // connection as far as possible without blocking. If the connection becomes idle,
             // issue() will start a new request on it, if the time and request limits allow
@@ -714,9 +754,12 @@ public:
                     continue;
                 }
                 try {
-                    // This connection is ready for reading or writing, call pump() to advance
-                    // its state machine.
-                    if (connection.pump(target_, config_, payload_, stats)) {
+                    // Readiness does not extend a deadline: waiting or processing earlier
+                    // events may have exhausted this request's remaining time.
+                    if (Clock::now() - connection.started >= request_timeout_) {
+                        throw std::runtime_error("Request timed out");
+                    }
+                    if (connection.pump(target_, config_, payload_, stats, request_timeout_)) {
                         // True return value means the connection is done with the current request
                         // and is now idle, ready for a new request. Try to issue a new request on
                         // this connection, if the time and request limits allow.
@@ -737,39 +780,7 @@ public:
                         poller_.set(connection.socket.fd.value, connection.socket.want);
                     }
                 } catch (const std::exception& error) {
-                    stats.fail(error.what());
-                    // Report the failure here, while the socket is still identifiable. Later
-                    // events skip this dead connection, so they must not repeat the warning.
-                    log_warning(
-                        "Workload connection fd " + std::to_string(connection.socket.fd.value) +
-                        " became dead: " + error.what() +
-                        ". Closing it without replacement; remaining connections continue.");
-                    connection.alive = false;
-                    connection.socket.fd = Fd{};
-                    --active;
-                }
-            }
-
-            // After processing ready connections, check how long each outstanding request
-            // has been running. The timeout applies to the request, not the connection's age.
-            const auto now = Clock::now();
-            for (auto& [fd, connection] : connections_) {
-                (void)fd;
-                // Fail a request that has exceeded its timeout, and permanently close its
-                // connection so no further requests are assigned to it.
-                if (connection->alive && connection->state != LoadConnection::State::idle &&
-                    std::chrono::duration<double>(now - connection->started).count() >=
-                        config_.timeout) {
-                    stats.fail("Request timed out");
-                    // A timeout also permanently removes this connection from the workload.
-                    // Log once before closing it; the alive check prevents repeated reports.
-                    log_warning("Workload connection fd " +
-                                std::to_string(connection->socket.fd.value) +
-                                " became dead: Request timed out. Closing it without replacement; "
-                                "remaining connections continue.");
-                    connection->alive = false;
-                    connection->socket.fd = Fd{};
-                    --active;
+                    fail_connection(connection, error.what());
                 }
             }
         }
@@ -789,22 +800,25 @@ public:
 // workers for measurement using a common measurement start time. This keeps connection setup
 // and warmup requests out of the measured workload.
 //
-// The two latches tell the calling thread when setup and warmup have finished. The same barrier
-// is used twice: workers wait there until the calling thread has prepared the next phase.
+// Three latches announce setup, warmup, and measurement completion. The barrier releases the
+// workers into warmup, measurement, and finally teardown, after final telemetry is captured.
 // A worker that encounters a fatal error records it and skips further workload, but must still
-// signal both latches and participate in both barrier waits. Otherwise, the calling thread or
+// signal every latch and participate in every barrier wait. Otherwise, the calling thread or
 // another worker could wait forever for a participant that exited early. If a thread cannot be
 // created, the calling thread accounts for its missing latch signals and barrier participation.
 //
 // Join all workers before reading their results or allowing the objects they reference to go
 // out of scope. If a fatal error was recorded, throw it after the threads have finished.
-// Otherwise, merge the measured request statistics, collect final telemetry, and return the
+// Final telemetry precedes connection teardown, thread joins, and histogram merging. Otherwise,
+// those costs would enter the CPU counters without entering the measured request interval.
+// After joining, merge the measured request statistics and return the
 // report with warnings for request failures or possible client CPU saturation.
 Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
            const std::vector<char>& payload, unsigned repetition, const Target& control_target,
            const std::string& run_id) {
     const LoadHeaders headers(target, config);
-    std::latch setup_done(config.workers), warmup_done(config.workers);
+    std::latch setup_done(config.workers), warmup_done(config.workers),
+        measurement_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};
     std::atomic<std::uint64_t> warmup_issued{}, issued{};
@@ -870,6 +884,10 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
                         fail(error.what());
                     }
                 }
+                // Preserve worker/socket ownership until the caller has sampled both ends.
+                // Failed workers must also participate so telemetry failures cannot deadlock join.
+                measurement_done.count_down();
+                gate.arrive_and_wait();
             });
         }
     } catch (const std::exception& error) {
@@ -878,6 +896,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
             // Threads that were never started cannot participate in latches or barrier phases.
             setup_done.count_down();
             warmup_done.count_down();
+            measurement_done.count_down();
             gate.arrive_and_drop();
         }
     }
@@ -906,6 +925,20 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     // Release worker threads to start measurement phase
     gate.arrive_and_wait();
 
+    // Sample before releasing parked workers to destroy their connections. Catch failures
+    // here so the final barrier is always released, even if a telemetry request throws.
+    measurement_done.wait();
+    Json client_after, server_after;
+    if (!abort) {
+        try {
+            client_after = usage();
+            server_after = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
+        } catch (const std::exception& error) {
+            fail(error.what());
+        }
+    }
+    gate.arrive_and_wait();
+
     // Destroying the jthread objects joins every worker before their results are read.
     threads.clear();
     if (abort) {
@@ -916,10 +949,6 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         combined.merge(stats);
     }
     const double elapsed = std::chrono::duration<double>(combined.end - measure_start).count();
-    // Collect telemetry after measurement, so that the measurement phase can be compared against
-    // the baseline.
-    const auto client_after = usage();
-    const auto server_after = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
@@ -928,7 +957,12 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     auto server_network = network_usage_delta(server_before.value("network", Json::object()),
                                               server_after.value("network", Json::object()));
     std::vector<std::string> warnings;
-    if (client_usage.at("cpu_utilization_percent").get<double>() >= config.workers * 85.0) {
+    const auto& client_cpu = client_usage.at("cpu_utilization_percent");
+    if (client_cpu.is_null()) {
+        warnings.emplace_back(
+            "Client CPU unavailable: " +
+            client_usage.at("cpu_utilization_unavailable_reason").get<std::string>());
+    } else if (client_cpu.get<double>() >= config.workers * 85.0) {
         warnings.emplace_back(
             "Load-generator workers may be CPU saturated; do not assume a server limit.");
     }
@@ -1041,8 +1075,10 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
         "Closed-loop workload: percentiles exclude arrival-rate queueing and do not establish an "
         "SLA.",
         "Server process telemetry includes the HTTP controller; one benchmark lease is active.",
-        "CPU telemetry includes control sampling; server sample boundaries slightly exceed the "
-        "load interval.",
+        "Final CPU/server telemetry is captured with workers parked, before connection teardown "
+        "and histogram merging. Process CPU uses its own sample interval when timestamps are "
+        "available; legacy servers use the workload interval. Server telemetry includes control "
+        "sampling, so its boundaries slightly exceed the load interval.",
         "Reference CPIO attributes all OS-visible server CPU work to the benchmark, including "
         "unrelated workloads; use an otherwise idle server. It is not measured core-clock cycles.",
         "Reference cycles use a fixed calibrated invariant-TSC frequency, not turbo frequency. "
@@ -1159,9 +1195,14 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
             } else {
                 std::cout << std::setw(11) << network.get<double>();
             }
-            std::cout << ' ' << std::setw(15)
-                      << result.at("client_process").at("cpu_utilization_percent").get<double>()
-                      << ' ';
+            const auto& client_cpu = result.at("client_process").at("cpu_utilization_percent");
+            std::cout << ' ' << std::setw(15);
+            if (client_cpu.is_null()) {
+                std::cout << "N/A";
+            } else {
+                std::cout << client_cpu.get<double>();
+            }
+            std::cout << ' ';
             const auto& cpu = result.at("server_host").at("cpu_utilization_percent");
             if (cpu.is_null()) {
                 std::cout << std::setw(12) << "N/A";

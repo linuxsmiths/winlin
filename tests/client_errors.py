@@ -15,6 +15,7 @@ import threading
 
 
 client = sys.argv[1]
+faults = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
 with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
     directory = Path(temporary)
     target = directory / "unreachable.json"
@@ -50,6 +51,24 @@ class RegistrationHandler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def setup(self):
+        """Track live workload connections across the client's final telemetry boundary."""
+        super().setup()
+        if self.server.is_workload:
+            with self.server.connection_condition:
+                self.server.open_connections += 1
+                self.server.connection_condition.notify_all()
+
+    def finish(self):
+        """Notify control-side assertions once a workload connection is actually torn down."""
+        try:
+            super().finish()
+        finally:
+            if self.server.is_workload:
+                with self.server.connection_condition:
+                    self.server.open_connections -= 1
+                    self.server.connection_condition.notify_all()
+
     def do_GET(self):
         if self.server.is_workload and not self.path.startswith("/v1/object?size="):
             self.server.metadata_requests.append(self.path)
@@ -59,6 +78,26 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.respond(b"x" * int(self.path.split("=")[1]),
                          status=503 if self.server.fail_workload else None)
         elif self.path.startswith("/v1/benchmark/telemetry?run_id="):
+            self.server.telemetry_in_run += 1
+            if self.server.telemetry_in_run == self.server.fail_telemetry_at:
+                self.respond({"error": "fixture telemetry failed"}, status=503)
+                return
+            if self.server.expected_live_connections:
+                data = self.server.current_workload
+                with data.connection_condition:
+                    if self.server.telemetry_in_run == 1:
+                        # TCP setup may finish before the fixture starts both handler threads.
+                        data.connection_condition.wait_for(
+                            lambda: data.open_connections == self.server.expected_live_connections,
+                            timeout=1,
+                        )
+                    else:
+                        # Give EOF handlers time to observe a prematurely closed client.
+                        # Correctly parked workers keep these sockets open throughout the wait.
+                        data.connection_condition.wait_for(
+                            lambda: data.open_connections == 0, timeout=0.1,
+                        )
+                    self.server.sampled_connections.append(data.open_connections)
             self.server.telemetry_samples += 1
             self.respond({
                 "get_response_data": self.server.current_get_response_data,
@@ -68,6 +107,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                                                   if self.server.current_get_response_data
                                                   == "shared" else 1024 * 1024 * 1024),
                 "process": {
+                    "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
                     "user_cpu_seconds": self.server.telemetry_samples * 0.000123456789,
                     "system_cpu_seconds": 0, "peak_rss_bytes": 0,
                     "voluntary_context_switches": None, "involuntary_context_switches": None,
@@ -127,18 +167,22 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             if settings["tls"] == "off":
                 settings["cipher"] = None
             data = self.server.plain if settings["tls"] == "off" else self.server.secure
+            self.server.current_workload = data
+            self.server.telemetry_in_run = 0
             applied = dict(settings)
             if self.server.misreport_workers:
                 applied["workers"] += 1
             if self.server.misreport_get_response_data:
                 applied["get_response_data"] = "shared"
             self.respond({
-                "run_id": "aa" * 32, "port": data.server_port,
+                "run_id": "aa" * 32,
+                "port": self.server.workload_port_override or data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
                 "backend": "test",
                 "settings": applied,
             })
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
+            self.server.stop_requests += 1
             self.respond({"stopped": True})
         else:
             self.respond({"error": "Unsupported route"}, status=404)
@@ -182,6 +226,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.metadata_requests = []
         endpoint.capability_queries = 0
         endpoint.telemetry_samples = 0
+        endpoint.connection_condition = threading.Condition()
+        endpoint.open_connections = 0
         endpoint.cycles_available = False
         endpoint.reference_available = False
         endpoint.host_cpu_available = True
@@ -194,6 +240,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     server.fail_workload = False
     server.misreport_workers = False
     server.misreport_get_response_data = False
+    server.telemetry_in_run = 0
+    server.fail_telemetry_at = 0
+    server.expected_live_connections = 0
+    server.sampled_connections = []
+    server.workload_port_override = None
+    server.stop_requests = 0
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
@@ -478,6 +530,101 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                    and repetition["object_goodput_bytes_per_second"] > 0
                    for repetition in report["results"])
         server.network_available = True
+
+        single_repetition = benchmark.copy()
+        single_repetition[single_repetition.index("--repetitions") + 1] = "1"
+        multiple_workers = single_repetition.copy()
+        for option in ("--connections", "--workers"):
+            multiple_workers[multiple_workers.index(option) + 1] = "2"
+
+        if faults:
+            # Inject delay at the two distinct boundaries that previously admitted expired I/O.
+            for variable, marker in (
+                ("WINLIN_TEST_LATE_READY", "delayed ready response"),
+                ("WINLIN_TEST_LATE_RECV", "delayed received response"),
+            ):
+                output = directory / f"{variable}.json"
+                result = subprocess.run(
+                    [*single_repetition, "--tls", "off", "--timeout", "0.05",
+                     "--output", str(output)],
+                    capture_output=True, text=True, timeout=15,
+                    env=dict(os.environ, LD_PRELOAD=faults, WINLIN_TEST_DATA_PORT=str(plain.server_port),
+                             **{variable: "1"}),
+                )
+                assert result.returncode == 2, result.stdout + result.stderr
+                assert marker in result.stderr, result.stderr
+                repetition = json.loads(output.read_text())["results"][0]
+                assert repetition["completed"] == 0 and repetition["errors"] == 1, repetition
+                assert repetition["first_error"] == "Request timed out", repetition
+                assert repetition["latency"]["samples"] == 0, repetition
+                assert result.stderr.count("became dead:") == 1, result.stderr
+
+            # Teardown has a known injected CPU cost. Neither final process counters nor the
+            # final control sample may include it; both workload connections must still be live.
+            with plain.connection_condition:
+                assert plain.connection_condition.wait_for(
+                    lambda: plain.open_connections == 0, timeout=1,
+                )
+            server.expected_live_connections = 2
+            server.sampled_connections = []
+            output = directory / "measurement-boundary.json"
+            result = subprocess.run(
+                [*multiple_workers, "--tls", "off", "--output", str(output)],
+                capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, LD_PRELOAD=faults, WINLIN_TEST_DATA_PORT=str(plain.server_port),
+                         WINLIN_TEST_TEARDOWN_CPU="1"),
+            )
+            server.expected_live_connections = 0
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stderr.count("accounted teardown CPU") == 2, result.stderr
+            assert server.sampled_connections == [2, 2], server.sampled_connections
+            repetition = json.loads(output.read_text())["results"][0]
+            assert repetition["client_process"]["user_cpu_seconds"] < 5, repetition
+            assert repetition["client_process"]["elapsed_seconds"] >= repetition["elapsed_seconds"]
+            assert repetition["server_process"]["elapsed_seconds"] == 0.25, repetition
+
+            # A never-created worker must not leave the new measurement latch waiting forever.
+            output = directory / "worker-creation-failure.json"
+            result = subprocess.run(
+                [*multiple_workers, "--tls", "off", "--output", str(output)],
+                capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, LD_PRELOAD=faults, WINLIN_TEST_FAIL_THREAD_CREATE="1"),
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
+            report = json.loads(output.read_text())
+            assert report["status"] == "failed"
+            assert "Cannot start load workers" in report["failure"], report
+
+        # Every failure stage must release parked workers and stop the benchmark lease.
+        for stage in ("setup", "warmup", "baseline", "final"):
+            output = directory / f"{stage}-failure.json"
+            stops_before = server.stop_requests
+            arguments = [*multiple_workers, "--tls", "off", "--output", str(output)]
+            with socket.socket() as refused:
+                refused.bind(("127.0.0.1", 0))
+                if stage == "setup":
+                    server.workload_port_override = refused.getsockname()[1]
+                elif stage == "warmup":
+                    plain.fail_workload = True
+                    arguments[arguments.index("--warmup") + 1] = "0.05"
+                else:
+                    server.fail_telemetry_at = 1 if stage == "baseline" else 2
+                result = subprocess.run(
+                    arguments, capture_output=True, text=True, timeout=15,
+                )
+            server.workload_port_override = None
+            plain.fail_workload = False
+            server.fail_telemetry_at = 0
+            assert result.returncode == 1, result.stdout + result.stderr
+            report = json.loads(output.read_text())
+            assert report["status"] == "failed", report
+            assert server.stop_requests == stops_before + 1
+            if stage in ("baseline", "final"):
+                assert "Server rejected control request (HTTP 503)" in report["failure"], report
+            with plain.connection_condition:
+                assert plain.connection_condition.wait_for(
+                    lambda: plain.open_connections == 0, timeout=1,
+                ), stage
 
         # Header fragments and preloaded bodies must work across repeated responses on the same
         # connection. Separate writes also split the header across TLS records.

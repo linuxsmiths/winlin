@@ -267,6 +267,22 @@ int main() {
               "CPU utilization is expressed only as a percentage");
         check(usage_delta(before, after, .25).at("cpu_utilization_percent") == 400,
               "CPU utilization is not capped at 100 percent or normalized by host core count");
+        // Boundary sampling is wider than request processing; CPU must use the former.
+        auto timed_before = before;
+        auto timed_after = after;
+        timed_before["sampled_at_monotonic_seconds"] = 10.0;
+        timed_after["sampled_at_monotonic_seconds"] = 12.0;
+        const auto timed_delta = usage_delta(timed_before, timed_after, .25);
+        check(timed_delta.at("cpu_utilization_percent") == 50 &&
+                  timed_delta.at("elapsed_seconds") == 2,
+              "Process CPU uses its sample interval instead of the request interval");
+        for (const Json& invalid_time : {Json(nullptr), Json(10.0), Json(9.0)}) {
+            timed_after["sampled_at_monotonic_seconds"] = invalid_time;
+            const auto invalid_delta = usage_delta(timed_before, timed_after, .25);
+            check(invalid_delta.at("cpu_utilization_percent").is_null() &&
+                      !invalid_delta.at("cpu_utilization_unavailable_reason").is_null(),
+                  "Invalid process sample boundaries cannot silently use the request interval");
+        }
         check(delta.at("cpu_cycles").is_null(),
               "Missing cycles must not be estimated from CPU time");
         auto counted_before = before;

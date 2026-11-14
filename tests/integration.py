@@ -17,6 +17,7 @@ from https_contract import exercise_request_reuse, exercise_single_instance, pen
 
 
 SERVER, CLIENT = sys.argv[1:3]
+FAULTS = str(Path(sys.argv[3]).resolve()) if len(sys.argv) > 3 else None
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -32,8 +33,9 @@ def command(*arguments, expected=0, **kwargs):
 class Controller:
     """Own only test-created processes; keep their guard and diagnostics isolated."""
 
-    def __init__(self, directory, bind=None, extra=()):
+    def __init__(self, directory, bind=None, extra=(), inject_accept_errors=False):
         self.directory = directory
+        self.inject_accept_errors = inject_accept_errors
         arguments = [
             str(ROOT / "scripts/run-server.sh"), "--build-dir", str(Path(SERVER).parent),
             "--state-dir", str(directory), "--port", "0", "--http-port", "0",
@@ -41,8 +43,12 @@ class Controller:
         ]
         if bind is not None:
             arguments += ["--bind", bind]
+        environment = dict(os.environ)
+        if inject_accept_errors:
+            environment.update(LD_PRELOAD=FAULTS, WINLIN_TEST_ACCEPT_ERRORS="1")
         self.process = subprocess.Popen(
             arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=environment,
         )
         try:
             assert select.select([self.process.stdout], [], [], 10)[0], "Controller startup timed out"
@@ -65,6 +71,8 @@ class Controller:
             self.process.communicate()
             raise AssertionError("Controller or workload workers failed to stop")
         assert self.process.returncode == 0, stderr
+        if self.inject_accept_errors:
+            assert stderr.count("Retrying listener after connection-local accept failure:") == 4, stderr
 
     def listening_ports(self):
         """Inspect this test-owned process's listeners, not other servers in its network namespace."""
@@ -295,7 +303,9 @@ def exercise_receive_buffer(lease):
 
 with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
     directory = Path(temporary)
-    controller = Controller(directory)
+    # The first controller and workload each encounter ECONNABORTED and EPROTO before accepting.
+    # All normal control/workload checks below must still succeed after those isolated failures.
+    controller = Controller(directory, inject_accept_errors=FAULTS is not None)
     try:
         assert controller.ready["bind"] == "0.0.0.0"
         assert controller.ready["backend"] == "http"

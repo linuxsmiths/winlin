@@ -489,7 +489,11 @@ inline Json usage() {
     if (getrusage(RUSAGE_SELF, &data) != 0) {
         throw system_error("getrusage");
     }
-    Json result{{"user_cpu_seconds", data.ru_utime.tv_sec + data.ru_utime.tv_usec / 1e6},
+    // Timestamp next to the CPU read, before optional counters add their own sampling overhead.
+    const auto sampled_at = Clock::now();
+    Json result{{"sampled_at_monotonic_seconds",
+                 std::chrono::duration<double>(sampled_at.time_since_epoch()).count()},
+                {"user_cpu_seconds", data.ru_utime.tv_sec + data.ru_utime.tv_usec / 1e6},
                 {"system_cpu_seconds", data.ru_stime.tv_sec + data.ru_stime.tv_usec / 1e6},
                 {"peak_rss_bytes", static_cast<std::uint64_t>(data.ru_maxrss) * 1024},
                 {"voluntary_context_switches", data.ru_nvcsw},

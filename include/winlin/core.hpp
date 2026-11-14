@@ -535,9 +535,20 @@ struct RunConfig {
     }
 };
 
-// Normalize cumulative process counters over the measured interval, preserving unsupported values
-// as null. Peak RSS is a lifetime high-water mark, not a counter that can be subtracted.
+// Normalize process counters over their own sample interval, preserving unsupported values as null.
+// Older servers without timestamps use the supplied workload interval and explicitly label it.
+// Peak RSS is a lifetime high-water mark, not a counter that can be subtracted.
 inline Json usage_delta(const Json& before, const Json& after, double elapsed) {
+    // Never divide a wider CPU sampling window by the shorter request-completion interval.
+    const bool timestamped = before.contains("sampled_at_monotonic_seconds") ||
+                             after.contains("sampled_at_monotonic_seconds");
+    if (timestamped) {
+        const auto start = before.value("sampled_at_monotonic_seconds", Json(nullptr));
+        const auto end = after.value("sampled_at_monotonic_seconds", Json(nullptr));
+        elapsed =
+            start.is_number() && end.is_number() ? end.get<double>() - start.get<double>() : 0;
+    }
+    const bool valid_interval = std::isfinite(elapsed) && elapsed > 0;
     const auto user =
         after.at("user_cpu_seconds").get<double>() - before.at("user_cpu_seconds").get<double>();
     const auto system = after.at("system_cpu_seconds").get<double>() -
@@ -570,7 +581,14 @@ inline Json usage_delta(const Json& before, const Json& after, double elapsed) {
     }
     return {{"user_cpu_seconds", user},
             {"system_cpu_seconds", system},
-            {"cpu_utilization_percent", 100 * (user + system) / elapsed},
+            {"elapsed_seconds", valid_interval ? Json(elapsed) : Json(nullptr)},
+            {"elapsed_source", timestamped ? "process sample monotonic timestamps"
+                                           : "workload interval; process timestamps unavailable"},
+            {"cpu_utilization_percent",
+             valid_interval ? Json(100 * (user + system) / elapsed) : Json(nullptr)},
+            {"cpu_utilization_unavailable_reason",
+             valid_interval ? Json(nullptr)
+                            : Json("Process CPU samples require a positive, monotonic interval")},
             {"cpu_cycles", cycles},
             {"cpu_cycles_source", after.value("cpu_cycles_source", Json(nullptr))},
             {"cpu_cycles_unavailable_reason", cycles_reason},

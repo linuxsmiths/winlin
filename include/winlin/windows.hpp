@@ -214,14 +214,20 @@ inline Json usage() {
     FILETIME creation{}, exit{}, kernel{}, user{};
     PROCESS_MEMORY_COUNTERS memory{};
     memory.cb = sizeof(memory);
-    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user) ||
-        !GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
         throw windows_error("Cannot collect process telemetry");
+    }
+    // Pair CPU counters with their own clock boundary, not the shorter client load interval.
+    const auto sampled_at = Clock::now();
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
+        throw windows_error("Cannot collect process memory telemetry");
     }
     ULONG64 cycles{};
     const bool cycles_available = QueryProcessCycleTime(GetCurrentProcess(), &cycles) != FALSE;
     const auto cycles_error = cycles_available ? ERROR_SUCCESS : GetLastError();
-    return {{"cpu_cycles", cycles_available ? Json(cycles) : Json(nullptr)},
+    return {{"sampled_at_monotonic_seconds",
+             std::chrono::duration<double>(sampled_at.time_since_epoch()).count()},
+            {"cpu_cycles", cycles_available ? Json(cycles) : Json(nullptr)},
             {"cpu_cycles_source", cycles_available ? Json("QueryProcessCycleTime") : Json(nullptr)},
             {"cpu_cycles_unavailable_reason",
              cycles_available ? Json(nullptr)
