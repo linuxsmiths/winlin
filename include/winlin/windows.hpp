@@ -2,6 +2,7 @@
 
 #include "winlin/host.hpp"
 #include "winlin/cpu.hpp"
+#include "winlin/network.hpp"
 
 #include <memory>
 #include <cstddef>
@@ -16,6 +17,8 @@
 #include <ws2tcpip.h>
 #include <winhttp.h>
 #include <http.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 
 namespace winlin {
 inline std::runtime_error windows_error(std::string message, DWORD code = GetLastError()) {
@@ -300,6 +303,47 @@ inline Json host_usage() {
     });
     result["processor_groups_sampled"] = sampled_groups;
     return result;
+}
+
+// Match HTTP.sys's explicitly bound IPv4 address to its interface LUID, then sample that
+// interface's native 64-bit RX/TX counters. Never aggregate unrelated or virtual interfaces.
+inline Json network_usage(const std::string& local_address) {
+    return sample_network_usage("Windows GetIfEntry2 InOctets/OutOctets", [&] {
+        IN_ADDR address{};
+        if (InetPtonA(AF_INET, local_address.c_str(), &address) != 1) {
+            throw std::runtime_error("Cannot parse server address for network telemetry");
+        }
+        MIB_UNICASTIPADDRESS_TABLE* addresses{};
+        const auto status = GetUnicastIpAddressTable(AF_INET, &addresses);
+        if (status != NO_ERROR) {
+            throw windows_error("Cannot enumerate server interface addresses", status);
+        }
+        const std::unique_ptr<MIB_UNICASTIPADDRESS_TABLE, decltype(&FreeMibTable)> cleanup(
+            addresses, FreeMibTable);
+        MIB_IF_ROW2 interface_row{};
+        bool matched = false;
+        for (ULONG index = 0; index < addresses->NumEntries; ++index) {
+            const auto& entry = addresses->Table[index];
+            if (entry.Address.Ipv4.sin_addr.s_addr == address.s_addr) {
+                if (matched && interface_row.InterfaceLuid.Value != entry.InterfaceLuid.Value) {
+                    throw std::runtime_error("Server address belongs to multiple interfaces");
+                }
+                interface_row.InterfaceLuid = entry.InterfaceLuid;
+                matched = true;
+            }
+        }
+        if (!matched) {
+            throw std::runtime_error("Cannot find interface for the bound server address");
+        }
+        const auto result = GetIfEntry2(&interface_row);
+        if (result != NO_ERROR) {
+            throw windows_error("Cannot sample server network interface", result);
+        }
+        return Json{{"interface_id", std::to_string(interface_row.InterfaceLuid.Value)},
+                    {"interface_name", utf8(interface_row.Alias)},
+                    {"received_bytes", static_cast<std::uint64_t>(interface_row.InOctets)},
+                    {"transmitted_bytes", static_cast<std::uint64_t>(interface_row.OutOctets)}};
+    });
 }
 
 // Read the local Azure SKU leaf only, bypassing proxies and refusing redirects.

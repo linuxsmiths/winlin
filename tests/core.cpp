@@ -1,5 +1,6 @@
 #include "winlin/host.hpp"
 #include "winlin/cpu.hpp"
+#include "winlin/network.hpp"
 #include <iostream>
 
 namespace {
@@ -320,6 +321,48 @@ int main() {
         missing_timestamp.erase("sampled_at_monotonic_seconds");
         check(host_usage_delta(host_before, missing_timestamp).at("reference_cycles").is_null(),
               "Missing server timestamps cannot silently use a zero baseline");
+
+        // NIC throughput uses the server interface's RX+TX deltas, not object payload sizes.
+        const Json network_before{{"source", "fixture counters"},
+                                  {"interface_id", "nic-1"},
+                                  {"interface_name", "test-nic"},
+                                  {"received_bytes", std::uint64_t{1000}},
+                                  {"transmitted_bytes", std::uint64_t{2000}},
+                                  {"sampled_at_monotonic_seconds", 10.0}};
+        auto network_after = network_before;
+        network_after["received_bytes"] = std::uint64_t{125001000};
+        network_after["transmitted_bytes"] = std::uint64_t{62502000};
+        network_after["sampled_at_monotonic_seconds"] = 10.25;
+        const auto network = network_usage_delta(network_before, network_after);
+        check(network.at("gigabits_per_second") == 6 && network.at("received_bytes") == 125000000 &&
+                  network.at("transmitted_bytes") == 62500000,
+              "Network Gbps includes both directions using decimal gigabits");
+        for (const auto* counter : {"received_bytes", "transmitted_bytes"}) {
+            auto reset_network = network_after;
+            reset_network[counter] = std::uint64_t{0};
+            check(network_usage_delta(network_before, reset_network)
+                      .at("gigabits_per_second")
+                      .is_null(),
+                  "Reset interface counters cannot appear as a valid rate");
+        }
+        auto changed_interface = network_after;
+        changed_interface["interface_id"] = "nic-2";
+        check(network_usage_delta(network_before, changed_interface)
+                  .at("gigabits_per_second")
+                  .is_null(),
+              "Different interfaces cannot be combined between network boundaries");
+        auto missing_network = network_after;
+        missing_network["received_bytes"] = nullptr;
+        missing_network["unavailable_reason"] = "Interface unavailable";
+        check(network_usage_delta(network_before, missing_network).at("unavailable_reason") ==
+                  "Interface unavailable",
+              "Unavailable network counters retain their diagnostic");
+        auto invalid_network_time = network_after;
+        invalid_network_time["sampled_at_monotonic_seconds"] = 10.0;
+        check(network_usage_delta(network_before, invalid_network_time)
+                  .at("gigabits_per_second")
+                  .is_null(),
+              "A zero network sample interval must not produce throughput");
         std::cout << "core tests passed\n";
         return 0;
     } catch (const std::exception& error) {

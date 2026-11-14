@@ -406,8 +406,11 @@ struct Runtime {
 
     // Create the control endpoint from local settings. It has no synthetic GET payload.
     explicit Runtime(const Args& args)
-        : agent(windows_config(), usage, {}, host_usage), stop_file(args.get("--stop-file")),
-          address(args.get("--bind", "127.0.0.1")),
+        : agent(windows_config(), usage, {}, host_usage,
+                [this] {
+                    return network_usage(address);
+                }),
+          stop_file(args.get("--stop-file")), address(args.get("--bind", "127.0.0.1")),
           port(static_cast<unsigned>(number(args.get("--port", "38080"), 65535))) {
         initialize();
     }
@@ -416,8 +419,11 @@ struct Runtime {
     // native engine as control, but has a separate endpoint and an in-memory run lease.
     Runtime(AgentConfig config, const std::string& run_id, std::string bind_address,
             unsigned bind_port)
-        : agent(std::move(config), usage, run_id, host_usage), payload(max_object_size),
-          address(std::move(bind_address)), port(bind_port) {
+        : agent(std::move(config), usage, run_id, host_usage,
+                [this] {
+                    return network_usage(address);
+                }),
+          payload(max_object_size), address(std::move(bind_address)), port(bind_port) {
         initialize();
     }
 

@@ -383,6 +383,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             assert "control_capabilities" not in report
             assert report["benchmark"] == ("http" if mode == "off" else "https")
             assert "Ref CPIO" in invocation.stdout
+            assert "p90(us)" in invocation.stdout
+            assert "Net Gbps" in invocation.stdout
+            assert "Client CPU(%)" in invocation.stdout
             assert "{" not in invocation.stdout
             assert "run_id" not in output.read_text() and "access_token" not in output.read_text()
             assert "authentication" not in invocation.stdout + output.read_text()
@@ -395,6 +398,17 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert repetition["get_completed"] == repetition["put_completed"] == 50
                 assert repetition["received_object_bytes"] == 50 * 512
                 assert repetition["sent_object_bytes"] == 50 * 256
+                network = repetition["server_network"]
+                assert network["interface_name"] == "lo"
+                assert network["received_bytes"] > 0 and network["transmitted_bytes"] > 0
+                assert network["gigabits_per_second"] > 0
+                assert network["elapsed_seconds"] > 0
+                before_network, after_network = (repetition[key]["network"]
+                                                for key in ("server_before", "server_after"))
+                assert network["received_bytes"] == (
+                    after_network["received_bytes"] - before_network["received_bytes"])
+                assert network["transmitted_bytes"] == (
+                    after_network["transmitted_bytes"] - before_network["transmitted_bytes"])
                 cpu = repetition["server_host"]
                 if cpu["reference_cycles"] is None:
                     assert repetition["server_reference_cycles_per_io"] is None

@@ -66,12 +66,25 @@ struct Server : Agent {
     std::vector<char> payload;
     bool ktls{};
     std::atomic<bool> stop{};
+    mutable std::mutex network_mutex;
+    std::vector<std::uint32_t> network_addresses;
+    std::string network_error;
 
     // Without options, construct a plain-HTTP control server. With options, prepare the selected
     // workload backend, loading a matching certificate/key only when HTTPS was requested.
     Server(const Args& args, const BenchmarkOptions* options = nullptr,
            const std::string& run_id = {})
-        : Agent(options ? workload_config(*options) : linux_config(), usage, run_id, host_usage),
+        : Agent(options ? workload_config(*options) : linux_config(), usage, run_id, host_usage,
+                [this] {
+                    std::lock_guard lock(network_mutex);
+                    if (!network_error.empty()) {
+                        return sample_network_usage("Linux sysfs interface rx_bytes/tx_bytes",
+                                                    [&]() -> Json {
+                                                        throw std::runtime_error(network_error);
+                                                    });
+                    }
+                    return network_usage(network_addresses);
+                }),
           tls(options && options->tls != "off"
                   ? context(true, options->cipher, options->tls == "ktls")
                   : Context(nullptr, SSL_CTX_free)),
@@ -88,6 +101,29 @@ struct Server : Agent {
         if (!payload.empty() &&
             RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
             throw tls_error("Cannot generate reusable payload");
+        }
+    }
+
+    // Record local addresses once per accepted connection, not per request. This identifies the
+    // actual interface for wildcard listeners; telemetry failures do not abort the workload.
+    void record_network_address(int fd) {
+        sockaddr_in address{};
+        socklen_t length = sizeof(address);
+        const auto result = getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length);
+        const auto error = errno;
+        std::lock_guard lock(network_mutex);
+        if (result != 0) {
+            network_error = "Cannot identify benchmark connection's local address: " +
+                            std::string(std::strerror(error));
+            return;
+        }
+        if (address.sin_family != AF_INET || length != sizeof(address)) {
+            network_error = "Benchmark connection did not expose an IPv4 local address";
+            return;
+        }
+        if (std::find(network_addresses.begin(), network_addresses.end(),
+                      address.sin_addr.s_addr) == network_addresses.end()) {
+            network_addresses.push_back(address.sin_addr.s_addr);
         }
     }
 };
@@ -139,6 +175,7 @@ struct Session {
 
     // Take ownership of an accepted socket and borrow the worker's shared Server resources.
     Session(int fd, Server& owner) : socket(fd, owner.tls.get()), server(owner) {
+        server.record_network_address(fd);
     }
 
     // Release the connection slot when the worker removes this session or shuts down.

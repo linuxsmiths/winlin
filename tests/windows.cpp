@@ -170,6 +170,15 @@ int main() {
         require(host.at("busy_cpu_seconds").is_number(), "Native whole-server CPU accounting");
         require(host.at("processor_groups_sampled") == GetActiveProcessorGroupCount(),
                 "Whole-server CPU accounting visits every active processor group");
+        const auto network = network_usage("127.0.0.1");
+        require(network.at("received_bytes").is_number_unsigned() &&
+                    network.at("transmitted_bytes").is_number_unsigned() &&
+                    !network.at("interface_name").is_null(),
+                "Native server interface RX/TX accounting");
+        const auto invalid_network = network_usage("not-an-address");
+        require(invalid_network.at("received_bytes").is_null() &&
+                    !invalid_network.at("unavailable_reason").is_null(),
+                "Unavailable interface counters retain a reason, not zero");
         require(environment().at("os") == "Windows", "Native environment");
         require(wide(utf8(L"winlin-\u03b1")) == L"winlin-\u03b1", "Unicode path conversion");
         std::cout << "Windows platform tests passed\n";

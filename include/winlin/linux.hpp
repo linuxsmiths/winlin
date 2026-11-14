@@ -2,6 +2,7 @@
 
 #include "winlin/host.hpp"
 #include "winlin/cpu.hpp"
+#include "winlin/network.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -16,6 +17,8 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -523,6 +526,63 @@ inline Json host_usage() {
         const double busy =
             static_cast<double>(ticks[0]) + ticks[1] + ticks[2] + ticks[5] + ticks[6];
         return busy / ticks_per_second;
+    });
+}
+
+// Resolve accepted connections' local IPv4 addresses to one interface, including wildcard
+// listeners. Multiple interfaces are ambiguous and must not be summed or silently substituted.
+inline Json network_usage(const std::vector<std::uint32_t>& local_addresses) {
+    return sample_network_usage("Linux sysfs interface rx_bytes/tx_bytes", [&] {
+        if (local_addresses.empty()) {
+            throw std::runtime_error("No accepted connection identifies the server interface");
+        }
+        ifaddrs* addresses{};
+        if (getifaddrs(&addresses) != 0) {
+            throw system_error("Cannot enumerate server network interfaces");
+        }
+        const std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> cleanup(addresses, freeifaddrs);
+        std::string interface;
+        for (const auto local_address : local_addresses) {
+            std::string matched;
+            for (auto* entry = addresses; entry; entry = entry->ifa_next) {
+                if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET) {
+                    continue;
+                }
+                const auto* address = reinterpret_cast<const sockaddr_in*>(entry->ifa_addr);
+                if (address->sin_addr.s_addr == local_address) {
+                    if (!matched.empty() && matched != entry->ifa_name) {
+                        throw std::runtime_error("Server address belongs to multiple interfaces");
+                    }
+                    matched = entry->ifa_name;
+                }
+            }
+            if (matched.empty()) {
+                throw std::runtime_error("Cannot find interface for the server connection address");
+            }
+            if (!interface.empty() && interface != matched) {
+                throw std::runtime_error("Benchmark connections use multiple network interfaces");
+            }
+            interface = std::move(matched);
+        }
+        const auto index = if_nametoindex(interface.c_str());
+        if (!index) {
+            throw system_error("Cannot identify server network interface " + interface);
+        }
+        // Read OS interface counters, not application payload counts. RX and TX are sampled
+        // separately, so a small read-time skew is unavoidable outside the measured hot path.
+        auto read_counter = [&](const char* name) {
+            const auto path = "/sys/class/net/" + interface + "/statistics/" + name;
+            std::ifstream input(path);
+            std::uint64_t bytes{};
+            if (!(input >> bytes)) {
+                throw std::runtime_error("Cannot read network counter " + path);
+            }
+            return bytes;
+        };
+        return Json{{"interface_id", std::to_string(index)},
+                    {"interface_name", interface},
+                    {"received_bytes", read_counter("rx_bytes")},
+                    {"transmitted_bytes", read_counter("tx_bytes")}};
     });
 }
 

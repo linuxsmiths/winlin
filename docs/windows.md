@@ -256,6 +256,13 @@ Processor-group count is recorded, but worker affinity and group/NUMA placement
 are not tuned automatically. Verify scheduling on hosts with more than 64 logical
 processors before interpreting scaling results.
 
+Network telemetry samples `GetIfEntry2` 64-bit interface RX/TX counters for the
+interface owning the explicitly bound server IPv4 address. The client reports
+their combined average as `Net Gbps`, separately from payload goodput. The report
+identifies the interface and preserves both cumulative samples. Traffic from
+other processes on that interface is included; unavailable counters remain `N/A`.
+See [measurement scope and platform differences](https.md#results-and-limitations).
+
 HTTP.sys performs native request parsing and buffering; malformed requests can
 be rejected by the kernel before reaching the shared agent. Every workload
 response explicitly disables HTTP.sys response caching. Both servers reuse a

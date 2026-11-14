@@ -263,16 +263,18 @@ activation is **not** evidence of NIC cryptographic offload.
 
 ## Results and limitations
 
-The console shows a compact per-run table of throughput, p50/p99 latency, errors,
-average whole-server CPU utilization (`Avg CPU(%)`), and estimated reference cycles
-per I/O (`Ref CPIO`). CPU utilization is averaged over each repetition's server-side
-telemetry interval, with 100% representing one logical CPU; unavailable values
+The console shows a compact per-run table of throughput, p50/p90/p99 latency, errors,
+server-interface network throughput (`Net Gbps`), average client-process CPU
+(`Client CPU(%)`), average whole-server CPU utilization (`Avg CPU(%)`), and estimated
+reference cycles per I/O (`Ref CPIO`). Server CPU utilization is averaged over each
+repetition's server-side telemetry interval; client CPU uses the measured client
+interval. Both use 100% per logical CPU. Unavailable server measurements
 appear as `N/A`. Decimal table values use two decimal places;
 JSON retains measurement precision. The console also shows run-specific warnings,
 such as load-generator CPU saturation or failed requests. General methodology
 caveats and backend measurement limitations appear once in the JSON report's
 top-level `notes` array, not in the console or each repetition's `warnings`.
-Detailed client/server telemetry, process CPU utilization percentages, and raw server
+Detailed client/server telemetry, server-process CPU utilization, and raw server
 counters stay in the JSON file, not the terminal. Report schema version 5
 saves supported choices in `server_capabilities`, the HTTP start response's
 configuration in `server_run`, and the selected workload endpoint.
@@ -291,6 +293,25 @@ Linux sums aggregate `/proc/stat` user, nice, system, IRQ and softirq time, excl
 idle, I/O wait and stolen VM time; guest time is not counted twice. Windows uses
 `GetSystemTimes`, subtracting idle and covering **every processor group**, including
 HTTP.sys/Schannel work charged to System.
+
+`Net Gbps` uses **actual OS interface RX+TX byte counters**, not
+`object_goodput_bytes_per_second`. The rate is `(received bytes + transmitted bytes)
+* 8 / elapsed server-sample seconds / 1,000,000,000`. `server_network` records the
+selected interface, both deltas, elapsed interval, and any unavailability reason;
+`server_before.network` and `server_after.network` retain the cumulative samples.
+Linux maps accepted sockets' local addresses to an interface, including wildcard
+listeners, and reads its sysfs `rx_bytes`/`tx_bytes`. Local addresses are recorded
+once per accepted connection, with no extra per-request work. Windows maps the HTTP.sys bound
+address to an interface LUID and reads `GetIfEntry2` `InOctets`/`OutOctets`.
+Missing or reset counters, ambiguous interfaces, and interface changes produce
+`N/A`, never a payload-rate fallback.
+
+These counters include other traffic on that interface and protocol overhead
+reported by its OS/driver, but are **not a physical-wire capture**. Loopback RX+TX
+counts both directions of local traffic. Driver accounting and offloads can differ
+between platforms. Sampling occurs only at telemetry boundaries; sequential
+counter reads introduce a small timing skew and the interval slightly exceeds
+the load interval. Use an otherwise idle server for meaningful network comparisons.
 
 On x86_64, a shared implementation calibrates an invariant TSC against
 `std::chrono::steady_clock` once before serving requests. RDTSCP reads are fenced;

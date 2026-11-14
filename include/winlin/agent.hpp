@@ -72,6 +72,7 @@ class Agent {
     std::string run_id_;
     std::function<Json()> process_usage_;
     std::function<Json()> host_usage_;
+    std::function<Json()> network_usage_;
 
 public:
     AgentConfig config;
@@ -81,9 +82,10 @@ public:
 
     // Workload adapters must supply the active lease ID; control needs no saved client state.
     Agent(AgentConfig settings, std::function<Json()> process_usage, std::string run_id = {},
-          std::function<Json()> host_usage = {})
+          std::function<Json()> host_usage = {}, std::function<Json()> network_usage = {})
         : run_id_(std::move(run_id)), process_usage_(std::move(process_usage)),
-          host_usage_(std::move(host_usage)), config(std::move(settings)) {
+          host_usage_(std::move(host_usage)), network_usage_(std::move(network_usage)),
+          config(std::move(settings)) {
         if (config.role == AgentConfig::Role::workload && run_id_.empty()) {
             throw std::invalid_argument("Workload requires an active run ID");
         }
@@ -95,6 +97,7 @@ public:
         return {
             {"process", process_usage_()},
             {"host", host_usage_ ? host_usage_() : Json::object()},
+            {"network", network_usage_ ? network_usage_() : Json::object()},
             {"process_cpu_scope", config.process_cpu_scope},
             {"accepted_connections",
              config.connection_metrics ? Json(connections.load()) : Json(nullptr)},
@@ -112,40 +115,46 @@ public:
     Json capabilities() const {
         const auto process = process_usage_();
         const auto host = host_usage_ ? host_usage_() : Json::object();
+        const auto network = network_usage_ ? network_usage_() : Json::object();
         auto unavailable = config.unavailable_metrics;
+        if (network.value("received_bytes", Json(nullptr)).is_number_unsigned() &&
+            network.value("transmitted_bytes", Json(nullptr)).is_number_unsigned()) {
+            std::erase(unavailable, "network_counters");
+        }
         if (process.contains("cpu_cycles") && !process.at("cpu_cycles").is_null()) {
             std::erase(unavailable, "hardware_cycles");
         } else if (std::find(unavailable.begin(), unavailable.end(), "hardware_cycles") ==
                    unavailable.end()) {
             unavailable.push_back("hardware_cycles");
         }
-        Json result{
-            {"environment", config.environment},
-            {"supported_backends", config.supported_backends},
-            {"supported_transports", {"http", "https"}},
-            {"supported_tls_modes", config.benchmark_tls_modes},
-            {"supported_tls_versions", {"TLSv1.3"}},
-            {"supported_ciphers", config.supported_ciphers},
-            {"supported_http_versions", {"1.1"}},
-            {"supported_methods", {"get", "put", "mixed"}},
-            {"supported_load_modes", {"closed_loop"}},
-            {"server_workers", {{"min", 1}, {"max", 256}}},
-            {"limits",
-             {{"max_connections", server_connection_limit},
-              {"max_object_size_bytes", max_object_size},
-              {"max_concurrent_runs", 1}}},
-            {"supports_handshake_benchmark", false},
-            {"telemetry",
-             {{"unavailable_metrics", unavailable},
-              {"cpu_cycles_source", process.value("cpu_cycles_source", Json(nullptr))},
-              {"cpu_cycles_unavailable_reason",
-               process.value("cpu_cycles_unavailable_reason", Json("Not collected"))},
-              {"process_cpu_scope", config.process_cpu_scope},
-              {"host_cpu_time_source", host.value("cpu_time_source", Json(nullptr))},
-              {"host_cpu_time_unavailable_reason",
-               host.value("cpu_time_unavailable_reason", Json("Not collected"))},
-              {"reference_clock", host.value("reference_clock", Json::object())},
-              {"scope", "whole-server CPU and separate process telemetry; one active benchmark"}}}};
+        Json result{{"environment", config.environment},
+                    {"supported_backends", config.supported_backends},
+                    {"supported_transports", {"http", "https"}},
+                    {"supported_tls_modes", config.benchmark_tls_modes},
+                    {"supported_tls_versions", {"TLSv1.3"}},
+                    {"supported_ciphers", config.supported_ciphers},
+                    {"supported_http_versions", {"1.1"}},
+                    {"supported_methods", {"get", "put", "mixed"}},
+                    {"supported_load_modes", {"closed_loop"}},
+                    {"server_workers", {{"min", 1}, {"max", 256}}},
+                    {"limits",
+                     {{"max_connections", server_connection_limit},
+                      {"max_object_size_bytes", max_object_size},
+                      {"max_concurrent_runs", 1}}},
+                    {"supports_handshake_benchmark", false},
+                    {"telemetry",
+                     {{"unavailable_metrics", unavailable},
+                      {"cpu_cycles_source", process.value("cpu_cycles_source", Json(nullptr))},
+                      {"cpu_cycles_unavailable_reason",
+                       process.value("cpu_cycles_unavailable_reason", Json("Not collected"))},
+                      {"process_cpu_scope", config.process_cpu_scope},
+                      {"host_cpu_time_source", host.value("cpu_time_source", Json(nullptr))},
+                      {"host_cpu_time_unavailable_reason",
+                       host.value("cpu_time_unavailable_reason", Json("Not collected"))},
+                      {"reference_clock", host.value("reference_clock", Json::object())},
+                      {"network", network},
+                      {"scope", "whole-server CPU, selected-interface network and separate process "
+                                "telemetry; one active benchmark"}}}};
         return result;
     }
 

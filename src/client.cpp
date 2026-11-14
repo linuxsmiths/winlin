@@ -922,6 +922,8 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         usage_delta(server_before.at("process"), server_after.at("process"), elapsed);
     auto server_host = host_usage_delta(server_before.value("host", Json::object()),
                                         server_after.value("host", Json::object()));
+    auto server_network = network_usage_delta(server_before.value("network", Json::object()),
+                                              server_after.value("network", Json::object()));
     std::vector<std::string> warnings;
     if (client_usage.at("cpu_utilization_percent").get<double>() >= config.workers * 85.0) {
         warnings.emplace_back(
@@ -956,6 +958,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
              {{"get", combined.get_latency.json()}, {"put", combined.put_latency.json()}}},
             {"server_process", server_usage},
             {"server_host", server_host},
+            {"server_network", server_network},
             {"server_before", server_before},
             {"server_after", server_after},
             {"warnings", warnings}};
@@ -1025,6 +1028,10 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         "unrelated workloads; use an otherwise idle server. It is not measured core-clock cycles.",
         "Reference cycles use a fixed calibrated invariant-TSC frequency, not turbo frequency. "
         "CPU accounting granularity and sampling overhead can dominate very short runs.",
+        "Network Gbps uses selected server-interface RX+TX counters over server-side sample "
+        "boundaries, including protocol overhead and unrelated traffic. These are OS interface "
+        "bytes, not payload goodput or a physical-wire capture; loopback RX+TX counts both "
+        "directions. Counter reads add boundary-only overhead and may have a small sampling skew.",
         "In-flight requests are drained after the duration limit; elapsed time includes draining."};
     const auto telemetry = capabilities.at("telemetry");
     const auto unavailable = telemetry.value("unavailable_metrics", std::vector<std::string>{});
@@ -1095,8 +1102,8 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
         write_private(output, report, false);
-        std::cout
-            << "Run  requests/s     p50(us)     p99(us)   errors   Avg CPU(%)       Ref CPIO\n";
+        std::cout << "Run  requests/s     p50(us)     p90(us)     p99(us)   errors    Net Gbps"
+                     "   Client CPU(%)   Avg CPU(%)       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
             // Run trial() for each repetition, which creates the worker threads, assigns
             // a subset of connections to each worker, issues requests, and collects the
@@ -1108,8 +1115,18 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
             std::cout << std::fixed << std::setprecision(2) << std::setw(3) << index
                       << std::setw(12) << result.at("requests_per_second").get<double>()
                       << std::setw(12) << result.at("latency").at("p50_us").get<double>()
+                      << std::setw(12) << result.at("latency").at("p90_us").get<double>()
                       << std::setw(12) << result.at("latency").at("p99_us").get<double>()
                       << std::setw(9) << result.at("errors").get<std::uint64_t>() << ' ';
+            const auto& network = result.at("server_network").at("gigabits_per_second");
+            if (network.is_null()) {
+                std::cout << std::setw(11) << "N/A";
+            } else {
+                std::cout << std::setw(11) << network.get<double>();
+            }
+            std::cout << ' ' << std::setw(15)
+                      << result.at("client_process").at("cpu_utilization_percent").get<double>()
+                      << ' ';
             const auto& cpu = result.at("server_host").at("cpu_utilization_percent");
             if (cpu.is_null()) {
                 std::cout << std::setw(12) << "N/A";
@@ -1150,6 +1167,7 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
     }
     // Keep details in the report; explain unavailable reference CPIO only once per reason.
     std::vector<std::string> cycle_reasons;
+    std::vector<std::string> network_reasons;
     for (const auto& result : report["results"]) {
         const auto& host = result.at("server_host");
         if (host.at("reference_cycles").is_null()) {
@@ -1158,6 +1176,15 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                 cycle_reasons.end()) {
                 cycle_reasons.push_back(reason);
                 log_warning("Reference CPIO unavailable: " + reason);
+            }
+        }
+        const auto& network = result.at("server_network");
+        if (network.at("gigabits_per_second").is_null()) {
+            const auto reason = network.at("unavailable_reason").get<std::string>();
+            if (std::find(network_reasons.begin(), network_reasons.end(), reason) ==
+                network_reasons.end()) {
+                network_reasons.push_back(reason);
+                log_warning("Server network throughput unavailable: " + reason);
             }
         }
     }

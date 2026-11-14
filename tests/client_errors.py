@@ -81,6 +81,18 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                                                else "fixture invariant TSC unavailable"),
                     },
                 },
+                "network": {
+                    "source": "fixture interface counters",
+                    "interface_id": "fixture-1",
+                    "interface_name": "fixture-nic",
+                    "received_bytes": (self.server.telemetry_samples * 125000000
+                                       if self.server.network_available else None),
+                    "transmitted_bytes": (self.server.telemetry_samples * 62500000
+                                          if self.server.network_available else None),
+                    "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
+                    "unavailable_reason": (None if self.server.network_available
+                                           else "fixture interface counters unavailable"),
+                },
             })
         else:
             self.server.capability_queries += 1
@@ -154,6 +166,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.cycles_available = False
         endpoint.reference_available = False
         endpoint.host_cpu_available = True
+        endpoint.network_available = True
     server.authorizations = []
     server.response_status = 200
     server.fail_workload = False
@@ -242,20 +255,29 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         report = json.loads(output.read_text())
         table_row = re.compile(
             r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
-            r"(\d+\.\d{2})\s+(\d+)\s+(N/A|\d+\.\d{2})\s+"
+            r"(\d+\.\d{2})\s+(\d+\.\d{2})\s+(\d+)\s+"
+            r"(N/A|\d+\.\d{2})\s+(\d+\.\d{2})\s+(N/A|\d+\.\d{2})\s+"
             r"(N/A|\d+\.\d{2})\s*$", re.MULTILINE,
         )
         assert "Ref CPIO" in result.stdout
         assert "Avg CPU(%)" in result.stdout
+        assert "p90(us)" in result.stdout
+        assert "Net Gbps" in result.stdout
+        assert "Client CPU(%)" in result.stdout
         assert "{" not in result.stdout, result.stdout
         rows = table_row.findall(result.stdout)
         assert [(row[0], row[-1]) for row in rows] == [("1", "N/A"), ("2", "N/A")]
         assert [row[-2] for row in rows] == ["200.00", "200.00"]
+        assert [row[-4] for row in rows] == ["6.00", "6.00"]
         assert result.stderr.count(
             "Reference CPIO unavailable: fixture invariant TSC unavailable") == 1
         assert report["schema_version"] == 5
         assert len(report["results"]) == 2
-        for repetition in report["results"]:
+        for row, repetition in zip(rows, report["results"]):
+            assert row[3] == f'{repetition["latency"]["p90_us"]:.2f}'
+            assert row[-3] == f'{repetition["client_process"]["cpu_utilization_percent"]:.2f}'
+            assert repetition["server_network"]["gigabits_per_second"] == 6
+            assert repetition["server_network"]["interface_name"] == "fixture-nic"
             assert repetition["server_reference_cycles_per_io"] is None
             assert repetition["server_host"]["cpu_utilization_percent"] == 200
             assert "server_cpu_seconds_per_request" not in repetition
@@ -313,6 +335,23 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert all(repetition["server_host"]["cpu_utilization_percent"] is None
                    for repetition in report["results"])
         server.host_cpu_available = True
+
+        # Interface-counter failures must not fall back to successful object payload goodput.
+        server.network_available = False
+        output = directory / "unavailable-network-benchmark.json"
+        result = subprocess.run(
+            [*benchmark, "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [row[-4] for row in table_row.findall(result.stdout)] == ["N/A", "N/A"]
+        assert result.stderr.count(
+            "Server network throughput unavailable: fixture interface counters unavailable") == 1
+        report = json.loads(output.read_text())
+        assert all(repetition["server_network"]["gigabits_per_second"] is None
+                   and repetition["object_goodput_bytes_per_second"] > 0
+                   for repetition in report["results"])
+        server.network_available = True
 
         # Header fragments and preloaded bodies must work across repeated responses on the same
         # connection. Separate writes also split the header across TLS records.
