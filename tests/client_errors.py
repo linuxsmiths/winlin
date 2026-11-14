@@ -228,7 +228,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             result = subprocess.run(
                 [str(menu_client)],
                 input=(f"3\n1\n{tls_input}1\n{method}\n{size_input}"
-                       f"1\n1\n0\n0.12345678912345678\n2\n1\n{output}\n0\n"),
+                       f"1\n1\n0\n0.12345678912345678\n2\n1\n{output}\nyes\n0\n"),
                 capture_output=True, text=True, timeout=15,
                 env=menu_environment,
             )
@@ -326,6 +326,47 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         for note in notes:
             assert note not in result.stdout + result.stderr
             assert all(note not in repetition["warnings"] for repetition in report["results"])
+
+        # Console-only runs must keep metrics and warnings without creating even a results directory.
+        console_directory = directory / "console-only"
+        console_directory.mkdir()
+        result = subprocess.run(
+            benchmark, cwd=console_directory,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert len(table_row.findall(result.stdout)) == 2
+        assert "Results saved" not in result.stdout
+        assert "Reference CPIO unavailable:" in result.stderr
+        assert not list(console_directory.iterdir())
+
+        # Both an explicit no and the default answer omit --output from the reproducible command.
+        for answer in ("no", ""):
+            proposed_output = console_directory / "nested" / "declined.json"
+            result = subprocess.run(
+                [str(menu_client)],
+                input=(f"3\n1\noff\n1\nget\n512\n1\n1\n0\n1\n2\n1\n"
+                       f"{proposed_output}\n{answer}\n0\n"),
+                cwd=console_directory, env=menu_environment,
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "Save detailed telemetry?" in result.stdout
+            assert len(table_row.findall(result.stdout)) == 1
+            displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+            assert displayed, result.stdout
+            assert "--output" not in shlex.split(displayed.group(1))
+            assert "Results saved" not in result.stdout
+            assert not list(console_directory.iterdir())
+
+        # An explicitly empty filename is an error, not an implicit request to disable saving.
+        result = subprocess.run(
+            [*benchmark, "--output", ""], cwd=console_directory,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1
+        assert "Missing --output" in result.stderr
+        assert not list(console_directory.iterdir())
 
         # Reference CPIO must work even when hardware counters remain denied.
         server.reference_available = True
@@ -452,6 +493,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert [row[-1] for row in table_row.findall(result.stdout)] == ["N/A", "N/A"]
         for note in report["notes"]:
             assert note not in result.stdout + result.stderr
+        result = subprocess.run(
+            benchmark, cwd=console_directory,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert len(table_row.findall(result.stdout)) == 2
+        assert "Benchmark completed with errors" in result.stderr
+        assert "Results saved" not in result.stdout
+        assert not list(console_directory.iterdir())
         secure.fail_workload = False
 
         # Validate the HTTP start response rather than asking the data endpoint for settings.
@@ -465,6 +515,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         report = json.loads(output.read_text())
         assert report["status"] == "failed"
         assert "did not apply the requested benchmark settings" in report["failure"]
+        result = subprocess.run(
+            benchmark, cwd=console_directory,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "did not apply the requested benchmark settings" in result.stderr
+        assert not list(console_directory.iterdir())
         server.misreport_workers = False
         assert not plain.metadata_requests and not secure.metadata_requests
 

@@ -107,6 +107,11 @@ public:
         }
     }
 
+    // Distinguish an omitted option from an explicitly supplied empty value.
+    bool contains(const std::string& key) const {
+        return values_.contains(key);
+    }
+
     std::string get(const std::string& key, std::string fallback = {}) const {
         const auto it = values_.find(key);
         return it == values_.end() ? std::move(fallback) : it->second;

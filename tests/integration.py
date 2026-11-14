@@ -471,7 +471,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         menu_output = directory / "menu-result.json"
         menu = command(
             CLIENT, input=(f"1\n127.0.0.1\n{controller.port}\n2\n1\n"
-                           f"3\n1\noff\n2\nget\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\n0\n"),
+                           f"3\n1\noff\n2\nget\n256\n1\n1\n0\n1\n2\n1\n{menu_output}\nyes\n0\n"),
             env=dict(os.environ, XDG_STATE_HOME=str(directory / "menu")),
         )
         assert "Target saved" in menu.stdout

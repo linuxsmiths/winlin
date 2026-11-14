@@ -8,6 +8,7 @@
 #include <latch>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 
@@ -991,9 +992,9 @@ RunConfig configuration(const Args& args) {
     return config;
 }
 
-// Persist every finished repetition and a final failure status; a nonzero result must remain
-// visible to automation even when useful partial measurements were saved.
-int run(Target target, const RunConfig& config, const fs::path& output) {
+// Always report console metrics and failures; persist detailed repetitions and final status only
+// when requested. Console-only runs still collect the telemetry needed for metrics and warnings.
+int run(Target target, const RunConfig& config, const std::optional<fs::path>& output) {
     auto capabilities = control(target, "/v1/capabilities");
     if (!capabilities.contains("supported_tls_modes") || !capabilities.contains("limits")) {
         throw std::runtime_error("Server capabilities are outdated; update and restart the server");
@@ -1059,10 +1060,12 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
          std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
              .count()},
         {"results", Json::array()}};
-    if (!output.parent_path().empty()) {
-        fs::create_directories(output.parent_path());
+    if (output) {
+        if (!output->parent_path().empty()) {
+            fs::create_directories(output->parent_path());
+        }
+        write_private(*output, report, true);
     }
-    write_private(output, report, true);
     bool errors = false;
     std::string run_id;
     auto command = [&](const std::string& path, const std::string& body = {}) {
@@ -1103,7 +1106,9 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         report["server_configuration"] = started.at("settings");
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
-        write_private(output, report, false);
+        if (output) {
+            write_private(*output, report, false);
+        }
         std::cout << "Run  requests/s     p50(us)     p90(us)     p99(us)   errors    Net Gbps"
                      "   Client CPU(%)   Avg CPU(%)       Ref CPIO\n";
         for (unsigned index = 1; index <= config.repetitions; ++index) {
@@ -1147,12 +1152,16 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
                 log_warning(warning.get<std::string>());
             }
             report["results"].push_back(std::move(result));
-            write_private(output, report, false);
+            if (output) {
+                write_private(*output, report, false);
+            }
         }
         report["server_final_telemetry"] = command("/v1/benchmark/stop?run_id=" + run_id);
         run_id.clear();
         report["status"] = errors ? "completed_with_errors" : "completed";
-        write_private(output, report, false);
+        if (output) {
+            write_private(*output, report, false);
+        }
     } catch (const std::exception& error) {
         if (!run_id.empty()) {
             try {
@@ -1164,7 +1173,9 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
         }
         report["status"] = "failed";
         report["failure"] = error.what();
-        write_private(output, report, false);
+        if (output) {
+            write_private(*output, report, false);
+        }
         throw;
     }
     // Keep details in the report; explain unavailable reference CPIO only once per reason.
@@ -1190,7 +1201,9 @@ int run(Target target, const RunConfig& config, const fs::path& output) {
             }
         }
     }
-    std::cout << "Results saved to " << output.string() << '\n';
+    if (output) {
+        std::cout << "Results saved to " << output->string() << '\n';
+    }
     if (errors) {
         log_warning(
             "Benchmark completed with errors; do not treat it as a valid throughput result");
@@ -1259,7 +1272,7 @@ std::string shell_argument(std::string_view value) {
 // Render the effective configuration without relying on CLI defaults or exposing target contents.
 // Preserve floating-point settings exactly so fractional durations survive a noninteractive rerun.
 std::string benchmark_command(std::string_view executable, const std::string& target,
-                              const RunConfig& config, const std::string& output) {
+                              const RunConfig& config, const std::optional<fs::path>& output) {
     std::ostringstream command;
     command << std::setprecision(std::numeric_limits<double>::max_digits10);
     command << shell_argument(executable) << " run";
@@ -1280,7 +1293,9 @@ std::string benchmark_command(std::string_view executable, const std::string& ta
     if (config.tls != "off") {
         command << " --cipher " << shell_argument(config.cipher);
     }
-    command << " --output " << shell_argument(output);
+    if (output) {
+        command << " --output " << shell_argument(output->string());
+    }
     return command.str();
 }
 
@@ -1337,11 +1352,22 @@ void interactive(std::string_view executable) {
                 config.requests = number(prompt("Request limit (0 = duration only)", "0"));
                 config.repetitions = number(prompt("Repetitions", "3"), 1000);
                 config.validate();
-                const auto output = prompt("Result file", default_output(config));
+                const auto proposed_output = prompt("Result file", default_output(config));
+                const auto save = lower(trim(prompt("Save detailed telemetry? yes / no", "no")));
+                if (save != "yes" && save != "y" && save != "no" && save != "n") {
+                    throw std::invalid_argument("Answer yes or no to saving detailed telemetry");
+                }
+                std::optional<fs::path> output;
+                if (save == "yes" || save == "y") {
+                    output = proposed_output;
+                }
                 std::cout << "\nNoninteractive command:\n"
-                          << benchmark_command(executable, target_path, config, output)
-                          << "\nFor another run, choose a new --output path; existing result files "
-                             "are not overwritten.\n\n";
+                          << benchmark_command(executable, target_path, config, output) << '\n';
+                if (output) {
+                    std::cout << "For another run, choose a new --output path; existing result "
+                                 "files are not overwritten.\n";
+                }
+                std::cout << '\n';
                 run(target, config, output);
             } else {
                 std::cout << "Unknown selection\n";
@@ -1377,6 +1403,7 @@ int main(int argc, char** argv) {
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
+                   "Without --output, results are displayed in the console only.\n"
                    "Closed-loop persistent HTTP/HTTPS; paced load and handshake tests are not "
                    "implemented yet.\n";
             return 0;
@@ -1402,7 +1429,11 @@ int main(int argc, char** argv) {
                         "--server-workers"});
             const auto config = configuration(args);
             auto target = load_target(args.require("--target"));
-            return run(target, config, args.get("--output", default_output(config)));
+            std::optional<fs::path> output;
+            if (args.contains("--output")) {
+                output = args.require("--output");
+            }
+            return run(target, config, output);
         }
         throw std::invalid_argument("Unknown command; use winlin --help");
     } catch (const std::exception& error) {

@@ -197,10 +197,12 @@ Client `--connections` still selects offered load concurrency (up to 16,384).
 OS resources may impose a lower practical capacity; the ceiling is not a throughput
 or resource-availability guarantee.
 The interactive benchmark menu exposes these same settings. After the final
-prompt it prints a shell-quoted `winlin run` command with the selected target,
-result path, and effective settings, including defaults. Use it to reproduce the
-configuration noninteractively from the same working directory. Choose a fresh
-`--output` path when repeating a run: existing result files are not overwritten.
+prompt it prints a shell-quoted `winlin run` command with the selected target
+and effective settings, including defaults. The menu proposes a result filename
+and asks whether to save detailed telemetry (yes/no, default no). The printed
+command includes `--output` only when saving is selected. Use it to reproduce the
+configuration noninteractively from the same working directory. When saving,
+choose a fresh `--output` path: existing result files are not overwritten.
 
 `--get-percent` specifies the GET share by **issued request count**, not bytes.
 Mixed requests are interleaved deterministically and the ratio is exact for each
@@ -345,10 +347,15 @@ Linux attempts inherited `perf_event_open` hardware cycles; Windows uses
 or multiplexing can leave these raw samples unavailable **without preventing
 reference CPIO**. Winlin does not change host security policy automatically.
 Cache misses, instructions, memory bandwidth and CPU profiling are not collected yet.
-JSON output defaults to a uniquely named file under `results/`; `--output`
-selects another path. Existing output files are not overwritten on startup.
-Completed repetitions are saved as the run progresses, and a caught run failure
-is recorded with `status: failed`. Abrupt termination may leave `status: running`.
+Detailed JSON reports are **opt-in**: `--output FILE` saves one; without that
+option the client displays the console table and warnings but writes no report
+or results directory. Telemetry needed for the console metrics is still collected.
+The interactive menu suggests a unique filename under `results/` and asks whether
+to save. Existing output files are not overwritten on startup.
+When saving is enabled, completed repetitions are saved as the run progresses,
+and a caught run failure is recorded with `status: failed`. Abrupt termination may
+leave `status: running`. Exit statuses and failure diagnostics are preserved even
+when saving is disabled.
 Target files contain server addresses and certificate pins; results omit run IDs.
 
 Server details put `environment` first, with OS, kernel, architecture and CPU
