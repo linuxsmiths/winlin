@@ -1,0 +1,372 @@
+#include "winlin/host.hpp"
+#include "winlin/cpu.hpp"
+#include "winlin/network.hpp"
+#include <iostream>
+
+namespace {
+void check(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+template <class Function> void rejects(Function function) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return;
+    }
+    throw std::runtime_error("Invalid input was accepted");
+}
+}
+
+int main() {
+    using namespace winlin;
+    try {
+        // Firmware evidence must not turn missing metadata into a bare-metal or invented-SKU claim.
+        check(describe_machine("", "").at("type") == "unknown", "Missing firmware is unknown");
+        auto machine = describe_machine("Microsoft Corporation", "Virtual Machine");
+        check(machine.at("type") == "virtual_machine" && machine.at("vm_sku").is_null() &&
+                  machine.at("cloud_provider").is_null(),
+              "Hyper-V firmware alone does not prove Azure");
+        apply_azure_sku(machine, "Standard_D96as_v5\n");
+        check(machine.at("vm_sku") == "Standard_D96as_v5" &&
+                  machine.at("cloud_provider") == "Azure",
+              "Azure SKU comes from explicit metadata");
+        check(describe_machine("Amazon EC2", "i3.metal").at("type") == "bare_metal" &&
+                  describe_machine("Amazon EC2", "EC2").at("vm_sku").is_null(),
+              "AWS firmware distinguishes known SKU from a generic model");
+        const auto firmware = std::string("\x01\x06\0\0\x01\x02", 6) + "Microsoft Corporation" +
+                              '\0' + "Virtual Machine" + std::string("\0\0", 2);
+        const auto [vendor, product] = smbios_system(firmware);
+        check(vendor == "Microsoft Corporation" && product == "Virtual Machine",
+              "Bounded SMBIOS string extraction");
+        bool rejected_firmware = false;
+        try {
+            smbios_system(firmware.substr(0, firmware.size() - 1));
+        } catch (const std::runtime_error&) {
+            rejected_firmware = true;
+        }
+        check(rejected_firmware, "Truncated firmware cannot be read beyond its buffer");
+        bool rejected_sku = false;
+        try {
+            apply_azure_sku(machine, "{\"unexpected\":\"metadata\"}");
+        } catch (const std::runtime_error&) {
+            rejected_sku = true;
+        }
+        check(rejected_sku, "Only a SKU leaf is accepted, not arbitrary metadata");
+        check(object_size("4MiB") == 4194304, "Size suffix");
+        check(object_size("256") == 256, "Byte size");
+        rejects([] {
+            object_size("65MiB");
+        });
+        rejects([] {
+            object_size("-1");
+        });
+        rejects([] {
+            object_size("1GB");
+        });
+        rejects([] {
+            seconds("nan");
+        });
+        rejects([] {
+            seconds("-1");
+        });
+        rejects([] {
+            number("12junk");
+        });
+        auto request = parse_head(
+            "PUT /v1/object HTTP/1.1\r\nContent-Length: 256\r\nConnection: close\r\n\r\n");
+        check(request.length == 256 && request.close, "HTTP fields");
+        rejects([] {
+            parse_head("GET / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 2\r\n\r\n");
+        });
+        rejects([] {
+            parse_head("GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        });
+        rejects([] {
+            parse_head("GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n");
+        });
+
+        // Native adapters add parsed fields directly rather than serializing and parsing HTTP
+        // again. They must use the same normalization, duplicate, and framing checks.
+        HttpHead native;
+        native.first = request.first;
+        add_http_field(native, "cOnTeNt-LeNgTh", "\t256 ");
+        add_http_field(native, "Connection", " close ");
+        finish_http_head(native);
+        check(native.fields == request.fields && native.length == request.length &&
+                  native.close == request.close,
+              "Direct fields retain raw-parser normalization and framing");
+        rejects([&] {
+            add_http_field(native, "CONTENT-LENGTH", "256");
+        });
+        rejects([&] {
+            add_http_field(native, "Bad Field", "value");
+        });
+        add_http_field(native, "Transfer-Encoding", "chunked");
+        rejects([&] {
+            finish_http_head(native);
+        });
+
+        // Request views retain native/raw storage rather than allocating a request line or map.
+        // Owning generic headers remain available for temporary input and returned control data.
+        const std::string raw_request =
+            "PUT /v1/object HTTP/1.1\r\nx-WiNlIn-RuN: lease-with-a-long-enough-value\r\n"
+            "cOnTeNt-LeNgTh:\t256 \r\nHost: localhost\r\nConnection: CLOSE\r\nX-Note: "
+            "ignored\r\n\r\n";
+        const auto request_view = parse_request_head(raw_request);
+        const auto owning_request = parse_head(raw_request);
+        check(request_view == RequestHead(owning_request) && request_view.length == 256 &&
+                  request_view.close && request_view.method == "PUT" &&
+                  request_view.path == "/v1/object" && request_view.version == "HTTP/1.1",
+              "Borrowed and owning requests retain the same routing and framing");
+        check(request_view.path.data() == raw_request.data() + 4 &&
+                  request_view.run_id->data() ==
+                      raw_request.data() + raw_request.find("lease-with"),
+              "Request paths and selected values borrow the original header bytes");
+        const auto empty_fields =
+            parse_request_head("PUT /v1/object HTTP/1.1\r\nHost:\r\nX-Winlin-Run: \t \r\n\r\n");
+        check(empty_fields.host && empty_fields.host->empty() && empty_fields.run_id &&
+                  empty_fields.run_id->empty() && !empty_fields.content_length,
+              "Present empty fields remain distinct from absent fields");
+        check(!parse_request_head("GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n").close,
+              "Request parsing preserves existing whole-value Connection semantics");
+        for (const auto invalid : {
+                 "PUT / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n",
+                 "GET / HTTP/1.1\r\nX-Note: 1\r\nx-note: 2\r\n\r\n",
+                 "GET / HTTP/1.1\r\nX-Winlin-Run: first\r\nx-winlin-run: second\r\n\r\n",
+                 "GET / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length:\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+                 "PUT / HTTP/1.1\r\nContent-Length: 67108865\r\n\r\n",
+                 "GET / HTTP/1.1\r\nBad Field: value\r\n\r\n",
+                 "GET / HTTP/1.1\r\nMissing-colon\r\n\r\n",
+                 "GET / HTTP/1.1\r\nHost: localhost\r\n",
+             }) {
+            rejects([&] {
+                parse_request_head(invalid);
+            });
+        }
+        std::string many_request_fields = "GET / HTTP/1.1\r\nHost: localhost\r\n";
+        for (unsigned index = 0; index < 20; ++index) {
+            many_request_fields += "X-Note-" + std::to_string(index) + ": ignored\r\n";
+        }
+        many_request_fields += "\r\n";
+        check(parse_request_head(many_request_fields).host == "localhost",
+              "Request field storage does not impose a new field-count limit");
+        auto duplicate_cached_field = many_request_fields;
+        duplicate_cached_field.insert(duplicate_cached_field.size() - 2, "hOsT: duplicate\r\n");
+        rejects([&] {
+            parse_request_head(duplicate_cached_field);
+        });
+        many_request_fields.insert(many_request_fields.size() - 2, "x-note-19: duplicate\r\n");
+        rejects([&] {
+            parse_request_head(many_request_fields);
+        });
+        rejects([] {
+            parse_request_head("GET / HTTP/1.1\r\nX-Pad: " + std::string(max_header_size, 'x') +
+                               "\r\n\r\n");
+        });
+
+        // Workload parsing borrows framing fields without normalizing or copying header strings.
+        const std::string_view response =
+            "HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh:\t256 \r\n"
+            "Server: Microsoft-HTTPAPI/2.0\r\nConnection: Keep-Alive\r\n\r\n";
+        const auto workload_head = parse_workload_response_head(response);
+        check(workload_head.first == "HTTP/1.1 200 OK" && workload_head.has_length &&
+                  workload_head.length == 256 && !workload_head.close,
+              "Workload response framing is case-insensitive and accepts optional whitespace");
+        check(parse_workload_response_head(
+                  "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive, CLOSE\t\r\n\r\n")
+                  .close,
+              "A close token cannot hide in a Connection list");
+        check(!parse_workload_response_head("HTTP/1.1 200 OK\r\nServer: test\r\n\r\n").has_length,
+              "Missing Content-Length remains distinguishable from a zero-length body");
+        for (const auto invalid : {
+                 "HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nX-Field: 1\r\nx-field: 2\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nBad Field: value\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nMissing-colon\r\n\r\n",
+                 "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
+             }) {
+            rejects([&] {
+                parse_workload_response_head(invalid);
+            });
+        }
+
+        // The small duplicate-name cache is an optimization, not a new protocol limit.
+        std::string many_fields = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
+        for (unsigned index = 0; index < 20; ++index) {
+            many_fields += "X-Field-" + std::to_string(index) + ": value\r\n";
+        }
+        many_fields += "\r\n";
+        check(parse_workload_response_head(many_fields).has_length,
+              "Large field counts retain allocation-free framing support");
+        many_fields.insert(many_fields.size() - 2, "x-field-19: duplicate\r\n");
+        rejects([&] {
+            parse_workload_response_head(many_fields);
+        });
+        rejects([] {
+            parse_workload_response_head(
+                "HTTP/1.1 200 OK\r\nX-Field: " + std::string(max_header_size, 'x') + "\r\n\r\n");
+        });
+
+        // Every possible delimiter split must survive incremental reads without rescanning the
+        // already searched prefix. A body containing another delimiter is not part of the header.
+        std::size_t search_from{};
+        for (std::size_t received = 0; received <= response.size(); ++received) {
+            const auto end = find_http_header_end(response.substr(0, received), search_from);
+            check(end ==
+                      (received == response.size() ? response.size() - 4 : std::string_view::npos),
+                  "Incremental framing handles byte-at-a-time headers");
+        }
+        search_from = 0;
+        check(find_http_header_end(std::string(response) + "body\r\n\r\n", search_from) ==
+                  response.size() - 4,
+              "Only the first header delimiter determines body framing");
+
+        auto config = RunConfig{};
+        config.connections = 16385;
+        rejects([&] {
+            config.validate();
+        });
+        config.connections = 1;
+        config.get_percent = 101;
+        rejects([&] {
+            config.validate();
+        });
+        // Bucket upper bounds may overestimate percentiles, but never exceed the observed maximum.
+        Histogram histogram;
+        check(histogram.json()["samples"] == 0, "Empty histogram");
+        histogram.record(1000);
+        histogram.record(2000);
+        Histogram second;
+        second.record(3000);
+        histogram.merge(second);
+        check(histogram.json()["samples"] == 3, "Merged histogram");
+        check(histogram.percentile(.5) >= 2 && histogram.percentile(.5) <= 2.032,
+              "Percentile bound");
+        check(histogram.percentile(.99) == 3, "Maximum bound");
+        // Missing Windows counters must not turn into zero-valued measurements after subtraction.
+        const Json before{{"user_cpu_seconds", 1.0},
+                          {"system_cpu_seconds", .5},
+                          {"peak_rss_bytes", 4096},
+                          {"voluntary_context_switches", nullptr},
+                          {"involuntary_context_switches", nullptr}};
+        auto after = before;
+        after["user_cpu_seconds"] = 2.0;
+        const auto delta = usage_delta(before, after, 2.0);
+        check(delta.at("voluntary_context_switches").is_null() &&
+                  delta.at("involuntary_context_switches").is_null(),
+              "Unavailable Windows counters stay null");
+        check(delta.at("cpu_utilization_percent") == 50 && !delta.contains("cpu_core_equivalents"),
+              "CPU utilization is expressed only as a percentage");
+        check(usage_delta(before, after, .25).at("cpu_utilization_percent") == 400,
+              "CPU utilization is not capped at 100 percent or normalized by host core count");
+        check(delta.at("cpu_cycles").is_null(),
+              "Missing cycles must not be estimated from CPU time");
+        auto counted_before = before;
+        auto counted_after = after;
+        counted_before["cpu_cycles"] = 1000;
+        counted_after["cpu_cycles"] = 2500;
+        counted_after["cpu_cycles_source"] = "test hardware counter";
+        const auto counted = usage_delta(counted_before, counted_after, 2);
+        check(counted.at("cpu_cycles") == 1500 && counted.at("cpu_utilization_percent") == 50,
+              "Cycles and CPU utilization use measured sample deltas");
+        counted_before["cpu_cycles"] = nullptr;
+        const auto missing_boundary = usage_delta(counted_before, counted_after, 2);
+        check(missing_boundary.at("cpu_cycles").is_null() &&
+                  !missing_boundary.at("cpu_cycles_unavailable_reason").is_null(),
+              "Cycles unavailable at either boundary need a reason, never an estimate");
+
+        // Whole-host reference cycles include every busy CPU, independently of process counters.
+        const Json host_before{{"busy_cpu_seconds", 1000.0},
+                               {"sampled_at_monotonic_seconds", 10.0},
+                               {"reference_clock", {{"frequency_hz", 2e9}}}};
+        auto host_after = host_before;
+        host_after["busy_cpu_seconds"] = 1006.0;
+        host_after["sampled_at_monotonic_seconds"] = 12.0;
+        const auto host = host_usage_delta(host_before, host_after);
+        check(host.at("cpu_utilization_percent") == 300 && host.at("reference_cycles") == 12e9 &&
+                  host.at("reference_cycles_unavailable_reason").is_null(),
+              "Reference cycles use all busy CPU seconds at calibrated reference frequency");
+        auto no_clock = host_after;
+        no_clock["reference_clock"] = {{"frequency_hz", nullptr},
+                                       {"unavailable_reason", "No invariant TSC"}};
+        const auto unavailable_clock = host_usage_delta(host_before, no_clock);
+        check(
+            unavailable_clock.at("cpu_utilization_percent") == 300 &&
+                unavailable_clock.at("reference_cycles").is_null() &&
+                unavailable_clock.at("reference_cycles_unavailable_reason") == "No invariant TSC",
+            "An unavailable reference clock preserves OS CPU utilization with an explicit reason");
+        auto no_cpu = host_after;
+        no_cpu["busy_cpu_seconds"] = nullptr;
+        no_cpu["cpu_time_unavailable_reason"] = "Host CPU counters unavailable";
+        check(host_usage_delta(host_before, no_cpu).at("reference_cycles_unavailable_reason") ==
+                  "Host CPU counters unavailable",
+              "Missing host CPU samples must not become zero reference cycles");
+        auto reset_cpu = host_after;
+        reset_cpu["busy_cpu_seconds"] = 999.0;
+        check(host_usage_delta(host_before, reset_cpu).at("reference_cycles").is_null(),
+              "Regressing whole-host CPU counters are rejected");
+        auto changed_clock = host_after;
+        changed_clock["reference_clock"]["frequency_hz"] = 3e9;
+        check(host_usage_delta(host_before, changed_clock).at("reference_cycles").is_null(),
+              "Changing reference frequencies between boundaries cannot be mixed");
+        auto missing_timestamp = host_after;
+        missing_timestamp.erase("sampled_at_monotonic_seconds");
+        check(host_usage_delta(host_before, missing_timestamp).at("reference_cycles").is_null(),
+              "Missing server timestamps cannot silently use a zero baseline");
+
+        // NIC throughput uses the server interface's RX+TX deltas, not object payload sizes.
+        const Json network_before{{"source", "fixture counters"},
+                                  {"interface_id", "nic-1"},
+                                  {"interface_name", "test-nic"},
+                                  {"received_bytes", std::uint64_t{1000}},
+                                  {"transmitted_bytes", std::uint64_t{2000}},
+                                  {"sampled_at_monotonic_seconds", 10.0}};
+        auto network_after = network_before;
+        network_after["received_bytes"] = std::uint64_t{125001000};
+        network_after["transmitted_bytes"] = std::uint64_t{62502000};
+        network_after["sampled_at_monotonic_seconds"] = 10.25;
+        const auto network = network_usage_delta(network_before, network_after);
+        check(network.at("gigabits_per_second") == 6 && network.at("received_bytes") == 125000000 &&
+                  network.at("transmitted_bytes") == 62500000,
+              "Network Gbps includes both directions using decimal gigabits");
+        for (const auto* counter : {"received_bytes", "transmitted_bytes"}) {
+            auto reset_network = network_after;
+            reset_network[counter] = std::uint64_t{0};
+            check(network_usage_delta(network_before, reset_network)
+                      .at("gigabits_per_second")
+                      .is_null(),
+                  "Reset interface counters cannot appear as a valid rate");
+        }
+        auto changed_interface = network_after;
+        changed_interface["interface_id"] = "nic-2";
+        check(network_usage_delta(network_before, changed_interface)
+                  .at("gigabits_per_second")
+                  .is_null(),
+              "Different interfaces cannot be combined between network boundaries");
+        auto missing_network = network_after;
+        missing_network["received_bytes"] = nullptr;
+        missing_network["unavailable_reason"] = "Interface unavailable";
+        check(network_usage_delta(network_before, missing_network).at("unavailable_reason") ==
+                  "Interface unavailable",
+              "Unavailable network counters retain their diagnostic");
+        auto invalid_network_time = network_after;
+        invalid_network_time["sampled_at_monotonic_seconds"] = 10.0;
+        check(network_usage_delta(network_before, invalid_network_time)
+                  .at("gigabits_per_second")
+                  .is_null(),
+              "A zero network sample interval must not produce throughput");
+        std::cout << "core tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
