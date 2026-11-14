@@ -12,7 +12,7 @@ namespace winlin {
 // Describe only per-run tuning. Bind addresses, ports, certificates and OS permissions stay local.
 struct BenchmarkOptions {
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
-    std::string get_response_data{"shared"};
+    std::string get_response_data{"copy"};
     unsigned workers{8}, lease_seconds{300};
 
     // Reject unknown or out-of-range settings rather than silently changing the requested run.

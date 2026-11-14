@@ -238,11 +238,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert server.authorizations and all(value is None for value in server.authorizations)
 
         for method, tls, data_mode, size_input, expected_gets, expected_puts in (
-            ("get", "off", "shared", "512\n\n", 2, 0),
-            ("put", "off", "shared", "256\n", 0, 2),
+            ("get", "off", "copy", "512\n\n", 2, 0),
+            ("get", "on", "shared", "512\nshared\n", 2, 0),
+            ("put", "off", "copy", "256\n", 0, 2),
             ("mixed", "on", "copy", "512\ncopy\n256\n50\n", 1, 1),
         ):
-            output = directory / f"menu-{method} 'quoted' $literal.json"
+            output = directory / f"menu-{method}-{tls}-{data_mode} 'quoted' $literal.json"
             tls_input = f"{tls}\n" + ("\n" if tls != "off" else "")
             result = subprocess.run(
                 [str(menu_client)],
@@ -283,7 +284,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 "--get-percent", "--connections", "--workers", "--warmup", "--duration",
                 "--requests", "--repetitions", "--timeout",
             ))
-            replay_output = directory / f"replay-{method}.json"
+            replay_output = directory / f"replay-{method}-{tls}-{data_mode}.json"
             replay_arguments[replay_arguments.index("--output") + 1] = str(replay_output)
             replay = subprocess.run(
                 replay_arguments, capture_output=True, text=True, timeout=15,
@@ -309,6 +310,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert result.returncode == 0, result.stdout + result.stderr
         assert server.capability_queries == queries_before + 1
         report = json.loads(output.read_text())
+        assert report["configuration"]["get_response_data"] == "copy"
+        assert report["server_configuration"]["get_response_data"] == "copy"
         table_row = re.compile(
             r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
             r"(\d+\.\d{2})\s+(\d+\.\d{2})\s+(\d+)\s+"

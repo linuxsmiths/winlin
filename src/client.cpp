@@ -973,7 +973,7 @@ RunConfig configuration(const Args& args) {
     config.cipher = args.get("--cipher", config.cipher);
     config.server_workers = number(args.get("--server-workers", "8"), 256);
     config.method = lower(args.get("--method", "get"));
-    config.get_response_data = args.get("--get-response-data", "shared");
+    config.get_response_data = args.get("--get-response-data", config.get_response_data);
     config.get_size = object_size(args.get("--get-size", "4KiB"));
     config.put_size = object_size(args.get("--put-size", "4KiB"));
     config.get_percent = number(args.get("--get-percent", "50"), 100);
@@ -1056,8 +1056,9 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
         notes.emplace_back(
             "GET copies changing objects from a fixed 1 GiB startup-generated source pool into "
             "reusable response-private storage. Shared mode serves a hot prefix, so comparing "
-            "the modes changes source-cache behavior as well as copying. No per-request RNG or "
-            "changed transport framing is used. Buffers "
+            "the modes changes source-cache behavior as well as copying. Application TLS "
+            "header/body staging may also differ by backend/version; see server telemetry "
+            "when available. No per-request RNG is used. Buffers "
             "retain their largest size; first use/growth includes allocation and initialization "
             "costs, so use warmup for steady-state comparisons.");
     }
@@ -1360,8 +1361,8 @@ void interactive(std::string_view executable) {
                              "1MiB, 4MiB\n";
                 if (config.method == "get" || config.method == "mixed") {
                     config.get_size = object_size(prompt("GET size", "4KiB"));
-                    config.get_response_data =
-                        lower(trim(prompt("GET response data: shared / copy", "shared")));
+                    config.get_response_data = lower(
+                        trim(prompt("GET response data: shared / copy", config.get_response_data)));
                 }
                 if (config.method == "put" || config.method == "mixed") {
                     config.put_size = object_size(prompt("PUT size", "4KiB"));
@@ -1428,7 +1429,7 @@ int main(int argc, char** argv) {
                    "            Custom workload certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
-                   "           [--get-response-data shared|copy]\n"
+                   "           [--get-response-data shared|copy] (default: copy)\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"

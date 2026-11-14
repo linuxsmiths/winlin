@@ -77,6 +77,34 @@ void test_get_response_payload() {
     }
 }
 
+// Verify that header staging and the body share one owned allocation, including zero-byte GETs.
+void test_get_header_headroom() {
+    std::vector<char> source{'a', 'b', 'c', 'd'};
+    std::string header = "header";
+    GetResponsePayload payload;
+    const auto* body = payload.prepare(source, source.size(), false, header);
+    require(std::string_view(body - header.size(), header.size() + source.size()) == "headerabcd",
+            "The staged header immediately precedes the copied body");
+    header[0] = 'x';
+    source[0] = 'z';
+    require(std::string_view(body - header.size(), header.size() + source.size()) == "headerabcd",
+            "Pending response bytes do not alias the source or serialized header");
+    body = payload.prepare(source, 2, false, "h");
+    require(std::string_view(body - 1, 3) == "hzb",
+            "Header length and object size can change without sending stale bytes");
+    body = payload.prepare(source, 0, false, "zero");
+    require(std::string_view(body - 4, 4) == "zero",
+            "Zero-byte GETs still own their complete staged header");
+    body = payload.prepare(source, 2, false, "next");
+    require(std::string_view(body - 4, 6) == "nextcd",
+            "Header-only responses do not advance the rotating object cursor");
+    try {
+        payload.prepare(source, 2, true, "header");
+        require(false, "Header staging must not introduce a private copy in shared mode");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
 // Check source rotation independently of random production data, including wrap and unused
 // tails.
 void test_rotating_get_source() {
@@ -126,6 +154,7 @@ void test_rotating_get_source() {
 int main() {
     try {
         test_get_response_payload();
+        test_get_header_headroom();
         test_rotating_get_source();
         const std::string access(64, 'b');
         AgentConfig config;
@@ -231,8 +260,8 @@ int main() {
                 "Control JSON must be fully buffered before starting workers");
         auto started = open.request(start, tls, settings);
         require(started.status == 200 && live == 1, "Starting creates exactly one workload");
-        require(Json::parse(started.text).at("settings").at("get_response_data") == "shared",
-                "Omitted GET data settings preserve the shared baseline");
+        require(Json::parse(started.text).at("settings").at("get_response_data") == "copy",
+                "Omitted GET data settings select copied responses");
         require(open.request(start, tls, settings).status == 409, "Overlapping runs are rejected");
         require(open.request(head("GET", "/v1/object?size=512", ""), tls).status == 404,
                 "Permanent control endpoint never serves benchmark objects");

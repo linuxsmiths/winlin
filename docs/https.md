@@ -207,8 +207,9 @@ configuration noninteractively from the same working directory. When saving,
 choose a fresh `--output` path: existing result files are not overwritten.
 
 `--get-response-data shared|copy` controls server GET payload handling independently
-of TLS. `shared` is the unchanged default: responses borrow a startup-generated
-buffer and always sends its prefix: this remains the hot-object baseline.
+of TLS. **`copy` is the default**, including when benchmark-start settings omit
+the field. Explicit `shared` selection borrows a startup-generated buffer and
+always sends its prefix, preserving the hot-object baseline.
 `copy` uses a **fixed 1 GiB source pool**, allocated and populated before requests
 are accepted. It copies changing object-sized regions into private, reusable
 storage for every GET, even when the object size is unchanged. The pool is shared
@@ -277,10 +278,20 @@ run need not visit the entire pool or establish that every read missed CPU cache
 Telemetry records `get_response_source_access` and `get_response_source_pool_bytes`.
 
 **Comparing shared and copy now changes source-cache behavior as well as copying;
-it does not isolate the cost of memcpy.** Transport framing remains unchanged:
-Linux still submits headers and bodies separately, and Windows still uses the
-same HTTP.sys response API.
-Header/body coalescing and file-backed kTLS sends are separate future experiments.
+it does not isolate the cost of memcpy.** Linux copy-mode TLS GETs additionally
+place the serialized header immediately before the body in reusable private
+storage. The selected object is copied directly to its final location once;
+only the small header is staged separately. This applies to OpenSSL and kTLS.
+Headers and data that fit within the 16 KiB plaintext write limit use one
+`SSL_write` rather than separate header/body writes. Larger responses continue
+through record-sized writes; this does not necessarily reduce their record count
+or guarantee one TCP packet.
+Shared GETs and plain HTTP retain separate submissions, and PUT/error handling
+is unchanged. Windows still uses the same HTTP.sys response API; its internal TLS
+record packing is not inferred from its application buffer layout.
+`get_response_contiguous_tls_buffer` reports application staging, not a claim
+about HTTP.sys internals. Thus shared/copy comparisons on Linux TLS also include
+this submission-path difference. File-backed kTLS sends remain a future experiment.
 
 ### Cipher selection and kTLS
 

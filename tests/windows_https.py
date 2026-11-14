@@ -193,6 +193,7 @@ def exercise_run(agent, cipher, mode, workers, data_mode):
     status, payload = agent.request("GET", f"/v1/benchmark/telemetry?run_id={run_id}")
     telemetry = json.loads(payload)
     assert telemetry["get_response_data"] == data_mode
+    assert not telemetry["get_response_contiguous_tls_buffer"]
     assert telemetry["get_response_source_access"] == (
         "hot-prefix" if data_mode == "shared" else "rotating-objects")
     assert telemetry["get_response_source_pool_bytes"] == (

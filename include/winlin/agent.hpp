@@ -27,6 +27,8 @@ struct AgentConfig {
     unsigned workers{};
     bool connection_metrics{true};
     bool shared_get_data{true};
+    // Describe application-side TLS staging, not the native transport's internal record packing.
+    bool contiguous_tls_get{};
     Json environment;
     std::vector<std::string> unavailable_metrics{
         "hardware_cycles", "instructions",     "cache_misses", "memory_bandwidth",
@@ -54,12 +56,12 @@ struct AgentConfig {
     }
 };
 
-// Prepare GET data without changing transport framing. Each Linux Session or Windows Request
-// owns one instance; only its current response may use the private buffer. Keep the shared source
-// alive and immutable through send completion. Private storage retains its largest size for reuse
-// and must not be prepared again while a partial/asynchronous send still references it. Each
-// copy context has its own deterministic source cursor; neither this cursor nor its buffer is
-// thread-safe. Native references/session ownership prevent concurrent preparation.
+// Own reusable GET data and optional header headroom for native transports. Each Linux Session or
+// Windows Request owns one instance; only its current response may use the private buffer. Keep the
+// shared source alive and immutable through send completion. Private storage retains its largest
+// size for reuse and must not be prepared again while a partial/asynchronous send still references
+// it. Each copy context has its own deterministic source cursor; neither this cursor nor its buffer
+// is thread-safe. Native references/session ownership prevent concurrent preparation.
 class GetResponsePayload {
     std::vector<char> private_data_;
     std::uint64_t stream_id_{};
@@ -70,23 +72,36 @@ public:
     explicit GetResponsePayload(std::uint64_t stream_id = 0) : stream_id_(stream_id) {
     }
 
-    // Borrow the hot shared prefix or copy a changing object into response-private storage.
+    // Borrow the hot shared source or copy a changing object after an optional header prefix.
+    // Return the body pointer; a copied prefix immediately precedes it in the same owned buffer.
     // Allocation occurs only when the private high-water size grows; invalid sizes are rejected.
-    const char* prepare(const std::vector<char>& source, std::size_t size, bool use_shared) {
+    const char* prepare(const std::vector<char>& source, std::size_t size, bool use_shared,
+                        std::string_view prefix = {}) {
         if (size > source.size()) {
             throw std::invalid_argument("GET response exceeds the prepared source payload");
         }
 
         if (use_shared) {
+            if (!prefix.empty()) {
+                throw std::invalid_argument("Shared GET data cannot use private header staging");
+            }
             return source.data();
         }
 
-        if (!size) {
-            return private_data_.data();
+        // Copy the body directly to its final offset rather than copying it a second time when
+        // joining headers and data. Retain the combined allocation's high-water size for reuse.
+        if (prefix.size() > private_data_.max_size() - size) {
+            throw std::invalid_argument("GET response prefix exceeds private storage limits");
         }
-
-        if (private_data_.size() < size) {
-            private_data_.resize(size);
+        const auto required_size = prefix.size() + size;
+        if (private_data_.size() < required_size) {
+            private_data_.resize(required_size);
+        }
+        if (!prefix.empty()) {
+            std::memcpy(private_data_.data(), prefix.data(), prefix.size());
+        }
+        if (!size) {
+            return prefix.empty() ? private_data_.data() : private_data_.data() + prefix.size();
         }
 
         // Divide the source into whole objects of the requested size. A partial tail is unused,
@@ -109,7 +124,8 @@ public:
             }
         }
 
-        std::memcpy(private_data_.data(), source.data() + object_index_ * object_size_, size);
+        auto* body = private_data_.data() + prefix.size();
+        std::memcpy(body, source.data() + object_index_ * object_size_, size);
 
         // The index and stride are each below the object count, so one subtraction wraps the
         // cursor. Zero-byte GETs do not advance it, and a one-object pool naturally repeats.
@@ -118,7 +134,7 @@ public:
             object_index_ -= object_count_;
         }
 
-        return private_data_.data();
+        return body;
     }
 };
 
@@ -195,6 +211,7 @@ public:
                  ? Json(nullptr)
                  : Json(config.shared_get_data ? "hot-prefix" : "rotating-objects")},
             {"get_response_source_pool_bytes", config.get_source_pool_size()},
+            {"get_response_contiguous_tls_buffer", config.contiguous_tls_get},
             {"accepted_connections",
              config.connection_metrics ? Json(connections.load()) : Json(nullptr)},
             {"active_connections", config.connection_metrics ? Json(active.load()) : Json(nullptr)},

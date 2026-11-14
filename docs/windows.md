@@ -267,9 +267,10 @@ HTTP.sys performs native request parsing and buffering; malformed requests can
 be rejected by the kernel before reaching the shared agent. Every workload
 response explicitly disables HTTP.sys response caching. Both servers use
 pre-generated payload bytes and fully consume PUT bodies before acknowledging
-them. GET defaults to the shared hot prefix; `--get-response-data copy` copies
+them. GET defaults to copy mode; `--get-response-data copy` copies
 changing objects from a fixed 1 GiB startup-populated pool into private storage
 without changing native response submission. The pool is shared by all workers.
+Explicit `--get-response-data shared` retains the hot-prefix baseline.
 
 Windows workers also reuse whole request contexts, including their 64 KiB native
 receive buffers and 16 KiB body buffers. Each worker retains at most 16 idle

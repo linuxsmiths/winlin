@@ -470,7 +470,7 @@ struct RunConfig {
     // The HTTP method to benchmark, or "mixed" for a mix of GET and PUT.
     std::string method{"get"};
     // Select direct shared payload sends or a fresh copy into reusable response-private storage.
-    std::string get_response_data{"shared"};
+    std::string get_response_data{"copy"};
     // The size of the GET response and PUT request bodies, in bytes.
     std::size_t get_size{4096};
     std::size_t put_size{4096};

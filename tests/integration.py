@@ -127,6 +127,77 @@ class Workload:
         return response.status, response.read()
 
 
+def exercise_tls_get_records(lease, coalesced):
+    """Inspect plaintext TLS record boundaries, not just reconstructed HTTP response lengths."""
+    raw = tls_context().wrap_socket(
+        socket.create_connection(("127.0.0.1", lease["port"]), timeout=10),
+        server_hostname="localhost",
+    )
+    try:
+        zero_header_size = None
+        sizes = [0, 4096]
+        while sizes:
+            size = sizes.pop(0)
+            request = (f"GET /v1/object?size={size} HTTP/1.1\r\nHost: localhost\r\n"
+                       f"X-Winlin-Run: {lease['run_id']}\r\n\r\n").encode()
+            raw.sendall(request)
+
+            # OpenSSL reads at most one application record per SSL_read. A full-size receive
+            # therefore exposes whether the first record contains headers alone or body bytes too.
+            first = raw.recv(16384)
+            assert first.startswith(b"HTTP/1.1 200 ")
+            header_size = first.index(b"\r\n\r\n") + 4
+            headers = dict(line.split(b":", 1) for line in first[:header_size].split(b"\r\n")[1:-2])
+            assert int(headers[b"Content-Length"]) == size
+            assert len(first) == (min(16384, header_size + size) if coalesced else header_size)
+            remaining = header_size + size - len(first)
+            while remaining:
+                record = raw.recv(16384)
+                assert len(record) == min(16384, remaining)
+                remaining -= len(record)
+
+            if size == 0:
+                zero_header_size = header_size
+                # Only Content-Length's digit count changes for this connection. Exercise
+                # immediately below, at, and above one complete 16 KiB plaintext record.
+                boundary = 16384 - zero_header_size - 4
+                assert len(str(boundary)) == 5
+                sizes.extend((boundary - 1, boundary, boundary + 1, 16384, 65536, 1048576))
+    finally:
+        raw.close()
+
+
+def exercise_tls_send_backpressure(lease):
+    """Keep a large combined response pending while a second request is already pipelined."""
+    transport = socket.create_connection(("127.0.0.1", lease["port"]), timeout=10)
+    transport.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 128 * 1024)
+    raw = tls_context().wrap_socket(transport, server_hostname="localhost")
+    try:
+        sizes = (8 * 1024 * 1024, 4096)
+        requests = b"".join(
+            (f"GET /v1/object?size={size} HTTP/1.1\r\nHost: localhost\r\n"
+             f"X-Winlin-Run: {lease['run_id']}\r\n\r\n").encode()
+            for size in sizes
+        )
+        raw.sendall(requests)
+        time.sleep(.05)
+        with raw.makefile("rb") as reader:
+            for size in sizes:
+                assert reader.readline().startswith(b"HTTP/1.1 200 ")
+                headers = {}
+                while True:
+                    line = reader.readline()
+                    assert line, "Connection closed inside the pending response"
+                    if line == b"\r\n":
+                        break
+                    name, value = line.split(b":", 1)
+                    headers[name.lower()] = value.strip()
+                assert int(headers[b"content-length"]) == size
+                assert len(reader.read(size)) == size
+    finally:
+        raw.close()
+
+
 def exercise_session_events(lease):
     """Keep event pointers valid across ownership-map growth, rearming, and connection turnover."""
     connections = [Workload(lease) for _ in range(32)]
@@ -308,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         data = Workload(lease)
         try:
             assert lease["settings"] == {
-                "tls": "off", "cipher": None, "workers": 3, "get_response_data": "shared",
+                "tls": "off", "cipher": None, "workers": 3, "get_response_data": "copy",
             }
             assert data.request("GET", "/v1/capabilities")[0] == 404
             assert data.request("GET", "/v1/capabilities", include_run=False)[0] == 404
@@ -361,6 +432,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                     "hot-prefix" if data_mode == "shared" else "rotating-objects")
                 assert measured["get_response_source_pool_bytes"] == (
                     64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
+                assert measured["get_response_contiguous_tls_buffer"] == (
+                    mode == "on" and data_mode == "copy")
+                if mode == "on":
+                    exercise_tls_get_records(lease, data_mode == "copy")
+                    if data_mode == "copy":
+                        exercise_tls_send_backpressure(lease)
                 data = Workload(lease)
                 try:
                     bodies = []
@@ -420,6 +497,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert repetition["server_after"]["get_response_data"] == data_mode
                 assert repetition["server_before"]["get_response_source_pool_bytes"] == (
                     64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
+                assert repetition["server_before"]["get_response_contiguous_tls_buffer"] == (
+                    mode == "on" and data_mode == "copy")
                 assert repetition["completed"] == repetition["issued"] == 100
                 assert repetition["errors"] == 0
                 assert repetition["latency"]["samples"] == 100
@@ -477,6 +556,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         if ktls.returncode == 0:
             assert report["server_run"]["backend"] == "openssl-ktls"
             assert report["server_final_telemetry"]["get_response_data"] == "copy"
+            assert report["server_final_telemetry"]["get_response_contiguous_tls_buffer"]
             assert report["server_final_telemetry"]["ktls_tx_connections"] >= 2
         else:
             assert report["status"] in ("failed", "completed_with_errors")

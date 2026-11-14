@@ -51,6 +51,7 @@ AgentConfig workload_config(const BenchmarkOptions& options) {
     config.cipher = options.cipher;
     config.workers = options.workers;
     config.shared_get_data = options.get_response_data == "shared";
+    config.contiguous_tls_get = config.tls && !config.shared_get_data;
     return config;
 }
 
@@ -151,6 +152,7 @@ struct Session {
     // Benchmark start: header -> control_body -> send_header -> send_body -> header -> ...
     // Other control: header -> send_header -> send_body -> header -> ...
     // Benchmark GET: header -> send_header -> send_body -> header -> ...
+    // Copy-mode TLS GET skips send_header: send_body writes the combined header/body buffer.
     // Benchmark PUT: header -> body -> send_header -> send_body (empty) -> header -> ...
     enum class State {
         handshake,
@@ -170,6 +172,7 @@ struct Session {
     std::size_t input_begin{}, input_end{}, header_search{};
     std::size_t offset{}, body_remaining{}, body_size{};
     bool close{}, object_response{}, get{}, put{};
+    bool combined_response{};
     ConnectionInfo connection;
     GetResponsePayload get_payload;
     const char* get_data{};
@@ -210,10 +213,6 @@ struct Session {
         text_body = std::move(body);
         object_response = object;
         body_size = object ? size : text_body.size();
-        if (object_response) {
-            get_data =
-                get_payload.prepare(server.payload, body_size, server.config.shared_get_data);
-        }
 
         // Retain the header buffer's capacity across requests. Building directly into it avoids
         // allocating a separate concatenation result and replacing the previous buffer each time.
@@ -233,8 +232,17 @@ struct Session {
         output.append(connection.ktls_rx ? "1" : "0");
         output.append("\r\n\r\n");
 
+        // Only copied TLS GETs own contiguous header/body storage. Plain HTTP and shared GETs
+        // retain separate submissions, so the optimization adds no per-response shared-body copy.
+        combined_response = object_response && server.config.contiguous_tls_get;
+        if (object_response) {
+            const auto prefix = combined_response ? std::string_view(output) : std::string_view{};
+            get_data = get_payload.prepare(server.payload, body_size, server.config.shared_get_data,
+                                           prefix);
+        }
+
         offset = 0;
-        state = State::send_header;
+        state = combined_response ? State::send_body : State::send_header;
     }
 
     // Let the shared Agent validate and route the header, then select the native next step.
@@ -329,12 +337,14 @@ struct Session {
                     state = State::send_body;
                 }
             } else if (state == State::send_body) {
-                // Send the prepared GET data or the session's JSON response. A completed
-                // persistent response returns to header processing and may use already buffered
-                // input.
-                if (offset < body_size) {
-                    const char* data = object_response ? get_data : text_body.data();
-                    const int bytes = socket.write(data + offset, body_size - offset);
+                // A copied TLS GET includes its header in this transfer. Keep the full buffer,
+                // length, and offset stable across OpenSSL WANT_READ/WANT_WRITE retries. Larger
+                // responses still advance through StreamSocket's record-sized writes.
+                const auto prefix_size = combined_response ? output.size() : 0;
+                const auto transfer_size = prefix_size + body_size;
+                if (offset < transfer_size) {
+                    const char* data = object_response ? get_data - prefix_size : text_body.data();
+                    const int bytes = socket.write(data + offset, transfer_size - offset);
                     if (!bytes) {
                         return true;
                     }
