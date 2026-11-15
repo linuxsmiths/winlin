@@ -73,6 +73,14 @@ class LocalBenchmark final : public BenchmarkInstance {
             startup_latency = std::make_unique<Histogram>();
             lifecycle_latency = std::make_unique<Histogram>();
         }
+        std::mutex contention_mutex;
+        std::uint64_t protected_counter{};
+        std::vector<std::unique_ptr<Histogram>> acquisition_latency;
+        if (options_.benchmark == "lock-contention") {
+            for (unsigned index = 0; index < count; ++index) {
+                acquisition_latency.push_back(std::make_unique<Histogram>());
+            }
+        }
         std::mutex error_mutex;
         std::string error;
         std::atomic<bool> failed{};
@@ -100,7 +108,8 @@ class LocalBenchmark final : public BenchmarkInstance {
                     void* region{};
                     try {
                         if (options_.benchmark != "allocation" &&
-                            options_.benchmark != "thread-create") {
+                            options_.benchmark != "thread-create" &&
+                            options_.benchmark != "lock-contention") {
                             native_.bind_cpu(cpu_);
                         } else if (options_.benchmark == "allocation") {
                             blocks.resize(options_.live_allocations);
@@ -125,7 +134,43 @@ class LocalBenchmark final : public BenchmarkInstance {
                                         (options_.allocation_size * options_.live_allocations)));
                     const auto deadline = begin + std::chrono::duration<double>(duration);
                     try {
-                        if (options_.benchmark == "thread-create") {
+                        if (options_.benchmark == "lock-contention") {
+                            unsigned until_sample{}, until_clock_check{};
+                            while (!stop_ && !failed) {
+                                // Deadline checks are batched; cancellation is checked for
+                                // every acquisition. Counters stay worker-local in the hot loop.
+                                if (until_clock_check == 0) {
+                                    if (Clock::now() >= deadline) {
+                                        break;
+                                    }
+                                    until_clock_check = 256;
+                                }
+                                const bool sample = until_sample == 0;
+                                const auto acquisition_begin =
+                                    sample ? Clock::now() : Clock::time_point{};
+                                std::uint64_t acquisition_ns{};
+                                {
+                                    // The only application work protected by this mutex is
+                                    // an increment. Sampled acquisitions add a clock read
+                                    // while holding it; histogram recording stays outside.
+                                    std::lock_guard lock(contention_mutex);
+                                    if (sample) {
+                                        acquisition_ns =
+                                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                Clock::now() - acquisition_begin)
+                                                .count();
+                                    }
+                                    ++protected_counter;
+                                }
+                                if (sample) {
+                                    acquisition_latency[index]->record(acquisition_ns);
+                                    until_sample = options_.latency_sample_every;
+                                }
+                                --until_sample;
+                                --until_clock_check;
+                                ++completed;
+                            }
+                        } else if (options_.benchmark == "thread-create") {
                             // Join establishes visibility of the child's entry stamp without
                             // another readiness signal. Only complete create/exit/join pairs
                             // count; cancellation finishes the current child before stopping.
@@ -328,6 +373,28 @@ class LocalBenchmark final : public BenchmarkInstance {
                 result["thread_startup_latency"] = std::move(startup);
                 result["thread_lifecycle_latency"] = std::move(lifecycle);
             }
+            if (options_.benchmark == "lock-contention") {
+                // Verify the protected update independently of progress accounting. Merge
+                // samples only after all workers finish and final CPU telemetry is captured.
+                if (protected_counter != total) {
+                    throw std::runtime_error(
+                        "Lock contention counter does not match completed operations");
+                }
+                Histogram combined;
+                for (const auto& histogram : acquisition_latency) {
+                    combined.merge(*histogram);
+                }
+                auto latency = combined.json();
+                latency.erase("histogram");
+                const auto [least_progress, most_progress] =
+                    std::minmax_element(operations.begin(), operations.end());
+                result["lock_acquisition_latency"] = std::move(latency);
+                result["latency_sample_every"] = options_.latency_sample_every;
+                result["protected_counter"] = protected_counter;
+                result["worker_operations"] = operations;
+                result["worker_operations_min"] = *least_progress;
+                result["worker_operations_max"] = *most_progress;
+            }
             // Process context-switch counters are not exact pair-only counts: control activity
             // also contributes. Never substitute handoffs for unavailable scheduler counters.
             if (measure &&
@@ -424,7 +491,8 @@ public:
         if (!native_.page_size) {
             throw std::invalid_argument("Native page size is unavailable");
         }
-        if (options_.benchmark != "allocation" && options_.benchmark != "thread-create") {
+        if (options_.benchmark != "allocation" && options_.benchmark != "thread-create" &&
+            options_.benchmark != "lock-contention") {
             cpu_ = native_.resolve_cpu(options_.server_cpu);
         }
         if (options_.benchmark == "context-switch") {
@@ -467,15 +535,19 @@ public:
                                : options_.benchmark == "page-fault"   ? "first-touch base page"
                                : options_.benchmark == "thread-create"
                                    ? "create/exit/join lifecycle"
-                                   : "native kernel query"},
-            {"server_cpu",
-             options_.benchmark == "allocation" || options_.benchmark == "thread-create"
-                 ? Json(nullptr)
-                 : Json(cpu_)},
+                               : options_.benchmark == "lock-contention" ? "lock/increment/unlock"
+                                                                         : "native kernel query"},
+            {"server_cpu", options_.benchmark == "allocation" ||
+                                   options_.benchmark == "thread-create" ||
+                                   options_.benchmark == "lock-contention"
+                               ? Json(nullptr)
+                               : Json(cpu_)},
             {"thread_api",
              options_.benchmark == "thread-create" ? Json("std::thread") : Json(nullptr)},
             {"child_threads_at_once",
              options_.benchmark == "thread-create" ? Json(1) : Json(nullptr)},
+            {"mutex_api",
+             options_.benchmark == "lock-contention" ? Json("std::mutex") : Json(nullptr)},
             {"native_syscall",
              options_.benchmark == "syscall" ? Json(native_.syscall_name) : Json(nullptr)},
             {"environment", native_.environment},
@@ -507,6 +579,12 @@ public:
               "stack/TLS caching remains enabled.",
               "Thread startup and lifecycle timing include timestamp overhead; throughput and CPU "
               "cost also include histogram bookkeeping.",
+              "Lock contention workers are unpinned. Sampled acquisition timing includes timer "
+              "overhead, "
+              "and its second timestamp extends the sampled critical section.",
+              "Lock sampling starts with each worker's first operation, then every configured "
+              "interval; "
+              "periodic samples can miss or correlate with scheduling events.",
               "Minimal native queries have different kernel work on Linux and Windows."}}};
     }
 

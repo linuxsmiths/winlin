@@ -71,18 +71,23 @@ void test_workloads() {
 
 // Invalid settings and worker failures must surface and unblock all participants, not hang.
 void test_failures() {
-    for (const auto& value : {Json{{"benchmark", "syscall"}, {"tls", "on"}},
-                              Json{{"benchmark", "context-switch"}, {"workers", 2}},
-                              Json{{"benchmark", "context-switch"}, {"threads", 1}},
-                              Json{{"benchmark", "context-switch"}, {"threads", 1025}},
-                              Json{{"benchmark", "syscall"}, {"threads", 8}},
-                              Json{{"benchmark", "thread-create"}, {"server_cpu", 0}},
-                              Json{{"benchmark", "thread-create"}, {"workers", 2}},
-                              Json{{"benchmark", "allocation"},
-                                   {"allocation_size", 67108864},
-                                   {"live_allocations", 65536}},
-                              Json{{"benchmark", "syscall"}, {"server_cpu", -1}},
-                              Json{{"benchmark", "allocation"}, {"memory_touch", "unknown"}}}) {
+    for (const auto& value :
+         {Json{{"benchmark", "syscall"}, {"tls", "on"}},
+          Json{{"benchmark", "context-switch"}, {"workers", 2}},
+          Json{{"benchmark", "context-switch"}, {"threads", 1}},
+          Json{{"benchmark", "context-switch"}, {"threads", 1025}},
+          Json{{"benchmark", "syscall"}, {"threads", 8}},
+          Json{{"benchmark", "thread-create"}, {"server_cpu", 0}},
+          Json{{"benchmark", "thread-create"}, {"workers", 2}},
+          Json{{"benchmark", "lock-contention"}, {"server_cpu", 0}},
+          Json{{"benchmark", "lock-contention"}, {"latency_sample_every", 0}},
+          Json{{"benchmark", "lock-contention"}, {"latency_sample_every", 1048577}},
+          Json{{"benchmark", "syscall"}, {"latency_sample_every", 7}},
+          Json{{"benchmark", "allocation"},
+               {"allocation_size", 67108864},
+               {"live_allocations", 65536}},
+          Json{{"benchmark", "syscall"}, {"server_cpu", -1}},
+          Json{{"benchmark", "allocation"}, {"memory_touch", "unknown"}}}) {
         try {
             BenchmarkOptions::parse(value);
             throw std::runtime_error("Invalid local settings were accepted");
@@ -223,6 +228,94 @@ void test_thread_creation() {
     cancellation.join();
     require(!returned_early && joined && launched == exited,
             "Cancellation must join every child before releasing the run");
+}
+
+// Verify protected increments, independent worker progress, and exact per-worker sampling
+// intervals.
+void test_lock_contention() {
+    for (unsigned worker_count : {1u, 4u}) {
+        auto native = native_operations();
+        native.resolve_cpu = [](int) -> unsigned {
+            throw std::runtime_error("Lock contention must not resolve affinity");
+        };
+        native.bind_cpu = [](unsigned) {
+            throw std::runtime_error("Lock contention must not change affinity");
+        };
+        const unsigned sample_interval = worker_count == 1 ? 1 : 7;
+        LocalBenchmark benchmark(BenchmarkOptions::parse({{"benchmark", "lock-contention"},
+                                                          {"workers", worker_count},
+                                                          {"latency_sample_every", sample_interval},
+                                                          {"duration", 0.02},
+                                                          {"repetitions", 2}}),
+                                 native);
+        const auto sample = finish(benchmark);
+        require(sample.at("status") == "completed", sample.dump().c_str());
+        require(sample.at("results").size() == 2, "Each contention stage needs a separate result");
+        for (const auto& result : sample.at("results")) {
+            const auto progress = result.at("worker_operations").get<std::vector<std::uint64_t>>();
+            const auto total = std::accumulate(progress.begin(), progress.end(), std::uint64_t{});
+            require(progress.size() == worker_count && total > 0 &&
+                        total == result.at("operations") && total == result.at("protected_counter"),
+                    "Reported progress must match every protected increment in this stage");
+            std::uint64_t expected_samples{};
+            for (const auto completed : progress) {
+                expected_samples += (completed + sample_interval - 1) / sample_interval;
+            }
+            const auto& latency = result.at("lock_acquisition_latency");
+            require(latency.at("samples") == expected_samples &&
+                        latency.at("mean_us").get<double>() > 0,
+                    "Sample the first acquisition and then each configured worker-local interval");
+            const auto [least_progress, most_progress] =
+                std::minmax_element(progress.begin(), progress.end());
+            require(result.at("worker_operations_min") == *least_progress &&
+                        result.at("worker_operations_max") == *most_progress,
+                    "Progress summaries must include every worker, including idle workers");
+        }
+    }
+
+    // Failed final sampling must release all parked workers and retain earlier repetitions.
+    auto native = native_operations();
+    const auto host = native.host;
+    unsigned samples{};
+    native.host = [&] {
+        if (++samples == 4) {
+            throw std::runtime_error("injected contention sampling failure");
+        }
+        return host();
+    };
+    {
+        LocalBenchmark failed(BenchmarkOptions::parse({{"benchmark", "lock-contention"},
+                                                       {"workers", 4},
+                                                       {"duration", 0.02},
+                                                       {"repetitions", 2}}),
+                              native);
+        const auto sample = finish(failed);
+        require(sample.at("status") == "failed" && sample.at("results").size() == 1 &&
+                    sample.at("failure") == "injected contention sampling failure",
+                "Contention failure must not strand workers or discard earlier results");
+    }
+
+    // Cancelling at a stage boundary must join all contending workers without taking their lock.
+    native = native_operations();
+    std::latch sampling(1), allow_sampling(1), cancelling(1);
+    samples = 0;
+    native.host = [&] {
+        if (++samples == 1) {
+            sampling.count_down();
+            allow_sampling.wait();
+        }
+        return host();
+    };
+    auto cancelled = std::make_unique<LocalBenchmark>(
+        BenchmarkOptions::parse({{"benchmark", "lock-contention"}, {"workers", 4}}), native);
+    sampling.wait();
+    std::jthread cancellation([&] {
+        cancelling.count_down();
+        cancelled.reset();
+    });
+    cancelling.wait();
+    allow_sampling.count_down();
+    cancellation.join();
 }
 
 // Larger rings must circulate across repetitions on the requested CPU and retain handoff units.
@@ -458,6 +551,7 @@ int main() {
         test_failures();
         test_context_switch_ring();
         test_thread_creation();
+        test_lock_contention();
         test_page_faults();
         std::cout << "Native local benchmark tests passed\n";
         return 0;

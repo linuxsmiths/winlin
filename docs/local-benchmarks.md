@@ -15,6 +15,9 @@ winlin run --target windows.json --benchmark context-switch \
 winlin run --target windows.json --benchmark thread-create \
   --duration 10 --repetitions 3
 
+winlin run --target linux.json --benchmark lock-contention \
+  --server-workers 8 --latency-sample-every 1024 --duration 30 --repetitions 3
+
 winlin run --target windows.json --benchmark syscall \
   --operation minimal-query --server-cpu 2 --duration 30 --repetitions 3
 
@@ -140,6 +143,43 @@ Clock/cancellation checks are amortized across repeated small batches (at most
 256 pairs and 64 KiB of requested allocation work between checks, unless one
 live batch itself exceeds those bounds).
 
+**Lock-contention:** 1–256 unpinned workers (default eight) compete for one shared
+`std::mutex`. Each operation locks it, increments one protected 64-bit counter,
+and unlocks it. There is no I/O, artificial delay, or configurable critical-section
+work in this version. One worker provides an uncontended baseline. All workers
+finish setup before sampling and park after their operation loops; mutex and
+counter state are fresh for each stage.
+
+Report completed operations/s, amortized mean operation time, whole-server CPU,
+and reference cycles/operation. Per-worker completed counts are retained in JSON;
+the console shows their minimum and maximum. The protected counter must equal
+the sum of completed operations, otherwise the run fails. Zero progress from an
+individual worker is reported honestly, not converted into an unavailable value.
+Uneven progress can reflect mutex behavior, scheduling, and initial wake delays;
+it is not by itself proof of a particular fairness policy.
+
+Acquisition latency spans immediately before locking to immediately after
+successful acquisition, excluding the protected increment and unlock. Each
+worker samples its first operation and then every `--latency-sample-every`
+operations (default 1024, range 1–1048576). Mean/p50/p99 in microseconds and the
+sample count are reported separately from amortized whole-operation timing.
+Worker-local bounded histograms are merged only after CPU sampling.
+
+Sampled acquisitions include clock overhead; their second timestamp extends
+the critical section. Histogram recording is outside the lock but still costs
+CPU and reduces throughput. Periodic sampling can miss or correlate with
+scheduler events, so these are sampled observations, not a complete latency
+distribution. Deadline checks happen every 256 operations per worker; stop and
+failure flags are checked before each acquisition. An in-flight acquisition
+finishes before exit, so duration and cancellation can overshoot while waiting.
+No worker parks or joins while holding the benchmark mutex.
+
+This measures C++ runtime plus OS synchronization, including native internal
+spinning/parking, scheduling, and cache-coherence effects. It does not substitute
+an application spinlock. Inherited affinity, SMT/NUMA layout, background load,
+and worker count affect results; explicit CPU pinning is not offered in this
+version. Compare equivalent CPU availability and topology on both servers.
+
 ## Affinity, accounting, and limitations
 
 Omitting `--server-cpu` selects an allowed Linux CPU or Windows CPU zero.
@@ -148,6 +188,8 @@ Windows CPU indices are flattened across processor groups; Linux indices use
 native logical CPU numbering. The actual selected CPU is reported. Allocation
 workers are not pinned in this first version.
 Thread-create's creator and children are also not explicitly pinned.
+Lock-contention workers are not explicitly pinned either; those two benchmarks
+reject `--server-cpu`.
 
 A fixed two-second warmup precedes repetitions, except for page-fault's single
 untimed region. Workers are created for each

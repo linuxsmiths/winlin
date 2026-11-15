@@ -1162,15 +1162,22 @@ BenchmarkOptions local_configuration(const Args& args) {
                     "--region-size"});
     } else if (benchmark == "thread-create") {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output"});
+    } else if (benchmark == "lock-contention") {
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
+                    "--server-workers", "--latency-sample-every"});
     } else {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
                     "--server-cpu", "--threads"});
     }
+    unsigned workers = 1;
+    if (benchmark == "allocation" || benchmark == "lock-contention") {
+        workers =
+            number(args.get("--server-workers", benchmark == "lock-contention" ? "8" : "1"), 256);
+    }
     Json settings{{"benchmark", benchmark},
                   {"duration", seconds(args.get("--duration", "30"), 3600)},
                   {"repetitions", number(args.get("--repetitions", "3"), 1000)},
-                  {"workers",
-                   benchmark == "allocation" ? number(args.get("--server-workers", "1"), 256) : 1}};
+                  {"workers", workers}};
     if (benchmark == "page-fault") {
         settings.erase("duration");
         settings["region_size"] =
@@ -1178,6 +1185,10 @@ BenchmarkOptions local_configuration(const Args& args) {
     }
     if (benchmark == "context-switch") {
         settings["threads"] = number(args.get("--threads", "2"), 1024);
+    }
+    if (benchmark == "lock-contention") {
+        settings["latency_sample_every"] =
+            number(args.get("--latency-sample-every", "1024"), 1048576);
     }
     if (benchmark == "allocation") {
         settings["allocation_size"] = object_size(args.get("--allocation-size", "4KiB"));
@@ -1269,6 +1280,11 @@ int run_local(Target target, const BenchmarkOptions& options,
         }
         if (options.benchmark == "thread-create") {
             std::cout << "std::thread | one unpinned creator | one child at a time\n";
+        } else if (options.benchmark == "lock-contention") {
+            std::cout << "Shared std::mutex | unpinned workers=" << options.workers
+                      << " | critical section: counter increment\n"
+                      << "Acquisition sampling: first operation, then every "
+                      << options.latency_sample_every << " operations per worker\n";
         } else if (options.benchmark == "allocation") {
             std::cout
                 << "Allocation size=" << options.allocation_size
@@ -1301,6 +1317,10 @@ int run_local(Target target, const BenchmarkOptions& options,
         if (options.benchmark == "thread-create") {
             std::cout << "  start mean(us)   start p50(us)   start p99(us)"
                          "    life p50(us)    life p99(us)";
+        }
+        if (options.benchmark == "lock-contention") {
+            std::cout << "    acq mean(us)     acq p50(us)     acq p99(us)"
+                         "   Min worker ops   Max worker ops";
         }
         std::cout << '\n';
         const auto deadline = Clock::now() + std::chrono::duration<double>(
@@ -1365,6 +1385,16 @@ int run_local(Target target, const BenchmarkOptions& options,
                           lifecycle.at("p50_us"), lifecycle.at("p99_us")}) {
                         std::cout << std::setw(16) << metric.get<double>();
                     }
+                }
+                if (options.benchmark == "lock-contention") {
+                    const auto& acquisition = result.at("lock_acquisition_latency");
+                    for (const auto* key : {"mean_us", "p50_us", "p99_us"}) {
+                        std::cout << std::setw(16) << acquisition.at(key).get<double>();
+                    }
+                    std::cout << std::setw(17)
+                              << result.at("worker_operations_min").get<std::uint64_t>()
+                              << std::setw(17)
+                              << result.at("worker_operations_max").get<std::uint64_t>();
                 }
                 std::cout << '\n';
                 report["results"].push_back(result);
@@ -1866,9 +1896,9 @@ void interactive(std::string_view executable) {
                 std::cout << '\n';
                 run(target, config, output);
             } else if (action == "4") {
-                const auto benchmark = prompt(
-                    "Benchmark: context-switch / syscall / allocation / page-fault / thread-create",
-                    "context-switch");
+                const auto benchmark = prompt("Benchmark: context-switch / syscall / allocation / "
+                                              "page-fault / thread-create / lock-contention",
+                                              "context-switch");
                 const auto target_path = select_target();
                 Json settings{{"benchmark", benchmark}, {"workers", 1}};
                 if (benchmark == "context-switch") {
@@ -1880,6 +1910,10 @@ void interactive(std::string_view executable) {
                         number(prompt("Live allocations per worker", "1"), 65536);
                     settings["memory_touch"] = prompt("Memory touch: none / pages", "none");
                     settings["workers"] = number(prompt("Server workers", "1"), 256);
+                } else if (benchmark == "lock-contention") {
+                    settings["workers"] = number(prompt("Server workers", "8"), 256);
+                    settings["latency_sample_every"] =
+                        number(prompt("Acquisition sample interval per worker", "1024"), 1048576);
                 } else if (benchmark != "thread-create") {
                     if (benchmark == "page-fault") {
                         settings["region_size"] = object_size(prompt("Fresh region size", "64MiB"),
@@ -1919,6 +1953,9 @@ void interactive(std::string_view executable) {
                               << " --live-allocations " << options.live_allocations
                               << " --memory-touch " << shell_argument(options.memory_touch)
                               << " --server-workers " << options.workers;
+                } else if (benchmark == "lock-contention") {
+                    std::cout << " --server-workers " << options.workers
+                              << " --latency-sample-every " << options.latency_sample_every;
                 } else {
                     if (benchmark == "context-switch") {
                         std::cout << " --threads " << options.threads;
@@ -1975,11 +2012,13 @@ int main(int argc, char** argv) {
                    "           [--workers N] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
                    "winlin run --target FILE --benchmark "
-                   "context-switch|syscall|allocation|thread-create\n"
+                   "context-switch|syscall|allocation|thread-create|lock-contention\n"
                    "           [--duration 30] [--repetitions 3] [--output FILE]\n"
                    "           context-switch/syscall: [--server-cpu N] (default: auto)\n"
                    "           context-switch: [--threads 2] (2-1024, same-CPU blocking ring)\n"
                    "           thread-create: one unpinned creator, sequential create/exit/join\n"
+                   "           lock-contention: [--server-workers 8] [--latency-sample-every "
+                   "1024]\n"
                    "           syscall: [--operation minimal-query]\n"
                    "           allocation: [--allocation-size 4KiB] [--live-allocations 1]\n"
                    "                       [--memory-touch none|pages] [--server-workers 1]\n"

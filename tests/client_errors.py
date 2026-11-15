@@ -56,7 +56,7 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/capabilities":
             self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation",
-                                                   "page-fault", "thread-create"]})
+                                                   "page-fault", "thread-create", "lock-contention"]})
         else:
             self.server.poll_seen.set()
             self.respond(self.snapshot())
@@ -82,6 +82,18 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
                     }
                     result["thread_lifecycle_latency"] = {
                         "mean_us": 30, "p50_us": 25, "p99_us": 50,
+                    }
+                if self.server.settings[-1]["benchmark"] == "lock-contention":
+                    workers = self.server.settings[-1]["workers"]
+                    interval = self.server.settings[-1]["latency_sample_every"]
+                    progress = [100 // workers + (index < 100 % workers)
+                                for index in range(workers)]
+                    result["worker_operations"] = progress
+                    result["worker_operations_min"] = min(progress)
+                    result["worker_operations_max"] = max(progress)
+                    result["lock_acquisition_latency"] = {
+                        "samples": sum((completed + interval - 1) // interval for completed in progress),
+                        "mean_us": 0.5, "p50_us": 0.2, "p99_us": 3.25,
                     }
                 results.append(result)
         return {
@@ -361,6 +373,49 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 1 and "Unknown option" in result.stderr
+        # Mutex contention exposes workers and sampling but no affinity or network workload knobs.
+        output = directory / "lock-contention.json"
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "lock-contention",
+             "--duration", "0.02", "--repetitions", "1", "--server-workers", "4",
+             "--latency-sample-every", "7", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "unpinned workers=4" in result.stdout and "acq p99(us)" in result.stdout
+        assert "3.25" in result.stdout and "Min worker ops" in result.stdout
+        assert server.settings[-1]["latency_sample_every"] == 7
+        assert "server_cpu" not in server.settings[-1]
+        report = json.loads(output.read_text())
+        assert report["results"][0]["worker_operations"] == [25, 25, 25, 25]
+        result = subprocess.run(
+            [client], input="4\nlock-contention\n1\n4\n7\n0.02\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--server-workers 4 --latency-sample-every 7" in displayed.group(1)
+        assert "--server-cpu" not in displayed.group(1)
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "lock-contention",
+             "--repetitions", "1"], capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert server.settings[-1]["workers"] == 8
+        assert server.settings[-1]["latency_sample_every"] == 1024
+        for parameters in (
+            ["--server-cpu", "0"], ["--tls", "on"], ["--latency-sample-every", "0"],
+            ["--latency-sample-every", "1048577"], ["--server-workers", "257"],
+        ):
+            result = subprocess.run(
+                [client, "run", "--target", str(target), "--benchmark", "lock-contention", *parameters],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
         # Both polling and stop return histories above 64 KiB, including the supported maximum.
         server.long_run = True
         for repetitions in (100, 1000):

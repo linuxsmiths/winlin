@@ -15,6 +15,7 @@ struct BenchmarkOptions {
     double duration{30};
     unsigned repetitions{3};
     unsigned threads{2};
+    unsigned latency_sample_every{1024};
     int server_cpu{-1};
     std::size_t allocation_size{4096}, live_allocations{1};
     std::size_t region_size{64 * 1024 * 1024};
@@ -30,7 +31,7 @@ struct BenchmarkOptions {
         const auto benchmark = value.value("benchmark", std::string("https"));
         if (benchmark != "https" && benchmark != "context-switch" && benchmark != "syscall" &&
             benchmark != "allocation" && benchmark != "page-fault" &&
-            benchmark != "thread-create") {
+            benchmark != "thread-create" && benchmark != "lock-contention") {
             throw std::invalid_argument("Unknown benchmark: " + benchmark);
         }
         for (const auto& [key, ignored] : value.items()) {
@@ -41,13 +42,14 @@ struct BenchmarkOptions {
                 benchmark != "https" &&
                 ((key == "duration" && benchmark != "page-fault") || key == "repetitions" ||
                  (key == "server_cpu" && benchmark != "allocation" &&
-                  benchmark != "thread-create") ||
+                  benchmark != "thread-create" && benchmark != "lock-contention") ||
                  (key == "operation" && benchmark == "syscall") ||
                  (key == "threads" && benchmark == "context-switch") ||
                  (benchmark == "allocation" &&
                   (key == "allocation_size" || key == "live_allocations" ||
                    key == "memory_touch")) ||
-                 (benchmark == "page-fault" && key == "region_size"));
+                 (benchmark == "page-fault" && key == "region_size") ||
+                 (benchmark == "lock-contention" && key == "latency_sample_every"));
             if (!common && !network && !local) {
                 throw std::invalid_argument("Unknown benchmark setting: " + key);
             }
@@ -67,7 +69,9 @@ struct BenchmarkOptions {
             }
             return static_cast<unsigned>(number);
         };
-        result.workers = bounded("workers", benchmark == "https" ? result.workers : 1, 256);
+        result.workers = bounded(
+            "workers", benchmark == "https" || benchmark == "lock-contention" ? result.workers : 1,
+            256);
         result.lease_seconds = bounded("lease_seconds", result.lease_seconds, 604800);
         if (benchmark != "https") {
             result.duration = value.value("duration", result.duration);
@@ -80,7 +84,8 @@ struct BenchmarkOptions {
                 result.duration > 3600) {
                 throw std::invalid_argument("Local benchmark duration must be 0.01-3600 seconds");
             }
-            if (benchmark != "allocation" && result.workers != 1) {
+            if (benchmark != "allocation" && benchmark != "lock-contention" &&
+                result.workers != 1) {
                 throw std::invalid_argument("This local benchmark uses one CPU/worker or pair");
             }
             if (value.contains("server_cpu")) {
@@ -101,6 +106,7 @@ struct BenchmarkOptions {
             result.live_allocations = bounded("live_allocations", 1, 65536);
             result.memory_touch = value.value("memory_touch", result.memory_touch);
             result.region_size = bounded("region_size", 64 * 1024 * 1024, 1024 * 1024 * 1024);
+            result.latency_sample_every = bounded("latency_sample_every", 1024, 1048576);
             if (result.memory_touch != "none" && result.memory_touch != "pages") {
                 throw std::invalid_argument("memory_touch must be none or pages");
             }
@@ -138,6 +144,8 @@ struct BenchmarkOptions {
                 result["allocation_size"] = allocation_size;
                 result["live_allocations"] = live_allocations;
                 result["memory_touch"] = memory_touch;
+            } else if (benchmark == "lock-contention") {
+                result["latency_sample_every"] = latency_sample_every;
             } else if (benchmark != "thread-create") {
                 if (benchmark == "context-switch") {
                     result["threads"] = threads;
