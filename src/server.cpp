@@ -818,6 +818,8 @@ int main(int argc, char** argv) {
         // one listener and one thread; only workloads create client-sized listener/worker pools.
         Server server(args);
         server.config.role = AgentConfig::Role::control;
+        // When the benchmark json is received, controller->start() is called that runs
+        // the benchmark
         server.controller = &controller;
         const auto bind_address = args.get("--bind", "0.0.0.0");
         auto port = static_cast<unsigned>(number(args.get("--port", "38080"), 65535));
