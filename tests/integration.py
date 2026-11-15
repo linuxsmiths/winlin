@@ -33,10 +33,10 @@ def command(*arguments, expected=0, **kwargs):
 class Controller:
     """Own only test-created processes; keep their guard and diagnostics isolated."""
 
-    def __init__(self, directory, bind=None, extra=(), inject_accept_errors=False, cork_retry="write"):
+    def __init__(self, directory, bind=None, extra=(), inject_accept_errors=False, tls_retry="write"):
         self.directory = directory
         self.inject_accept_errors = inject_accept_errors
-        self.cork_retry = cork_retry
+        self.tls_retry = tls_retry
         arguments = [
             str(ROOT / "scripts/run-server.sh"), "--build-dir", str(Path(SERVER).parent),
             "--state-dir", str(directory), "--port", "0", "--http-port", "0",
@@ -48,7 +48,7 @@ class Controller:
         if inject_accept_errors:
             environment.update(LD_PRELOAD=FAULTS, WINLIN_TEST_ACCEPT_ERRORS="1",
                                WINLIN_TEST_VERIFY_SERVER_NODELAY="1",
-                               WINLIN_TEST_CORK_RETRY=cork_retry)
+                               WINLIN_TEST_TLS_RETRY=tls_retry)
         self.process = subprocess.Popen(
             arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=environment,
@@ -78,9 +78,8 @@ class Controller:
             assert stderr.count("Retrying listener after connection-local accept failure:") == 4, stderr
             assert "winlin-test: control TCP_NODELAY=1" in stderr, stderr
             assert "winlin-test: workload TCP_NODELAY=1" in stderr, stderr
-            assert "winlin-test: workload TCP_CORK=1" in stderr, stderr
-            assert "winlin-test: workload TCP_CORK=0" in stderr, stderr
-            wait_marker = ("uncorked TLS read" if self.cork_retry == "read" else "corked TLS write")
+            assert "winlin-test: workload TCP_CORK=1" not in stderr, stderr
+            wait_marker = ("uncorked TLS read" if self.tls_retry == "read" else "uncorked TLS write")
             assert f"winlin-test: checked {wait_marker} wait" in stderr, stderr
             assert "winlin-test: preserved TLS retry buffer" in stderr, stderr
 
@@ -248,7 +247,7 @@ def exercise_tls_peer_retry(lease):
 
 
 def exercise_abandoned_get(lease):
-    """Abandon a backpressured GET after receiving data; teardown must clear the socket cork."""
+    """Abandon a backpressured GET and verify that the connection slot is released."""
     transport = socket.create_connection(("127.0.0.1", lease["port"]), timeout=5)
     transport.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
     raw = tls_context().wrap_socket(transport, server_hostname="localhost")
@@ -374,6 +373,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert status == 200
         assert "authentication" not in capabilities
         assert next(iter(capabilities)) == "environment"
+        assert capabilities["environment"]["workload_tcp_cork"] is False
+        assert capabilities["environment"]["workload_tls_msg_more"] is False
         assert list(capabilities["environment"])[:2] == ["os", "kernel"]
         assert controller.request("POST", "/v1/pair")[0] == 404
         assert capabilities["supported_tls_modes"] == ["on", "off", "ktls"]
@@ -637,7 +638,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         controller.stop()
 
     if FAULTS is not None:
-        controller = Controller(directory, inject_accept_errors=True, cork_retry="read")
+        controller = Controller(directory, inject_accept_errors=True, tls_retry="read")
         try:
             lease = controller.start(tls="on", workers=1, get_response_data="copy")
             try:

@@ -199,16 +199,12 @@ Client `--connections` still selects offered load concurrency (up to 16,384).
 OS resources may impose a lower practical capacity; the ceiling is not a throughput
 or resource-availability guarantee.
 
-The current experimental Linux server keeps `TCP_NODELAY` enabled and applies
-`TCP_CORK` only while submitting workload GET responses. It retains corking across
-writable retries, flushes before peer-dependent TLS reads, and uncorks immediately
-after the final response bytes are queued. Full segments can transmit while corked;
-this does not buffer the whole response or change TLS record sizes. Cork/uncork
-adds two socket-option calls per GET, plus any peer-dependent retry transitions.
-Environment metadata records `workload_tcp_nodelay: true` and
-`workload_tcp_cork: "per-get-response"`. Client, HTTP control, PUT acknowledgements,
-and Windows behavior remain unchanged. Compare small-response tail latency as well
-as bulk CPU/packet rates; lower reported PPS is not guaranteed.
+The Linux server keeps `TCP_NODELAY` enabled and uses OpenSSL's native socket BIO.
+The response-scoped `TCP_CORK` and custom-BIO `MSG_MORE` experiments are disabled
+for the CPIO baseline comparison: GETs perform no cork/uncork socket-option calls.
+Copy-mode TLS GET header/body coalescing remains enabled. Environment metadata
+records `workload_tcp_nodelay: true`, `workload_tcp_cork: false`, and
+`workload_tls_msg_more: false`. Client and Windows behavior are unchanged.
 
 The interactive benchmark menu exposes these same settings. After the final
 prompt it prints a shell-quoted `winlin run` command with the selected target

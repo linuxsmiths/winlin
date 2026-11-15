@@ -184,6 +184,17 @@ extern "C" int accept4(int fd, sockaddr* address, socklen_t* length, int flags) 
     return client;
 }
 
+// Reject experimental send flags when validating the restored native transport baseline.
+extern "C" ssize_t send(int fd, const void* buffer, std::size_t length, int flags) {
+    static const auto real_send = next_symbol<decltype(&send)>("send");
+    static const bool verify = std::getenv("WINLIN_TEST_VERIFY_SERVER_NODELAY") != nullptr;
+    if (verify && (flags & MSG_MORE)) {
+        std::fprintf(stderr, "Fatal test shim error: MSG_MORE is enabled in baseline transport\n");
+        std::_Exit(127);
+    }
+    return real_send(fd, buffer, length, flags);
+}
+
 // Deliver an already-ready response only after its deadline has passed.
 extern "C" int epoll_wait(int fd, epoll_event* events, int count, int timeout) {
     static const auto real_wait = next_symbol<decltype(&epoll_wait)>("epoll_wait");
@@ -191,11 +202,10 @@ extern "C" int epoll_wait(int fd, epoll_event* events, int count, int timeout) {
     static std::atomic<bool> delayed{};
     if (tls_retry.session && !tls_retry.checked_wait) {
         if (!tls_retry.client_put) {
-            verify_cork(tls_retry.fd, tls_retry.read_wait ? 0 : 1);
+            verify_cork(tls_retry.fd, 0);
         }
         tls_retry.checked_wait = true;
-        std::fprintf(stderr, "winlin-test: checked %s TLS %s wait\n",
-                     tls_retry.read_wait ? "uncorked" : "corked",
+        std::fprintf(stderr, "winlin-test: checked uncorked TLS %s wait\n",
                      tls_retry.read_wait ? "read" : "write");
     }
     const int result = real_wait(fd, events, count, timeout);
@@ -259,11 +269,11 @@ extern "C" int SSL_read(ssl_st* session, void* buffer, int length) {
     return real_read(session, buffer, length);
 }
 
-// Force one corked application write to need readiness, without changing OpenSSL's real state.
+// Force one workload application write to need readiness without changing OpenSSL's real state.
 // A read retry is injected after one full record, allowing the client to trigger peer readiness.
 extern "C" int SSL_write(ssl_st* session, const void* buffer, int length) {
     static const auto real_write = next_symbol<decltype(&SSL_write)>("SSL_write");
-    static const char* mode = std::getenv("WINLIN_TEST_CORK_RETRY");
+    static const char* mode = std::getenv("WINLIN_TEST_TLS_RETRY");
     static std::atomic<bool> injected{};
     if (tls_retry.session == session) {
         if (!tls_retry.checked_wait || tls_retry.buffer != buffer || tls_retry.length != length) {
@@ -313,14 +323,18 @@ extern "C" int SSL_write(ssl_st* session, const void* buffer, int length) {
     }
 
     const int fd = tls_descriptor(session);
-    int cork{};
-    socklen_t option_length = sizeof(cork);
-    if (getsockopt(fd, IPPROTO_TCP, TCP_CORK, &cork, &option_length) != 0) {
-        std::perror("Fatal winlin test shim TLS cork query error");
+    sockaddr_in local{};
+    socklen_t local_length = sizeof(local);
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0) {
+        std::perror("Fatal winlin test shim TLS socket query error");
         std::_Exit(127);
     }
+    const bool workload = local.sin_family == AF_INET && local.sin_port == workload_port.load();
+    if (workload) {
+        verify_cork(fd, 0);
+    }
     const bool read_wait = std::strcmp(mode, "read") == 0;
-    if (cork && (!read_wait || tls_retry.large_write_completed) && !injected.exchange(true)) {
+    if (workload && (!read_wait || tls_retry.large_write_completed) && !injected.exchange(true)) {
         tls_retry.session = session;
         tls_retry.buffer = buffer;
         tls_retry.length = length;
@@ -331,7 +345,7 @@ extern "C" int SSL_write(ssl_st* session, const void* buffer, int length) {
         return -1;
     }
     const int result = real_write(session, buffer, length);
-    if (cork && result == 16384) {
+    if (workload && result == 16384) {
         tls_retry.large_write_completed = true;
     }
     return result;
