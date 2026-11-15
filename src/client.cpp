@@ -384,18 +384,29 @@ struct Stats {
     }
 };
 
-// Own the two immutable wire headers shared by every connection in one trial. Construction
-// happens before worker startup; the trial retains them until all workers and TLS retries end.
+// Own immutable request headers and the TLS PUT prefix shared by every benchmark connection.
+// Build once before workers start, and retain the bytes unchanged through every TLS retry.
 struct LoadHeaders {
-    std::string get, put;
+    std::string get, put, tls_put_start;
+    std::size_t put_prefix_bytes{};
 
     // Build both methods from fixed trial settings and the active workload lease, not per I/O.
-    LoadHeaders(const Target& target, const RunConfig& config) {
+    LoadHeaders(const Target& target, const RunConfig& config, const std::vector<char>& payload) {
         const auto fields = " HTTP/1.1\r\nHost: " + target.host + ":" + target.port +
                             (target.run_id.empty() ? "" : "\r\nX-Winlin-Run: " + target.run_id) +
                             "\r\nContent-Length: ";
         get = "GET /v1/object?size=" + std::to_string(config.get_size) + fields + "0\r\n\r\n";
         put = "PUT /v1/object" + fields + std::to_string(config.put_size) + "\r\n\r\n";
+        // Fill the first TLS record without copying the whole object or staging per request.
+        // HTTP and GET requests retain their existing submissions.
+        if (config.tls != "off" && config.method != "get") {
+            if (put.size() >= 16384) {
+                throw std::invalid_argument("PUT header leaves no room in the first TLS record");
+            }
+            put_prefix_bytes = std::min(config.put_size, 16384 - put.size());
+            tls_put_start = put;
+            tls_put_start.append(payload.data(), put_prefix_bytes);
+        }
     }
 };
 
@@ -421,12 +432,13 @@ struct LoadConnection {
         read_body
     } state{State::handshake};
     bool alive{true}, get{};
-    // Borrow the selected immutable trial header, including through partial writes/TLS retries.
+    // Borrow the immutable header (plus the first body bytes for TLS PUTs) through retries.
     std::string_view header;
     // buffer: accumulate response headers directly, then reuse it to discard response body bytes
     std::array<char, max_header_size> buffer{};
     // offset tracks the number of bytes sent in the request header or body
     std::size_t offset{}, remaining{};
+    std::size_t put_prefix_bytes{};
     // Retain partial headers and resume scanning with overlap for a split delimiter.
     // header_received: Number of header bytes received so far, including any body bytes
     //                  that may have been read into buffer.
@@ -454,7 +466,15 @@ struct LoadConnection {
         get = config.method == "get" ||
               (config.method == "mixed" &&
                ((index % 100) * config.get_percent) % 100 < config.get_percent);
-        header = get ? headers.get : headers.put;
+        const bool combined_put = !get && socket.ssl && !headers.tls_put_start.empty();
+        if (get) {
+            header = headers.get;
+        } else if (combined_put) {
+            header = headers.tls_put_start;
+        } else {
+            header = headers.put;
+        }
+        put_prefix_bytes = combined_put ? headers.put_prefix_bytes : 0;
         offset = 0;
         header_received = 0;
         header_search = 0;
@@ -511,7 +531,8 @@ struct LoadConnection {
                 }
                 offset += count;
                 if (offset == header.size()) {
-                    offset = 0;
+                    // The TLS prefix already sent these body bytes; resume without duplication.
+                    offset = get ? 0 : put_prefix_bytes;
                     // header is fully sent, now we can either send the body (for PUT) or
                     // read the response (for GET).
                     state = get ? State::read_head : State::send_body;
@@ -881,7 +902,7 @@ void trials(SSL_CTX* ctx, const Target& target, const RunConfig& config,
             const std::vector<char>& payload, const Target& control_target,
             const std::string& run_id, ReportResult report_result) {
     check_interruption();
-    const LoadHeaders headers(target, config);
+    const LoadHeaders headers(target, config, payload);
     std::latch setup_done(config.workers), warmup_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};

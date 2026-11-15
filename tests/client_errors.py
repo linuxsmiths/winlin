@@ -2,6 +2,7 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -248,7 +249,16 @@ class RegistrationHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         """Consume the complete dummy PUT before acknowledging an interactive workload."""
         self.observe_workload()
-        self.rfile.read(int(self.headers["Content-Length"]))
+        size = int(self.headers["Content-Length"])
+        body = self.rfile.read(size)
+        if self.server.verify_put:
+            assert len(body) == size
+            digest = hashlib.sha256(body).digest()
+            with self.server.connection_condition:
+                if self.server.put_digest is None:
+                    self.server.put_digest = digest
+                assert self.server.put_digest == digest, "PUT body changed across requests"
+                self.server.puts_verified += 1
         self.respond(b"")
 
     def observe_workload(self):
@@ -297,6 +307,9 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.response_status = 200
         endpoint.fail_workload = False
         endpoint.fail_warmup = False
+        endpoint.verify_put = False
+        endpoint.put_digest = None
+        endpoint.puts_verified = 0
         endpoint.raw_response_parts = ()
         endpoint.is_workload = endpoint is not server
         endpoint.metadata_requests = []
@@ -679,6 +692,35 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             multiple_workers[multiple_workers.index(option) + 1] = "2"
 
         if faults:
+            # Check the TLS write itself and exact body framing through retries, multiple
+            # connections/repetitions, and mixed requests. Include empty and multi-record PUTs.
+            for size in (0, 256, 16384, 65536):
+                secure.verify_put = True
+                secure.put_digest = None
+                secure.puts_verified = 0
+                output = directory / f"tls-put-prefix-{size}.json"
+                arguments = benchmark.copy()
+                for option, value in (("--connections", "2"), ("--workers", "2"),
+                                      ("--requests", "4")):
+                    arguments[arguments.index(option) + 1] = value
+                result = subprocess.run(
+                    [*arguments, "--method", "mixed", "--get-percent", "50",
+                     "--put-size", str(size), "--output", str(output)],
+                    capture_output=True, text=True, timeout=15,
+                    env=dict(os.environ, LD_PRELOAD=faults,
+                             WINLIN_TEST_DATA_PORT=str(secure.server_port),
+                             WINLIN_TEST_TLS_PUT_SIZE=str(size)),
+                )
+                secure.verify_put = False
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert "verified combined TLS PUT prefix" in result.stderr, result.stderr
+                assert "preserved TLS retry buffer" in result.stderr, result.stderr
+                report = json.loads(output.read_text())
+                assert all(entry["put_completed"] == 2 and entry["get_completed"] == 2 and
+                           entry["sent_object_bytes"] == 2 * size and entry["errors"] == 0
+                           for entry in report["results"])
+                assert secure.puts_verified > 4
+
             # Inject delay at the two distinct boundaries that previously admitted expired I/O.
             for variable, marker in (
                 ("WINLIN_TEST_LATE_READY", "delayed ready response"),

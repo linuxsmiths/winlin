@@ -1,6 +1,7 @@
 // Test-only syscall interposition. CTest preloads this library into its own child processes;
 // no production executable links it or exposes these fault controls.
 #include <arpa/inet.h>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <netinet/tcp.h>
+#include <string_view>
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
@@ -33,6 +35,8 @@ struct TlsRetry {
     int length{}, error{};
     int fd{-1};
     bool read_wait{}, checked_wait{}, large_write_completed{};
+    bool client_put{};
+    std::array<char, 16384> saved_bytes{};
 };
 
 thread_local TlsRetry tls_retry;
@@ -186,7 +190,9 @@ extern "C" int epoll_wait(int fd, epoll_event* events, int count, int timeout) {
     static const bool inject = std::getenv("WINLIN_TEST_LATE_READY") != nullptr;
     static std::atomic<bool> delayed{};
     if (tls_retry.session && !tls_retry.checked_wait) {
-        verify_cork(tls_retry.fd, tls_retry.read_wait ? 0 : 1);
+        if (!tls_retry.client_put) {
+            verify_cork(tls_retry.fd, tls_retry.read_wait ? 0 : 1);
+        }
         tls_retry.checked_wait = true;
         std::fprintf(stderr, "winlin-test: checked %s TLS %s wait\n",
                      tls_retry.read_wait ? "uncorked" : "corked",
@@ -264,9 +270,43 @@ extern "C" int SSL_write(ssl_st* session, const void* buffer, int length) {
             std::fprintf(stderr, "Fatal winlin test shim error: TLS retry changed its buffer\n");
             std::_Exit(127);
         }
+        if (tls_retry.client_put &&
+            std::memcmp(tls_retry.saved_bytes.data(), buffer, length) != 0) {
+            std::fprintf(stderr, "Fatal winlin test shim error: TLS PUT retry bytes changed\n");
+            std::_Exit(127);
+        }
         tls_retry.session = nullptr;
         std::fprintf(stderr, "winlin-test: preserved TLS retry buffer\n");
         return real_write(session, buffer, length);
+    }
+    // Observe actual application TLS submissions, not TCP packetization. One synthetic
+    // WANT_WRITE verifies that the immutable combined prefix survives a readiness retry.
+    static const char* put_size = std::getenv("WINLIN_TEST_TLS_PUT_SIZE");
+    if (put_size && workload_socket(tls_descriptor(session))) {
+        const std::string_view bytes(static_cast<const char*>(buffer), length);
+        if (bytes.starts_with("PUT ")) {
+            const auto boundary = bytes.find("\r\n\r\n");
+            const auto size = std::strtoul(put_size, nullptr, 10);
+            const auto total = boundary + 4 + size;
+            if (boundary == std::string_view::npos ||
+                static_cast<std::size_t>(length) != (total < 16384 ? total : 16384)) {
+                std::fprintf(stderr,
+                             "Fatal winlin test shim error: TLS PUT prefix is incomplete\n");
+                std::_Exit(127);
+            }
+            static std::atomic<bool> checked{};
+            if (!checked.exchange(true)) {
+                std::fprintf(stderr, "winlin-test: verified combined TLS PUT prefix\n");
+                tls_retry.session = session;
+                tls_retry.buffer = buffer;
+                tls_retry.length = length;
+                tls_retry.fd = tls_descriptor(session);
+                tls_retry.client_put = true;
+                tls_retry.error = 3;
+                std::memcpy(tls_retry.saved_bytes.data(), buffer, length);
+                return -1;
+            }
+        }
     }
     if (!mode || injected.load()) {
         return real_write(session, buffer, length);
