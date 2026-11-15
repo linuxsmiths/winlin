@@ -30,6 +30,54 @@ class StalledHandshake(socketserver.BaseRequestHandler):
                 pass
 
 
+class LocalControllerHandler(BaseHTTPRequestHandler):
+    """Exercise server-local CLI dispatch without acquiring the native server guard."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_):
+        """Keep fixture diagnostics out of console result assertions."""
+        pass
+
+    def respond(self, payload):
+        """Send a bounded control JSON reply and close this fixture connection."""
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        """Advertise local workloads or return completed and failed repetition snapshots."""
+        if self.path == "/v1/capabilities":
+            self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation"]})
+        else:
+            self.server.poll_seen.set()
+            self.respond({
+                "status": ("running" if self.server.running else
+                           "failed" if self.server.fail_run else "completed"),
+                "failure": "fixture native failure" if self.server.fail_run else None,
+                "results": [] if self.server.running else [{
+                    "repetition": 1, "operations": 100, "operations_per_second": 1000,
+                    "mean_operation_ns": 1000000, "reference_cycles_per_operation": 2000,
+                    "server_host": {"cpu_utilization_percent": 100}, "errors": 0,
+                }],
+            })
+
+    def do_POST(self):
+        """Retain submitted parameters and verify the client releases its owned lease."""
+        if self.path == "/v1/benchmark/start":
+            settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.server.settings.append(settings)
+            self.respond({
+                "run_id": "ab" * 32, "settings": settings, "transport": "server-local",
+                "operation_unit": "fixture operation", "benchmark": settings["benchmark"],
+            })
+        else:
+            self.server.stops += 1
+            self.respond({"status": "stopped"})
+
+
 client = sys.argv[1]
 faults = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
 native_server = str(Path(sys.argv[3]).resolve()) if len(sys.argv) > 3 else None
@@ -101,6 +149,105 @@ if faults:
             assert "Unknown" in result.stderr, result.stderr
             assert ("verified native descriptor-limit increase" in result.stderr) == (
                 soft_limit < 524288), result.stderr
+
+with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
+    directory = Path(temporary)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), LocalControllerHandler)
+    server.settings, server.stops, server.fail_run = [], 0, False
+    server.running = False
+    server.poll_seen = threading.Event()
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    target = directory / "local.json"
+    target.write_text(json.dumps({
+        "host": "127.0.0.1", "port": str(server.server_port),
+        "certificate_sha256": "ab" * 32,
+    }))
+    target.chmod(0o600)
+    try:
+        for benchmark, parameters in (
+            ("context-switch", ["--server-cpu", "2"]),
+            ("syscall", ["--operation", "minimal-query"]),
+            ("allocation", ["--allocation-size", "512B", "--live-allocations", "4",
+                            "--memory-touch", "pages", "--server-workers", "2"]),
+        ):
+            output = directory / f"{benchmark}.json"
+            result = subprocess.run(
+                [client, "run", "--target", str(target), "--benchmark", benchmark,
+                 "--duration", "0.02", "--repetitions", "1", "--output", str(output), *parameters],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert f"Server-local {benchmark}" in result.stdout
+            report = json.loads(output.read_text())
+            assert report["status"] == "completed" and len(report["results"]) == 1
+            assert "ab" * 32 not in output.read_text()
+            assert not {"tls", "cipher", "get_response_data"} & server.settings[-1].keys()
+        assert server.settings[0]["server_cpu"] == 2
+        assert server.settings[2]["allocation_size"] == 512
+        assert server.stops == 3
+        server.fail_run = True
+        output = directory / "failed-local.json"
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "syscall",
+             "--repetitions", "2", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "fixture native failure" in result.stderr
+        report = json.loads(output.read_text())
+        assert report["status"] == "failed" and len(report["results"]) == 1
+        assert server.stops == 4
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "syscall", "--tls", "on"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "Unknown option: --tls" in result.stderr
+        assert len(server.settings) == 4
+        server.fail_run = False
+        # The local menu emits a replayable command without changing existing network prompts.
+        state = directory / "state" / "winlin"
+        state.mkdir(parents=True, mode=0o700)
+        saved_target = state / "target.json"
+        saved_target.write_text(target.read_text())
+        saved_target.chmod(0o600)
+        result = subprocess.run(
+            [client], input="4\nsyscall\n1\nauto\n0.02\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--benchmark 'syscall'" in displayed.group(1), result.stdout
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        assert server.stops == 6
+        # Cancellation while polling must release the owned lease and keep reports bearer-free.
+        server.running = True
+        for signal_number in (signal.SIGINT, signal.SIGTERM):
+            server.poll_seen.clear()
+            output = directory / f"local-cancel-{signal_number}.json"
+            process = subprocess.Popen(
+                [client, "run", "--target", str(target), "--benchmark", "context-switch",
+                 "--output", str(output)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                assert server.poll_seen.wait(5), "Local client did not start telemetry polling"
+                process.send_signal(signal_number)
+                stdout, stderr = process.communicate(timeout=10)
+                assert process.returncode == 128 + signal_number, stdout + stderr
+                assert json.loads(output.read_text())["status"] == "interrupted"
+                assert "ab" * 32 not in output.read_text()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        assert server.stops == 8
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
     directory = Path(temporary)

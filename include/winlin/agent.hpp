@@ -241,6 +241,9 @@ public:
             unavailable.push_back("hardware_cycles");
         }
         Json result{{"environment", config.environment},
+                    {"supported_benchmarks", {"https", "context-switch", "syscall", "allocation"}},
+                    {"supported_syscall_operations", {"minimal-query"}},
+                    {"supported_memory_touch_modes", {"none", "pages"}},
                     {"supported_backends", config.supported_backends},
                     {"supported_transports", {"http", "https"}},
                     {"supported_tls_modes", config.benchmark_tls_modes},

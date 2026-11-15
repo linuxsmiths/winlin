@@ -93,6 +93,12 @@ Use the foreground launchers:
 ./scripts/run-client.sh inspect --target .winlin-local/local.json
 ```
 
+Server-local tests now also cover **same-CPU thread handoffs, minimal native
+syscall queries, and allocation/free pairs**. Select them with
+`winlin run --target FILE --benchmark context-switch|syscall|allocation`, or the
+server-local menu entry. See [local benchmark definitions and comparison limits](docs/local-benchmarks.md)
+for parameters, native operation differences, and cycles/operation accounting.
+
 The Linux HTTP controller listens on `0.0.0.0:38080` by default, accepting remote IPv4
 clients. Use `--bind 127.0.0.1` if you want loopback-only operation.
 It advertises a separate per-run data endpoint: port 38444 for HTTP or 38445 for

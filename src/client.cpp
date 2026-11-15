@@ -1,4 +1,5 @@
 #include "winlin/linux.hpp"
+#include "winlin/benchmark.hpp"
 
 #include <barrier>
 #include <cassert>
@@ -1139,6 +1140,231 @@ RunConfig configuration(const Args& args) {
     return config;
 }
 
+// Parse only options meaningful to a server-local workload. The same shared parser validates
+// settings again on the server; no network workload knobs are accepted on this path.
+BenchmarkOptions local_configuration(const Args& args) {
+    const auto benchmark = args.get("--benchmark");
+    if (benchmark == "allocation") {
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
+                    "--allocation-size", "--live-allocations", "--memory-touch",
+                    "--server-workers"});
+    } else if (benchmark == "syscall") {
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
+                    "--server-cpu", "--operation"});
+    } else {
+        args.allow(
+            {"--benchmark", "--target", "--duration", "--repetitions", "--output", "--server-cpu"});
+    }
+    Json settings{{"benchmark", benchmark},
+                  {"duration", seconds(args.get("--duration", "30"), 3600)},
+                  {"repetitions", number(args.get("--repetitions", "3"), 1000)},
+                  {"workers",
+                   benchmark == "allocation" ? number(args.get("--server-workers", "1"), 256) : 1}};
+    if (benchmark == "allocation") {
+        settings["allocation_size"] = object_size(args.get("--allocation-size", "4KiB"));
+        settings["live_allocations"] = number(args.get("--live-allocations", "1"), 65536);
+        settings["memory_touch"] = args.get("--memory-touch", "none");
+    } else {
+        if (args.contains("--server-cpu")) {
+            settings["server_cpu"] = number(args.require("--server-cpu"), 65535);
+        }
+        if (benchmark == "syscall") {
+            settings["operation"] = args.get("--operation", "minimal-query");
+        }
+    }
+    return BenchmarkOptions::parse(settings);
+}
+
+// Control a leased server-local run without a load-generator socket or measured client loop.
+// Preserve completed repetitions on failure/cancellation and stop only the lease we acquired.
+int run_local(Target target, const BenchmarkOptions& options,
+              const std::optional<fs::path>& output) {
+    RunSignals signals;
+    std::string run_id;
+    bool report_created{};
+    Json report{{"schema_version", 1},
+                {"benchmark", options.benchmark},
+                {"configuration", options.json()},
+                {"status", "running"},
+                {"results", Json::array()},
+                {"server", {{"host", target.host}, {"port", target.port}}}};
+    // Save snapshots only when explicitly requested, never including control bearer IDs.
+    const auto save = [&] {
+        if (output) {
+            write_private(*output, report, false);
+        }
+    };
+    const auto command = [&](const std::string& path, const std::string& body = {}) {
+        const auto response = exchange(target, "POST", path, body);
+        if (response.status != 200) {
+            throw std::runtime_error(
+                "Server rejected local benchmark (HTTP " + std::to_string(response.status) +
+                "): " + Json::parse(response.body).value("error", "unknown error"));
+        }
+        return Json::parse(response.body);
+    };
+    try {
+        const auto capabilities = control(target, "/v1/capabilities");
+        check_interruption();
+        const auto supported =
+            capabilities.value("supported_benchmarks", std::vector<std::string>{});
+        if (std::find(supported.begin(), supported.end(), options.benchmark) == supported.end()) {
+            throw std::runtime_error("Server does not advertise benchmark: " + options.benchmark);
+        }
+        if (output) {
+            if (!output->parent_path().empty()) {
+                fs::create_directories(output->parent_path());
+            }
+            write_private(*output, report, true);
+            report_created = true;
+        }
+        auto settings = options.json();
+        // Omit auto-CPU null; the server chooses an allowed CPU and reports the actual choice.
+        if (settings.contains("server_cpu") && settings.at("server_cpu").is_null()) {
+            settings.erase("server_cpu");
+        }
+        settings["lease_seconds"] = 300;
+        auto started = command("/v1/benchmark/start", settings.dump());
+        run_id = started.at("run_id").get<std::string>();
+        started.erase("run_id");
+        const auto expected_settings = options.json();
+        for (const auto& [key, expected] : expected_settings.items()) {
+            if (key == "server_cpu" && expected.is_null()) {
+                continue;
+            }
+            if (!started.at("settings").contains(key) ||
+                started.at("settings").at(key) != expected) {
+                throw std::runtime_error("Server did not apply local benchmark setting: " + key);
+            }
+        }
+        if (started.at("transport") != "server-local") {
+            throw std::runtime_error("Server did not start a local workload");
+        }
+        report["server_run"] = started;
+        check_interruption();
+        std::cout << "Server-local " << options.benchmark
+                  << " | operation: " << started.at("operation_unit").get<std::string>() << '\n';
+        if (started.value("native_syscall", Json(nullptr)).is_string()) {
+            std::cout << "Native query: " << started.at("native_syscall").get<std::string>()
+                      << '\n';
+        }
+        if (options.benchmark == "allocation") {
+            std::cout
+                << "Allocation size=" << options.allocation_size
+                << " | live blocks/worker=" << options.live_allocations
+                << " | touch=" << options.memory_touch << " | workers=" << options.workers
+                << " | allocator="
+                << started.value("environment", Json::object()).value("allocator", "unreported")
+                << '\n';
+        } else if (started.value("server_cpu", Json(nullptr)).is_number()) {
+            std::cout << "Server logical CPU=" << started.at("server_cpu")
+                      << " | execution threads="
+                      << started.value("execution_threads",
+                                       options.benchmark == "context-switch" ? 2 : 1)
+                      << '\n';
+        }
+        std::cout << "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op";
+        if (options.benchmark == "context-switch") {
+            std::cout << "     mean RTT(ns)      Sched CS/s";
+        }
+        std::cout << '\n';
+        const auto deadline = Clock::now() + std::chrono::duration<double>(
+                                                 2 + options.duration * options.repetitions + 180);
+        for (;;) {
+            check_interruption();
+            if (Clock::now() >= deadline) {
+                throw std::runtime_error("Local benchmark exceeded its expected completion time");
+            }
+            const auto sample = control(target, "/v1/benchmark/telemetry?run_id=" + run_id);
+            const auto& results = sample.at("results");
+            if (results.size() < report.at("results").size()) {
+                throw std::runtime_error("Server local results decreased");
+            }
+            // Print only newly completed repetitions; polling cannot change their measurements.
+            for (std::size_t index = report.at("results").size(); index < results.size(); ++index) {
+                const auto& result = results[index];
+                std::cout << std::fixed << std::setprecision(2) << std::setw(3)
+                          << result.at("repetition").get<unsigned>() << std::setw(16)
+                          << result.at("operations_per_second").get<double>() << std::setw(14)
+                          << result.at("mean_operation_ns").get<double>();
+                for (const auto& metric : {result.at("server_host").at("cpu_utilization_percent"),
+                                           result.at("reference_cycles_per_operation")}) {
+                    std::cout << std::setw(16);
+                    if (metric.is_number()) {
+                        std::cout << metric.get<double>();
+                    } else {
+                        std::cout << "N/A";
+                    }
+                }
+                if (options.benchmark == "context-switch") {
+                    for (const auto* key :
+                         {"mean_round_trip_ns", "scheduler_context_switches_per_second"}) {
+                        const auto metric = result.value(key, Json(nullptr));
+                        std::cout << std::setw(16);
+                        if (metric.is_number()) {
+                            std::cout << metric.get<double>();
+                        } else {
+                            std::cout << "N/A";
+                        }
+                    }
+                }
+                std::cout << '\n';
+                report["results"].push_back(result);
+                if (result.at("reference_cycles_per_operation").is_null()) {
+                    log_warning("Reference cycles/op unavailable: " +
+                                result.at("server_host")
+                                    .at("reference_cycles_unavailable_reason")
+                                    .get<std::string>());
+                }
+                save();
+            }
+            const auto status = sample.at("status").get<std::string>();
+            if (status != "running") {
+                if (status != "completed" || results.size() != options.repetitions) {
+                    throw std::runtime_error(sample.value("failure", Json(nullptr)).is_string()
+                                                 ? sample.at("failure").get<std::string>()
+                                                 : "Server local benchmark is incomplete");
+                }
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        command("/v1/benchmark/stop?run_id=" + run_id);
+        run_id.clear();
+        check_interruption();
+        report["status"] = "completed";
+        save();
+    } catch (const std::exception& error) {
+        if (!run_id.empty()) {
+            try {
+                command("/v1/benchmark/stop?run_id=" + run_id);
+            } catch (const std::exception& cleanup) {
+                log_warning("Cannot stop local run; bounded lease will expire: " +
+                            std::string(cleanup.what()));
+            }
+        }
+        const auto signal_number = interruption_signal.load(std::memory_order_relaxed);
+        report["status"] = signal_number ? "interrupted" : "failed";
+        report["failure"] = error.what();
+        // Do not overwrite an existing output when initial exclusive report creation failed.
+        if (output && report_created) {
+            save();
+        }
+        if (signal_number) {
+            if (dynamic_cast<const RunInterrupted*>(&error) == nullptr) {
+                log_warning("Local benchmark interrupted after failure: " +
+                            std::string(error.what()));
+            }
+            throw RunInterrupted(signal_number);
+        }
+        throw;
+    }
+    if (output) {
+        std::cout << "Results saved to " << output->string() << '\n';
+    }
+    return 0;
+}
+
 // Always report console metrics and failures; persist detailed repetitions and final status only
 // when requested. Console-only runs still collect the telemetry needed for metrics and warnings.
 int run_benchmark(Target target, const RunConfig& config, const std::optional<fs::path>& output) {
@@ -1513,8 +1739,8 @@ std::string benchmark_command(std::string_view executable, const std::string& ta
 // Keep recoverable input/run failures local to the menu; CLI fatal failures instead exit nonzero.
 void interactive(std::string_view executable) {
     while (std::cin) {
-        std::cout
-            << "\nWinlin\n1. Add server\n2. Inspect server\n3. Run HTTP/HTTPS benchmark\n0. Exit\n";
+        std::cout << "\nWinlin\n1. Add server\n2. Inspect server\n3. Run HTTP/HTTPS benchmark\n"
+                     "4. Run server-local benchmark\n0. Exit\n";
         const auto action = prompt("Select", "0");
         if (action == "0") {
             return;
@@ -1580,6 +1806,54 @@ void interactive(std::string_view executable) {
                 }
                 std::cout << '\n';
                 run(target, config, output);
+            } else if (action == "4") {
+                const auto benchmark =
+                    prompt("Benchmark: context-switch / syscall / allocation", "context-switch");
+                const auto target_path = select_target();
+                Json settings{{"benchmark", benchmark}, {"workers", 1}};
+                if (benchmark == "allocation") {
+                    settings["allocation_size"] = object_size(prompt("Allocation size", "4KiB"));
+                    settings["live_allocations"] =
+                        number(prompt("Live allocations per worker", "1"), 65536);
+                    settings["memory_touch"] = prompt("Memory touch: none / pages", "none");
+                    settings["workers"] = number(prompt("Server workers", "1"), 256);
+                } else {
+                    const auto cpu = prompt("Server logical CPU (auto or index)", "auto");
+                    if (cpu != "auto") {
+                        settings["server_cpu"] = number(cpu, 65535);
+                    }
+                    if (benchmark == "syscall") {
+                        settings["operation"] = "minimal-query";
+                    }
+                }
+                settings["duration"] = seconds(prompt("Measurement seconds", "30"), 3600);
+                settings["repetitions"] = number(prompt("Repetitions", "3"), 1000);
+                const auto options = BenchmarkOptions::parse(settings);
+                std::optional<fs::path> output;
+                const auto save = lower(trim(prompt("Save detailed telemetry? yes / no", "no")));
+                if (save == "yes" || save == "y") {
+                    output = prompt("Result file", benchmark + ".json");
+                } else if (save != "no" && save != "n") {
+                    throw std::invalid_argument("Answer yes or no to saving detailed telemetry");
+                }
+                std::cout << "\nNoninteractive command:\n"
+                          << shell_argument(executable) << " run --target "
+                          << shell_argument(target_path) << " --benchmark "
+                          << shell_argument(benchmark) << " --duration " << options.duration
+                          << " --repetitions " << options.repetitions;
+                if (benchmark == "allocation") {
+                    std::cout << " --allocation-size " << options.allocation_size
+                              << " --live-allocations " << options.live_allocations
+                              << " --memory-touch " << shell_argument(options.memory_touch)
+                              << " --server-workers " << options.workers;
+                } else if (options.server_cpu >= 0) {
+                    std::cout << " --server-cpu " << options.server_cpu;
+                }
+                if (output) {
+                    std::cout << " --output " << shell_argument(output->string());
+                }
+                std::cout << "\n\n";
+                run_local(load_target(target_path), options, output);
             } else {
                 std::cout << "Unknown selection\n";
             }
@@ -1616,11 +1890,18 @@ int main(int argc, char** argv) {
                    "            Custom workload certificates require --fingerprint.\n"
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
+                   "           [--benchmark https] (existing network default)\n"
                    "           [--get-response-data shared|copy] (default: copy)\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
+                   "winlin run --target FILE --benchmark context-switch|syscall|allocation\n"
+                   "           [--duration 30] [--repetitions 3] [--output FILE]\n"
+                   "           context-switch/syscall: [--server-cpu N] (default: auto)\n"
+                   "           syscall: [--operation minimal-query]\n"
+                   "           allocation: [--allocation-size 4KiB] [--live-allocations 1]\n"
+                   "                       [--memory-touch none|pages] [--server-workers 1]\n"
                    "Without --output, results are displayed in the console only.\n"
                    "A fixed two-second warmup runs once before all repetitions.\n"
                    "Closed-loop persistent HTTP/HTTPS; paced load and handshake tests are not "
@@ -1643,10 +1924,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (command == "run") {
+            if (args.get("--benchmark", "https") != "https") {
+                const auto options = local_configuration(args);
+                std::optional<fs::path> output;
+                if (args.contains("--output")) {
+                    output = args.require("--output");
+                }
+                return run_local(load_target(args.require("--target")), options, output);
+            }
             args.allow({"--target", "--method", "--get-size", "--get-response-data", "--put-size",
                         "--get-percent", "--connections", "--workers", "--duration", "--requests",
                         "--repetitions", "--timeout", "--output", "--cipher", "--tls",
-                        "--server-workers"});
+                        "--server-workers", "--benchmark"});
             const auto config = configuration(args);
             auto target = load_target(args.require("--target"));
             std::optional<fs::path> output;

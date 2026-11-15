@@ -1,5 +1,6 @@
 #include "winlin/linux.hpp"
 #include "winlin/agent.hpp"
+#include "winlin/local_linux.hpp"
 
 #include <cassert>
 #include <iostream>
@@ -805,8 +806,13 @@ int main(int argc, char** argv) {
                 return id;
             },
             [&](const BenchmarkOptions& options, const std::string& id) {
-                return std::make_unique<LinuxBenchmark>(args, options, id);
-        });
+                if (options.benchmark != "https") {
+                    return std::unique_ptr<BenchmarkInstance>(
+                        std::make_unique<LocalBenchmark>(options, linux_local_operations()));
+                }
+                return std::unique_ptr<BenchmarkInstance>(
+                    std::make_unique<LinuxBenchmark>(args, options, id));
+            });
 
         // Control requests create and stop workloads through the shared controller. Control has
         // one listener and one thread; only workloads create client-sized listener/worker pools.

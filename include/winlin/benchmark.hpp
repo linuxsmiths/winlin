@@ -11,6 +11,11 @@
 namespace winlin {
 // Describe only per-run tuning. Bind addresses, ports, certificates and OS permissions stay local.
 struct BenchmarkOptions {
+    std::string benchmark{"https"}, operation{"minimal-query"}, memory_touch{"none"};
+    double duration{30};
+    unsigned repetitions{3};
+    int server_cpu{-1};
+    std::size_t allocation_size{4096}, live_allocations{1};
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
     std::string get_response_data{"copy"};
     unsigned workers{8}, lease_seconds{300};
@@ -20,13 +25,28 @@ struct BenchmarkOptions {
         if (!value.is_object()) {
             throw std::invalid_argument("Benchmark settings must be a JSON object");
         }
+        const auto benchmark = value.value("benchmark", std::string("https"));
+        if (benchmark != "https" && benchmark != "context-switch" && benchmark != "syscall" &&
+            benchmark != "allocation") {
+            throw std::invalid_argument("Unknown benchmark: " + benchmark);
+        }
         for (const auto& [key, ignored] : value.items()) {
-            if (key != "tls" && key != "cipher" && key != "workers" && key != "lease_seconds" &&
-                key != "get_response_data") {
+            const bool common = key == "benchmark" || key == "workers" || key == "lease_seconds";
+            const bool network = benchmark == "https" &&
+                                 (key == "tls" || key == "cipher" || key == "get_response_data");
+            const bool local =
+                benchmark != "https" && (key == "duration" || key == "repetitions" ||
+                                         (key == "server_cpu" && benchmark != "allocation") ||
+                                         (key == "operation" && benchmark == "syscall") ||
+                                         (benchmark == "allocation" &&
+                                          (key == "allocation_size" || key == "live_allocations" ||
+                                           key == "memory_touch")));
+            if (!common && !network && !local) {
                 throw std::invalid_argument("Unknown benchmark setting: " + key);
             }
         }
         BenchmarkOptions result;
+        result.benchmark = benchmark;
         result.tls = value.value("tls", result.tls);
         result.cipher = value.value("cipher", result.cipher);
         result.get_response_data = value.value("get_response_data", result.get_response_data);
@@ -40,8 +60,45 @@ struct BenchmarkOptions {
             }
             return static_cast<unsigned>(number);
         };
-        result.workers = bounded("workers", result.workers, 256);
+        result.workers = bounded("workers", benchmark == "https" ? result.workers : 1, 256);
         result.lease_seconds = bounded("lease_seconds", result.lease_seconds, 604800);
+        if (benchmark != "https") {
+            result.duration = value.value("duration", result.duration);
+            result.repetitions = bounded("repetitions", result.repetitions, 1000);
+            if (!std::isfinite(result.duration) || result.duration < 0.01 ||
+                result.duration > 3600) {
+                throw std::invalid_argument("Local benchmark duration must be 0.01-3600 seconds");
+            }
+            if (benchmark != "allocation" && result.workers != 1) {
+                throw std::invalid_argument("Context-switch and syscall use one CPU/pair");
+            }
+            if (value.contains("server_cpu")) {
+                if (!value.at("server_cpu").is_number_integer()) {
+                    throw std::invalid_argument("server_cpu must be an integer");
+                }
+                const auto cpu = value.at("server_cpu").get<std::int64_t>();
+                if (cpu < 0 || cpu > 65535) {
+                    throw std::invalid_argument("server_cpu is outside supported limits");
+                }
+                result.server_cpu = static_cast<int>(cpu);
+            }
+            result.operation = value.value("operation", result.operation);
+            if (result.operation != "minimal-query") {
+                throw std::invalid_argument("Only minimal-query is supported");
+            }
+            result.allocation_size = bounded("allocation_size", 4096, max_object_size);
+            result.live_allocations = bounded("live_allocations", 1, 65536);
+            result.memory_touch = value.value("memory_touch", result.memory_touch);
+            if (result.memory_touch != "none" && result.memory_touch != "pages") {
+                throw std::invalid_argument("memory_touch must be none or pages");
+            }
+            if (benchmark == "allocation" &&
+                result.allocation_size * result.live_allocations * result.workers >
+                    std::size_t{1024} * 1024 * 1024) {
+                throw std::invalid_argument("Allocation live working set exceeds 1 GiB");
+            }
+            return result;
+        }
         if (result.tls != "on" && result.tls != "off" && result.tls != "ktls") {
             throw std::invalid_argument("TLS mode must be on, off, or ktls");
         }
@@ -56,6 +113,23 @@ struct BenchmarkOptions {
 
     // Return the settings actually used by the workload adapter, never a credential.
     Json json() const {
+        if (benchmark != "https") {
+            Json result{{"benchmark", benchmark},
+                        {"duration", duration},
+                        {"repetitions", repetitions},
+                        {"workers", workers}};
+            if (benchmark == "allocation") {
+                result["allocation_size"] = allocation_size;
+                result["live_allocations"] = live_allocations;
+                result["memory_touch"] = memory_touch;
+            } else {
+                result["server_cpu"] = server_cpu < 0 ? Json(nullptr) : Json(server_cpu);
+                if (benchmark == "syscall") {
+                    result["operation"] = operation;
+                }
+            }
+            return result;
+        }
         return {{"tls", tls},
                 {"cipher", tls == "off" ? Json(nullptr) : Json(cipher)},
                 {"get_response_data", get_response_data},

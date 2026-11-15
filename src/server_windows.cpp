@@ -1,4 +1,5 @@
 #include "winlin/windows.hpp"
+#include "winlin/local_windows.hpp"
 #include "winlin/agent.hpp"
 
 #include <cstddef>
@@ -1087,11 +1088,15 @@ int wmain(int argc, wchar_t** argv) {
         const auto address = args.get("--bind", "127.0.0.1");
         BenchmarkController controller(
             issue_run_id, [&](const BenchmarkOptions& options, const std::string& run_id) {
+                if (options.benchmark != "https") {
+                    return std::unique_ptr<BenchmarkInstance>(
+                        std::make_unique<LocalBenchmark>(options, windows_local_operations()));
+                }
                 auto config = workload_config(host_config, options);
                 try {
-                    return std::make_unique<NativeBenchmark>(std::move(config), run_id, address,
-                                                             options.tls == "off" ? http_port
-                                                                                  : https_port);
+                    return std::unique_ptr<BenchmarkInstance>(std::make_unique<NativeBenchmark>(
+                        std::move(config), run_id, address,
+                        options.tls == "off" ? http_port : https_port));
                 } catch (const BenchmarkError&) {
                     throw;
                 } catch (const std::exception& failure) {
