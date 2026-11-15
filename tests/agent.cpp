@@ -199,11 +199,39 @@ int main() {
         require(restarted.request(head("GET", "/v1/capabilities", access), tls).status == 200,
                 "Control discovery needs no persistent client state after restart");
         config.backend = "openssl-ktls";
+        config.file_get_data = true;
+        config.supports_ktls_sendfile = true;
         Agent ktls(config, process);
         require(ktls.request(head("GET", "/v1/object?size=256", access), tls).status == 501,
                 "kTLS TX cannot silently fall back");
         require(ktls.request(head("PUT", "/v1/object", access, 256), tls).status == 501,
-                "kTLS RX cannot silently fall back");
+                "kTLS sendfile rejects PUT");
+        const ConnectionInfo active_ktls{"TLSv1.3", config.cipher, true, true};
+        require(ktls.request(head("PUT", "/v1/object", access, 256), active_ktls).status == 501,
+                "Even active RX kTLS must not accept PUT on the GET-only sendfile backend");
+        require(ktls.request(head("GET", "/v1/object?size=256", access), active_ktls).kind ==
+                    AgentReply::Kind::object,
+                "Verified TX kTLS accepts file-backed GETs");
+        require(ktls.telemetry().at("get_response_data") == "file" &&
+                    ktls.telemetry().at("get_response_sendfile") == true &&
+                    ktls.capabilities().at("supported_get_response_data_modes") ==
+                        Json({"shared", "copy", "file"}),
+                "File source semantics and sendfile support must be explicit");
+        require(BenchmarkOptions::parse({{"tls", "ktls"}}).get_response_data == "file",
+                "Selecting kTLS implies the immutable file source");
+        for (const Json& invalid : {Json{{"tls", "ktls"}, {"get_response_data", "generated"}},
+                                    Json{{"tls", "on"}, {"get_response_data", "file"}},
+                                    Json{{"tls", "off"}, {"get_response_data", "file"}}}) {
+            bool rejected = false;
+            try {
+                BenchmarkOptions::parse(invalid);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            require(rejected, "Unknown modes and file data outside kTLS must remain invalid");
+        }
+        config.file_get_data = false;
+        config.supports_ktls_sendfile = false;
         config.backend = "openssl";
         Agent open(config, process);
         const auto anonymous = parse_head(
@@ -277,6 +305,25 @@ int main() {
                 "Selected GET data settings reach the run contract");
         require(controller.telemetry(access).at("get_response_data") == "copy",
                 "The native adapter receives the selected payload mode");
+        controller.stop(access);
+        // Legacy memory selections are overridden visibly, never echoed as applied copy mode.
+        for (const auto* mode : {"copy", "shared"}) {
+            const auto body = Json{{"tls", "ktls"}, {"get_response_data", mode}}.dump();
+            const auto reply =
+                open.request(head("POST", "/v1/benchmark/start", "", body.size()), tls, body);
+            require(reply.status == 200, "Legacy kTLS payload selections must not return HTTP 400");
+            const auto file_run = Json::parse(reply.text);
+            require(file_run.at("settings").at("get_response_data") == "file" &&
+                        controller.telemetry(access).at("get_response_data") == "file",
+                    "The native adapter and start response must use the forced file mode");
+            require(file_run.at("warnings") == Json::array({std::string(ktls_file_data_warning)}),
+                    "Overriding a legacy memory mode must return one explicit warning");
+            controller.stop(access);
+        }
+        const auto default_file_run = controller.start({{"tls", "ktls"}});
+        require(default_file_run.at("settings").at("get_response_data") == "file" &&
+                    !default_file_run.contains("warnings"),
+                "The default file selection does not need an override warning");
         controller.stop(access);
         try {
             controller.start({{"get_response_data", "generated"}});

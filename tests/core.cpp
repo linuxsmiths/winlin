@@ -239,6 +239,37 @@ int main() {
         rejects([&] {
             config.validate();
         });
+        // kTLS is one explicit workload: immutable file-backed GETs, never copied PUT/mixed.
+        auto file_config = RunConfig{};
+        file_config.tls = "ktls";
+        rejects([&] {
+            file_config.validate();
+        });
+        file_config.get_response_data = "file";
+        file_config.validate();
+        for (const auto* selected : {"shared", "copy", "file", "generated"}) {
+            std::string mode = selected;
+            const bool overridden = normalize_ktls_get_response_data("ktls", mode);
+            check(overridden == (selected == std::string_view("shared") ||
+                                 selected == std::string_view("copy")),
+                  "Only recognized memory selections require an override warning");
+            check(mode == (overridden ? "file" : selected),
+                  "kTLS normalization must preserve unknown values for rejection");
+            mode = selected;
+            check(!normalize_ktls_get_response_data("on", mode) && mode == selected,
+                  "Ordinary TLS payload selections must not change");
+        }
+        for (const auto* method : {"put", "mixed"}) {
+            file_config.method = method;
+            rejects([&] {
+                file_config.validate();
+            });
+        }
+        file_config.method = "get";
+        file_config.tls = "on";
+        rejects([&] {
+            file_config.validate();
+        });
         // Bucket upper bounds may overestimate percentiles, but never exceed the observed maximum.
         Histogram histogram;
         check(histogram.json()["samples"] == 0, "Empty histogram");

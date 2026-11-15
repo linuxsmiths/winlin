@@ -180,9 +180,15 @@ Failed requests and timeouts must be reported separately from successful-request
 latency.
 
 Linux userspace OpenSSL, Linux kTLS, and Windows Schannel are separate result
-series. For kTLS, the server verifies the direction relevant to the operation:
-TX for GET and RX for PUT. Unsupported activation fails rather than falling back
-silently. Socket kTLS activation does not establish NIC cryptographic offload.
+series. The kTLS series is GET-only and always uses `SSL_sendfile()` with verified
+TX activation, not buffered OpenSSL body writes. Its startup-populated, sealed
+64 MiB memory-backed file supplies the requested hot prefix without per-response
+copying. PUT/mixed is rejected; shared/copy selections are forced to file with a
+warning, and applied settings identify the effective file source. This differs
+from the rotating 1 GiB source and private response buffers used by copy mode;
+comparisons must state both the TLS path and payload-source/memory-work difference.
+Unsupported activation fails rather than falling back silently. Socket kTLS and
+sendfile do not establish NIC cryptographic offload or end-to-end zero-copy.
 
 ### 4.2. Comparison matrix
 
@@ -197,7 +203,7 @@ already been measured.
 | Concurrency | One connection, then a sweep toward the observed capacity plateau |
 | Client/server workers | Record both; sweep independently where needed |
 | Transport | Plain HTTP control comparison, HTTPS, and verified Linux kTLS |
-| GET payload handling | Copy baseline; shared-buffer results labeled separately |
+| GET payload handling | Ordinary TLS: copy baseline, shared labeled separately; kTLS: immutable file only |
 | Duration and repetition | Sustained runs with repeated trials; retain every repetition |
 
 One connection exposes serial request/response behavior; it is not a capacity

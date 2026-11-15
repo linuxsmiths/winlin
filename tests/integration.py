@@ -378,6 +378,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         assert list(capabilities["environment"])[:2] == ["os", "kernel"]
         assert controller.request("POST", "/v1/pair")[0] == 404
         assert capabilities["supported_tls_modes"] == ["on", "off", "ktls"]
+        assert capabilities["ktls_get_sendfile"]
+        assert capabilities["supported_get_response_data_modes"] == ["shared", "copy", "file"]
         assert capabilities["supported_transports"] == ["http", "https"]
         assert [backend["name"] for backend in capabilities["supported_backends"]] == [
             "http", "openssl", "openssl-ktls"]
@@ -614,7 +616,6 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         ktls = subprocess.run(
             [CLIENT, "run", "--target", str(target), "--tls", "ktls", "--server-workers", "2",
              "--method", "get", "--get-size", "64KiB", "--connections", "2", "--workers", "1",
-             "--get-response-data", "copy",
              "--duration", "1", "--requests", "10", "--repetitions", "1",
              "--output", str(output)],
             capture_output=True, text=True, timeout=30,
@@ -622,9 +623,33 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         report = json.loads(output.read_text())
         if ktls.returncode == 0:
             assert report["server_run"]["backend"] == "openssl-ktls"
-            assert report["server_final_telemetry"]["get_response_data"] == "copy"
-            assert report["server_final_telemetry"]["get_response_contiguous_tls_buffer"]
+            telemetry = report["server_final_telemetry"]
+            assert report["configuration"]["get_response_data"] == "file"
+            assert report["server_run"]["get_response_sendfile"]
+            assert telemetry["get_response_data"] == "file"
+            assert telemetry["get_response_file_backend"] == "sealed-memfd"
+            assert not telemetry["get_response_contiguous_tls_buffer"]
+            assert telemetry["get_sendfile_calls"] > 0
+            assert telemetry["get_sendfile_bytes"] >= 10 * 65536
             assert report["server_final_telemetry"]["ktls_tx_connections"] >= 2
+            lease = controller.start(tls="ktls", workers=2)
+            first = Workload(lease)
+            second = Workload(lease)
+            try:
+                # Exercise framing, zero-length bodies, the full file, independent connection
+                # offsets, backpressure, and the absence of a PUT fallback on this backend.
+                assert first.request("GET", "/v1/object?size=0") == (200, b"")
+                status, body = first.request("GET", "/v1/object?size=67108864")
+                assert status == 200 and len(body) == 67108864
+                assert second.request("GET", "/v1/object?size=256") == (200, body[:256])
+                assert first.request("GET", "/v1/object?size=4096") == (200, body[:4096])
+                assert second.request("PUT", "/v1/object", b"x" * 256)[0] == 501
+                exercise_tls_send_backpressure(lease)
+                exercise_abandoned_get(lease)
+            finally:
+                first.connection.close()
+                second.connection.close()
+                controller.finish(lease)
         else:
             assert report["status"] in ("failed", "completed_with_errors")
             assert ("kTLS" in ktls.stderr or "kTLS" in report.get("failure", "") or

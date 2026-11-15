@@ -20,11 +20,12 @@ void on_signal(int) {
 }
 
 // Describe the permanent plain-HTTP control endpoint and the workload backends this host supports.
-// Advertising kTLS does not guarantee activation: each workload connection must verify the
-// requested direction after its TLS handshake.
+// Advertising kTLS does not guarantee activation: each workload connection must verify TX
+// activation after its TLS handshake before serving file-backed GETs.
 AgentConfig linux_config() {
     auto config = AgentConfig::control_config("http");
     config.benchmark_tls_modes = {"on", "off", "ktls"};
+    config.supports_ktls_sendfile = true;
     config.supported_ciphers = supported_tls_ciphers();
     config.supported_backends = {
         {{"name", "http"}, {"transport", "http"}, {"tls_mode", "off"}},
@@ -32,9 +33,11 @@ AgentConfig linux_config() {
         {{"name", "openssl-ktls"},
          {"transport", "https"},
          {"tls_mode", "ktls"},
+         {"methods", {"get"}},
+         {"get_response_data_modes", {"file"}},
          {"availability", "conditional"},
          {"requirement",
-          "Kernel/OpenSSL support and verified activation for the requested direction"}}};
+          "Verified kTLS TX and SSL_sendfile with an immutable memory-backed source; GET only"}}};
     config.environment = environment();
     config.environment["workload_tcp_nodelay"] = true;
     config.environment["workload_tcp_cork"] = false;
@@ -55,13 +58,14 @@ AgentConfig workload_config(const BenchmarkOptions& options) {
     config.cipher = options.cipher;
     config.workers = options.workers;
     config.shared_get_data = options.get_response_data == "shared";
-    config.contiguous_tls_get = config.tls && !config.shared_get_data;
+    config.file_get_data = options.get_response_data == "file";
+    config.contiguous_tls_get = config.tls && !config.shared_get_data && !config.file_get_data;
     return config;
 }
 
 // Hold the configuration and shared resources for either the control endpoint or one workload.
 // Agent supplies the common Linux/Windows routing, request validation, and telemetry counters.
-// This class adds the Linux TLS context and a reusable random payload for GET responses.
+// This class adds the Linux TLS context and a reusable memory or sealed-file GET source.
 //
 // Workload workers read the same payload instead of generating bytes for every request. The TLS
 // context is configured before workers start; each accepted connection creates its own TLS session.
@@ -70,6 +74,7 @@ AgentConfig workload_config(const BenchmarkOptions& options) {
 struct Server : Agent {
     Context tls;
     std::vector<char> payload;
+    Fd get_file;
     bool ktls{};
     std::atomic<bool> stop{};
     mutable std::mutex network_mutex;
@@ -107,6 +112,12 @@ struct Server : Agent {
         if (!payload.empty() &&
             RAND_bytes(reinterpret_cast<unsigned char*>(payload.data()), payload.size()) != 1) {
             throw tls_error("Cannot generate reusable payload");
+        }
+        if (config.file_get_data) {
+            get_file = sealed_payload_file(payload);
+            // Release the generation vector before listeners start. Only the file remains an
+            // accessible source, although the allocator may retain freed staging memory.
+            std::vector<char>().swap(payload);
         }
     }
 
@@ -224,8 +235,8 @@ struct Session {
     }
 
     // Prepare the response but do not send it yet. Keep JSON text and serialized headers in this
-    // session until pump() finishes writing; GET bodies use shared or response-private payload
-    // storage.
+    // session until pump() finishes writing; GET bodies use shared/private memory or the server's
+    // immutable file, whose lifetime extends beyond every session.
     void respond(int status, std::string body = {}, bool object = false, std::size_t size = 0) {
         text_body = std::move(body);
         object_response = object;
@@ -252,7 +263,7 @@ struct Session {
         // Only copied TLS GETs own contiguous header/body storage. Plain HTTP and shared GETs
         // retain separate submissions, so the optimization adds no per-response shared-body copy.
         combined_response = object_response && server.config.contiguous_tls_get;
-        if (object_response) {
+        if (object_response && !server.config.file_get_data) {
             const auto prefix = combined_response ? std::string_view(output) : std::string_view{};
             get_data = get_payload.prepare(server.payload, body_size, server.config.shared_get_data,
                                            prefix);
@@ -366,8 +377,21 @@ struct Session {
                 const auto prefix_size = combined_response ? output.size() : 0;
                 const auto transfer_size = prefix_size + body_size;
                 if (offset < transfer_size) {
-                    const char* data = object_response ? get_data - prefix_size : text_body.data();
-                    const int bytes = socket.write(data + offset, transfer_size - offset);
+                    std::size_t bytes{};
+                    if (object_response && server.config.file_get_data) {
+                        // Keep the source immutable and the offset local to this connection;
+                        // a blocked or failed file send must never fall back to buffer writes.
+                        ++server.get_sendfile_calls;
+                        bytes = socket.send_file(server.get_file.value, static_cast<off_t>(offset),
+                                                 transfer_size - offset);
+                        if (bytes) {
+                            server.get_sendfile_bytes += bytes;
+                        }
+                    } else {
+                        const char* data =
+                            object_response ? get_data - prefix_size : text_body.data();
+                        bytes = socket.write(data + offset, transfer_size - offset);
+                    }
                     if (!bytes) {
                         return true;
                     }
@@ -673,8 +697,8 @@ void serve(Server& server, Fd listener_fd, const std::function<void()>& ready = 
 }
 
 // Own the temporary Linux workload created by a control-channel benchmark-start command.
-// HTTP, OpenSSL HTTPS, and kTLS all use the same Server/Session event loop; only TLS configuration
-// differs. The requested worker count and listeners are created for this run, not changed mid-run.
+// HTTP, OpenSSL HTTPS, and kTLS use the same Server/Session event loop. kTLS additionally selects
+// the immutable file source and sendfile body path. Workers/listeners are fixed for this run.
 //
 // Construction waits until every worker has registered its listener, or startup has failed.
 // Worker failures are retained for telemetry requests and stop the workload. Destruction signals
@@ -743,6 +767,7 @@ public:
     // Return the bound endpoint and selected backend for the client's workload connections.
     Json describe() const override {
         return {{"port", port_},
+                {"get_response_sendfile", server_.config.file_get_data},
                 {"transport", server_.config.tls ? "https" : "http"},
                 {"backend", server_.config.backend}};
     }

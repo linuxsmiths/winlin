@@ -453,7 +453,8 @@ struct LoadConnection {
     //                  that may have been read into buffer.
     // header_search: Offset at which the next search for the header delimiter begins.
     //                Revisit up to three bytes so a delimiter split across reads is found,
-    //                without searching the entire accumulated header again. To be precise this is the next search offset.
+    //                without searching the entire accumulated header again. To be precise this is
+    //                the next search offset.
     std::size_t header_received{}, header_search{};
     Clock::time_point started;
 
@@ -1127,7 +1128,8 @@ RunConfig configuration(const Args& args) {
     config.cipher = args.get("--cipher", config.cipher);
     config.server_workers = number(args.get("--server-workers", "8"), 256);
     config.method = lower(args.get("--method", "get"));
-    config.get_response_data = args.get("--get-response-data", config.get_response_data);
+    config.get_response_data =
+        args.get("--get-response-data", config.tls == "ktls" ? "file" : config.get_response_data);
     config.get_size = object_size(args.get("--get-size", "4KiB"));
     config.put_size = object_size(args.get("--put-size", "4KiB"));
     config.get_percent = number(args.get("--get-percent", "50"), 100);
@@ -1142,7 +1144,11 @@ RunConfig configuration(const Args& args) {
     config.repetitions = number(args.get("--repetitions", "3"), 1000);
     config.requests = number(args.get("--requests", "0"));
     config.timeout = seconds(args.get("--timeout", "10"), 3600);
+    const bool forced_file = normalize_ktls_get_response_data(config.tls, config.get_response_data);
     config.validate();
+    if (forced_file) {
+        log_warning(ktls_file_data_warning);
+    }
     return config;
 }
 
@@ -1479,6 +1485,10 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
     if (std::find(modes.begin(), modes.end(), config.tls) == modes.end()) {
         throw std::invalid_argument("Server does not support requested TLS mode: " + config.tls);
     }
+    if (config.tls == "ktls" && !capabilities.value("ktls_get_sendfile", false)) {
+        throw std::runtime_error(
+            "Server kTLS sendfile capabilities are outdated; update and restart the server");
+    }
     const auto data_modes =
         capabilities.at("supported_get_response_data_modes").get<std::vector<std::string>>();
     if (std::find(data_modes.begin(), data_modes.end(), config.get_response_data) ==
@@ -1537,6 +1547,12 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
             "when available. No per-request RNG is used. Buffers "
             "retain their largest size; first use/growth includes allocation and initialization "
             "costs, so use warmup for steady-state comparisons.");
+    } else if (config.get_response_data == "file") {
+        notes.emplace_back(
+            "kTLS GET uses SSL_sendfile from the hot prefix of a sealed, startup-populated "
+            "64 MiB memfd, without per-response copying. This differs from copy-mode memory "
+            "work and does not establish hardware TLS offload or end-to-end zero-copy. "
+            "File pages may still be subject to OS memory pressure.");
     }
     const auto telemetry = capabilities.at("telemetry");
     const auto unavailable = telemetry.value("unavailable_metrics", std::vector<std::string>{});
@@ -1608,14 +1624,22 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
             (workload_tls && applied.at("cipher") != config.cipher)) {
             throw std::runtime_error("Server did not apply the requested benchmark settings");
         }
+        if (config.tls == "ktls" && !started.value("get_response_sendfile", false)) {
+            throw std::runtime_error("Server did not apply the required kTLS sendfile path");
+        }
         report["server_run"] = applied;
         report["server_run"]["backend"] = started.at("backend");
         report["server_run"]["transport"] = started.at("transport");
+        report["server_run"]["get_response_sendfile"] =
+            started.value("get_response_sendfile", false);
         report["server_configuration"] = started.at("settings");
         report["workload_endpoint"] = {
             {"host", target.host}, {"port", workload.port}, {"transport", started.at("transport")}};
         if (output) {
             write_private(*output, report, false);
+        }
+        if (config.tls == "ktls") {
+            std::cout << "kTLS GET | SSL_sendfile | immutable 64 MiB memfd | no response copy\n";
         }
         std::cout << "Run  requests/s     p50(us)     p90(us)     p99(us)   errors    Net Gbps"
                      "   Client CPU(%)   Avg CPU(%)       Ref CPIO\n";
@@ -1865,13 +1889,22 @@ void interactive(std::string_view executable) {
                     config.cipher = prompt("Benchmark TLS 1.3 cipher", config.cipher);
                 }
                 config.server_workers = number(prompt("Server workers (1-256)", "8"), 256);
-                config.method = lower(prompt("Method: get / put / mixed", "get"));
+                if (config.tls == "ktls") {
+                    config.method = "get";
+                    config.get_response_data = "file";
+                    std::cout << "kTLS selects GET with SSL_sendfile from an immutable file; "
+                                 "PUT/mixed and response copying are unsupported.\n";
+                } else {
+                    config.method = lower(prompt("Method: get / put / mixed", "get"));
+                }
                 std::cout << "Size presets: 256B, 512B, 1KiB, 4KiB, 8KiB, 16KiB, 64KiB, 256KiB, "
                              "1MiB, 4MiB\n";
                 if (config.method == "get" || config.method == "mixed") {
                     config.get_size = object_size(prompt("GET size", "4KiB"));
-                    config.get_response_data = lower(
-                        trim(prompt("GET response data: shared / copy", config.get_response_data)));
+                    if (config.tls != "ktls") {
+                        config.get_response_data = lower(trim(
+                            prompt("GET response data: shared / copy", config.get_response_data)));
+                    }
                 }
                 if (config.method == "put" || config.method == "mixed") {
                     config.put_size = object_size(prompt("PUT size", "4KiB"));
@@ -2026,8 +2059,10 @@ int main(int argc, char** argv) {
                    "winlin inspect --target FILE\n"
                    "winlin run --target FILE [--method get|put|mixed] [--get-size 4KiB]\n"
                    "           [--benchmark https] (existing network default)\n"
-                   "           [--get-response-data shared|copy] (default: copy)\n"
+                   "           [--get-response-data shared|copy|file] (default: copy; ktls: file)\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
+                   "           ktls requires GET + SSL_sendfile; forces file data with a warning\n"
+                   "           if shared/copy was selected; PUT/mixed are unsupported.\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"

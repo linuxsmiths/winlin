@@ -587,10 +587,10 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.respond({
                 "get_response_data": self.server.current_get_response_data,
                 "get_response_source_access": ("hot-prefix" if self.server.current_get_response_data
-                                               == "shared" else "rotating-objects"),
+                                               in ("shared", "file") else "rotating-objects"),
                 "get_response_source_pool_bytes": (64 * 1024 * 1024
                                                   if self.server.current_get_response_data
-                                                  == "shared" else 1024 * 1024 * 1024),
+                                                  in ("shared", "file") else 1024 * 1024 * 1024),
                 "process": {
                     "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
                     "user_cpu_seconds": self.server.telemetry_samples * 0.000123456789,
@@ -634,7 +634,8 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                 self.respond({"error": "fixture discovery failed"}, status=503)
                 return
             payload = {
-                "supported_tls_modes": ["on", "off"],
+                "supported_tls_modes": ["on", "off", "ktls"],
+                "ktls_get_sendfile": self.server.ktls_sendfile,
                 "supported_get_response_data_modes": self.server.get_response_data_modes,
                 "supported_ciphers": ["TLS_AES_128_GCM_SHA256"],
                 "server_workers": {"min": 1, "max": 256},
@@ -662,11 +663,12 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                     run_id = f"{self.server.run_sequence:064x}"
                     self.server.active_run = run_id
             assert "max_connections" not in settings
-            assert settings["get_response_data"] in ("shared", "copy")
+            assert settings["get_response_data"] in ("shared", "copy", "file")
             self.server.current_get_response_data = settings["get_response_data"]
             if settings["tls"] == "off":
                 settings["cipher"] = None
             data = self.server.plain if settings["tls"] == "off" else self.server.secure
+            data.ktls_sendfile = settings["tls"] == "ktls"
             self.server.current_workload = data
             self.server.telemetry_in_run = 0
             data.first_warmup_request = None
@@ -683,6 +685,8 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                 "port": self.server.workload_port_override or data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
                 "backend": "test",
+                "get_response_sendfile": (settings["tls"] == "ktls" and
+                                           not self.server.misreport_sendfile),
                 "settings": applied,
             })
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
@@ -743,6 +747,8 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             return
         self.send_response(self.server.response_status if status is None else status)
         self.send_header("Content-Length", str(len(body)))
+        if self.server.is_workload and self.server.ktls_sendfile:
+            self.send_header("X-Winlin-Ktls-Tx", "1")
         self.end_headers()
         self.wfile.write(body)
 
@@ -787,6 +793,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.host_cpu_available = True
         endpoint.network_available = True
         endpoint.get_response_data_modes = ["shared", "copy"]
+        endpoint.ktls_sendfile = False
         endpoint.current_get_response_data = "shared"
         endpoint.copy_working_set_bytes = 1024 * 1024 * 1024
     server.authorizations = []
@@ -794,6 +801,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     server.fail_workload = False
     server.misreport_workers = False
     server.misreport_get_response_data = False
+    server.misreport_sendfile = False
     server.telemetry_in_run = 0
     server.warmup_samples = []
     server.measurement_marker = None
@@ -863,12 +871,17 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             ("get", "on", "shared", "512\nshared\n", 2, 0),
             ("put", "off", "copy", "256\n", 0, 2),
             ("mixed", "on", "copy", "512\ncopy\n256\n50\n", 1, 1),
+            ("get", "ktls", "file", "512\n", 2, 0),
         ):
+            server.ktls_sendfile = tls == "ktls"
+            server.get_response_data_modes = (["shared", "copy", "file"] if tls == "ktls"
+                                              else ["shared", "copy"])
             output = directory / f"menu-{method}-{tls}-{data_mode} 'quoted' $literal.json"
             tls_input = f"{tls}\n" + ("\n" if tls != "off" else "")
+            method_input = "" if tls == "ktls" else f"{method}\n"
             result = subprocess.run(
                 [str(menu_client)],
-                input=(f"3\n1\n{tls_input}1\n{method}\n{size_input}"
+                input=(f"3\n1\n{tls_input}1\n{method_input}{size_input}"
                        f"1\n1\n0.12345678912345678\n2\n1\nyes\n{output}\n0\n"),
                 capture_output=True, text=True, timeout=15,
                 env=menu_environment,
@@ -877,7 +890,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert result.stdout.index("Save detailed telemetry?") < result.stdout.index("Result file")
             assert ("GET size" in result.stdout) == (method != "put")
             assert ("PUT size" in result.stdout) == (method != "get")
-            assert ("GET response data:" in result.stdout) == (method != "put")
+            assert ("GET response data:" in result.stdout) == (method != "put" and tls != "ktls")
             assert "Warmup seconds" not in result.stdout
             report = json.loads(output.read_text())
             assert report["status"] == "completed", report
@@ -922,6 +935,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert replay_report["results"][0]["put_completed"] == expected_puts
             assert "Noninteractive command:" not in replay.stdout
 
+        server.ktls_sendfile = False
+        server.get_response_data_modes = ["shared", "copy"]
         benchmark = [
             client, "run", "--target", str(target), "--get-size", "256",
             "--connections", "1", "--workers", "1",
@@ -1057,7 +1072,60 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 1
-        assert "GET response data mode must be shared or copy" in result.stderr
+        assert "GET response data mode must be shared, copy, or file" in result.stderr
+        queries_before = server.capability_queries
+        for parameters, message in (
+            (["--tls", "ktls", "--method", "put"], "supports GET only"),
+            (["--tls", "ktls", "--method", "mixed"], "supports GET only"),
+            (["--get-response-data", "file"], "requires kTLS"),
+        ):
+            result = subprocess.run(
+                [*benchmark, *parameters], capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1 and message in result.stderr, result.stdout + result.stderr
+        assert server.capability_queries == queries_before
+
+        # A previous kTLS server cannot be silently used as a userspace-buffer fallback.
+        result = subprocess.run(
+            [*benchmark, "--tls", "ktls"], capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "kTLS sendfile capabilities are outdated" in result.stderr
+        server.ktls_sendfile = True
+        server.get_response_data_modes.append("file")
+        ktls_output = directory / "ktls-file.json"
+        result = subprocess.run(
+            [*benchmark, "--tls", "ktls", "--output", str(ktls_output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(ktls_output.read_text())
+        assert report["configuration"]["get_response_data"] == "file"
+        assert report["server_run"]["get_response_sendfile"]
+        assert "SSL_sendfile" in result.stdout
+        assert any("sealed" in note and "memfd" in note for note in report["notes"])
+        for mode in ("copy", "shared", "file"):
+            normalized_output = directory / f"ktls-normalized-{mode}.json"
+            result = subprocess.run(
+                [*benchmark, "--tls", "ktls", "--get-response-data", mode,
+                 "--output", str(normalized_output)],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stderr.count("forcing GET response data to 'file'") == (mode != "file")
+            normalized = json.loads(normalized_output.read_text())
+            assert normalized["configuration"]["get_response_data"] == "file"
+            assert normalized["server_configuration"]["get_response_data"] == "file"
+            assert normalized["server_run"]["get_response_sendfile"]
+        server.misreport_sendfile = True
+        stops_before = server.stop_requests
+        result = subprocess.run(
+            [*benchmark, "--tls", "ktls"], capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "required kTLS sendfile path" in result.stderr
+        assert server.stop_requests == stops_before + 1
+        server.misreport_sendfile = False
+        server.ktls_sendfile = False
+        server.get_response_data_modes = ["shared", "copy"]
         server.get_response_data_modes = ["shared"]
         result = subprocess.run(
             [*benchmark, "--get-response-data", "copy"],

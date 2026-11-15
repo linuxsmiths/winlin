@@ -14,8 +14,10 @@ Winlin has native HTTP/HTTPS workload implementations for Linux (TCP, OpenSSL an
 kTLS) and Windows (HTTP.sys/Schannel), with an interactive/noninteractive Linux client,
 target registration and discovery, GET/PUT workloads, process telemetry, and JSON results.
 Both servers share agent routing, run leases, capabilities, and workload
-semantics. The kTLS backend verifies activation per direction and refuses
-userspace fallback.
+semantics. The Linux kTLS backend is GET-only: `--tls ktls` requires verified TX
+activation and `SSL_sendfile()` from an immutable, startup-populated memory-backed
+file. It rejects PUT/mixed and overrides shared/copy payload selections with a
+warning; applied settings and reports always identify file mode.
 A plain-HTTP controller configures one exclusive run at a time: clients select
 workload TLS on/off, kTLS, cipher, and server workers without
 restarting the server. Compact terminal tables include reference cycles per I/O,

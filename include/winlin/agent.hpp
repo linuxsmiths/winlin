@@ -27,6 +27,8 @@ struct AgentConfig {
     unsigned workers{};
     bool connection_metrics{true};
     bool shared_get_data{true};
+    bool file_get_data{};
+    bool supports_ktls_sendfile{};
     // Describe application-side TLS staging, not the native transport's internal record packing.
     bool contiguous_tls_get{};
     Json environment;
@@ -35,13 +37,14 @@ struct AgentConfig {
         "kernel_profiles", "network_counters", "numa_topology"};
     std::string process_cpu_scope{"server process only"};
 
-    // Control has no object source. Shared workloads retain their original payload allocation;
+    // Control has no object source. File workloads use an immutable, hot-prefix 64 MiB source.
+    // Shared workloads retain their original payload allocation;
     // copied workloads populate a fixed, worker-shared 1 GiB source before accepting requests.
     std::size_t get_source_pool_size() const {
         if (role == Role::control) {
             return 0;
         }
-        return shared_get_data ? max_object_size : copy_get_working_set_size;
+        return shared_get_data || file_get_data ? max_object_size : copy_get_working_set_size;
     }
 
     // Start only a single plain-HTTP control worker. Workload adapters replace the worker count
@@ -176,6 +179,7 @@ public:
     BenchmarkController* controller{};
     std::atomic<std::uint64_t> connections{}, handshakes{}, tx_ktls{}, rx_ktls{};
     std::atomic<std::uint64_t> gets{}, puts{}, get_bytes{}, put_bytes{}, active{};
+    std::atomic<std::uint64_t> get_sendfile_calls{}, get_sendfile_bytes{};
 
     // Workload adapters must supply the active lease ID; control needs no saved client state.
     Agent(AgentConfig settings, std::function<Json()> process_usage, std::string run_id = {},
@@ -191,7 +195,7 @@ public:
     // Reserve a stream only when a copy-mode connection/request context is created. Warm GETs
     // use private cursors, not a new contended atomic increment on every response.
     std::uint64_t reserve_get_payload_stream() {
-        if (config.shared_get_data) {
+        if (config.shared_get_data || config.file_get_data) {
             return 0;
         }
         return next_get_payload_stream_.fetch_add(1, std::memory_order_relaxed);
@@ -205,11 +209,17 @@ public:
             {"host", host_usage_ ? host_usage_() : Json::object()},
             {"network", network_usage_ ? network_usage_() : Json::object()},
             {"process_cpu_scope", config.process_cpu_scope},
-            {"get_response_data", config.shared_get_data ? "shared" : "copy"},
+            {"get_response_data", config.file_get_data     ? "file"
+                                  : config.shared_get_data ? "shared"
+                                                           : "copy"},
+            {"get_response_sendfile", config.file_get_data},
+            {"get_response_file_backend",
+             config.file_get_data ? Json("sealed-memfd") : Json(nullptr)},
             {"get_response_source_access",
              config.role == AgentConfig::Role::control
                  ? Json(nullptr)
-                 : Json(config.shared_get_data ? "hot-prefix" : "rotating-objects")},
+                 : Json(config.shared_get_data || config.file_get_data ? "hot-prefix"
+                                                                       : "rotating-objects")},
             {"get_response_source_pool_bytes", config.get_source_pool_size()},
             {"get_response_contiguous_tls_buffer", config.contiguous_tls_get},
             {"accepted_connections",
@@ -221,6 +231,8 @@ public:
             {"get_completed", gets.load()},
             {"put_completed", puts.load()},
             {"get_bytes", get_bytes.load()},
+            {"get_sendfile_calls", get_sendfile_calls.load()},
+            {"get_sendfile_bytes", get_sendfile_bytes.load()},
             {"put_bytes", put_bytes.load()}};
     }
 
@@ -275,6 +287,10 @@ public:
                       {"network", network},
                       {"scope", "whole-server CPU, selected-interface network and separate process "
                                 "telemetry; one active benchmark"}}}};
+        if (config.supports_ktls_sendfile) {
+            result["supported_get_response_data_modes"].push_back("file");
+        }
+        result["ktls_get_sendfile"] = config.supports_ktls_sendfile;
         return result;
     }
 
@@ -349,8 +365,8 @@ public:
                 reply.size = static_cast<std::size_t>(
                     number(std::string_view(path).substr(16), max_object_size));
             } else if (method == "PUT" && path == "/v1/object" && head.content_length) {
-                if (config.backend == "openssl-ktls" && !connection.ktls_rx) {
-                    return AgentReply::error(501, "kTLS RX is not active; refusing fallback");
+                if (config.backend == "openssl-ktls") {
+                    return AgentReply::error(501, "kTLS sendfile supports GET only");
                 }
                 // PUT benchmark object, bounded to max_object_size.
                 // We must consume the body before replying.

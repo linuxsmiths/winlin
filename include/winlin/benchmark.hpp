@@ -22,9 +22,10 @@ struct BenchmarkOptions {
     std::size_t region_size{64 * 1024 * 1024};
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
     std::string get_response_data{"copy"};
+    bool forced_ktls_file_data{};
     unsigned workers{8}, lease_seconds{300};
 
-    // Reject unknown or out-of-range settings rather than silently changing the requested run.
+    // Reject unknown/out-of-range settings. kTLS forces its mandatory file source with a warning.
     static BenchmarkOptions parse(const Json& value) {
         if (!value.is_object()) {
             throw std::invalid_argument("Benchmark settings must be a JSON object");
@@ -61,7 +62,9 @@ struct BenchmarkOptions {
         result.benchmark = benchmark;
         result.tls = value.value("tls", result.tls);
         result.cipher = value.value("cipher", result.cipher);
-        result.get_response_data = value.value("get_response_data", result.get_response_data);
+        result.get_response_data =
+            value.value("get_response_data",
+                        result.tls == "ktls" ? std::string("file") : result.get_response_data);
         auto bounded = [&](const char* key, unsigned fallback, unsigned maximum) {
             if (value.contains(key) && !value.at(key).is_number_integer()) {
                 throw std::invalid_argument(std::string(key) + " must be an integer");
@@ -135,9 +138,15 @@ struct BenchmarkOptions {
         if (result.tls != "on" && result.tls != "off" && result.tls != "ktls") {
             throw std::invalid_argument("TLS mode must be on, off, or ktls");
         }
-        if (result.get_response_data != "shared" && result.get_response_data != "copy") {
-            throw std::invalid_argument("GET response data mode must be shared or copy");
+        if (result.get_response_data == "file" && result.tls != "ktls") {
+            throw std::invalid_argument("File-backed GET data requires kTLS");
         }
+        if (result.get_response_data != "shared" && result.get_response_data != "copy" &&
+            result.get_response_data != "file") {
+            throw std::invalid_argument("GET response data mode must be shared, copy, or file");
+        }
+        result.forced_ktls_file_data =
+            normalize_ktls_get_response_data(result.tls, result.get_response_data);
         if (result.tls == "off") {
             result.cipher.clear();
         }
@@ -147,9 +156,8 @@ struct BenchmarkOptions {
     // Return the settings actually used by the workload adapter, never a credential.
     Json json() const {
         if (benchmark != "https") {
-            Json result{{"benchmark", benchmark},
-                        {"repetitions", repetitions},
-                        {"workers", workers}};
+            Json result{
+                {"benchmark", benchmark}, {"repetitions", repetitions}, {"workers", workers}};
             if (benchmark != "page-fault") {
                 result["duration"] = duration;
             } else {
@@ -264,6 +272,10 @@ public:
         auto instance = factory_(options, id);
         auto result = instance->describe();
         result["settings"] = options.json();
+        if (options.forced_ktls_file_data) {
+            result["warnings"] = Json::array({std::string(ktls_file_data_warning)});
+            log_warning(ktls_file_data_warning);
+        }
         result["run_id"] = id;
         id_ = std::move(id);
         active_ = std::move(instance);

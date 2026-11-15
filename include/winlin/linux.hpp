@@ -25,6 +25,7 @@
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -165,6 +166,35 @@ inline Context context(bool server, const std::string& cipher, bool ktls = false
         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, nullptr);
     }
     return ctx;
+}
+
+// Populate and seal a memory-backed file before measurement. No writable aliases are retained,
+// so asynchronous transmission and retransmission always observe the same bytes. The returned
+// descriptor owns the source until every workload connection has been destroyed.
+inline Fd sealed_payload_file(const std::vector<char>& data) {
+    Fd file(memfd_create("winlin-get", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (file.value < 0) {
+        throw system_error("Create kTLS GET source file");
+    }
+    std::size_t offset{};
+    while (offset < data.size()) {
+        const auto written = ::write(file.value, data.data() + offset, data.size() - offset);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw system_error("Populate kTLS GET source file");
+        }
+        if (!written) {
+            throw std::runtime_error("Populating kTLS GET source file made no progress");
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (fcntl(file.value, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) !=
+        0) {
+        throw system_error("Seal immutable kTLS GET source file");
+    }
+    return file;
 }
 
 // Return the SHA-256 fingerprint of the peer certificate, or throw if no certificate was sent.
@@ -322,6 +352,32 @@ struct StreamSocket {
         const int result =
             SSL_write(ssl.get(), buffer, static_cast<int>(std::min<std::size_t>(length, 16384)));
         return outcome(result) ? result : 0;
+    }
+
+    // Submit immutable file bytes only through verified TX kTLS. Positive results advance this
+    // connection's explicit offset; zero means socket backpressure, never an accepted empty send.
+    // The caller must keep the source open and retry the same range after a readiness wait.
+    std::size_t send_file(int file, off_t offset, std::size_t length) {
+        if (!ssl || !BIO_get_ktls_send(SSL_get_wbio(ssl.get()))) {
+            throw std::runtime_error("kTLS TX is not active; refusing sendfile fallback");
+        }
+        if (!length) {
+            throw std::invalid_argument("kTLS sendfile requires a nonempty file range");
+        }
+        if (ERR_peek_error() != 0) {
+            ERR_clear_error();
+        }
+        errno = 0;
+        const auto result = SSL_sendfile(ssl.get(), file, offset, length, 0);
+        if (result > 0) {
+            want = EPOLLOUT;
+            return static_cast<std::size_t>(result);
+        }
+        if (!result) {
+            throw std::runtime_error("kTLS sendfile reached unexpected source EOF");
+        }
+        outcome(static_cast<int>(result));
+        return 0;
     }
 
     // Keep retry and EOF semantics identical for HTTP and HTTPS state machines.

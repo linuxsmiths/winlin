@@ -28,6 +28,8 @@ using Json = nlohmann::ordered_json;
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t max_object_size = 64 * 1024 * 1024;
 constexpr std::size_t copy_get_working_set_size = std::size_t{1024} * 1024 * 1024;
+constexpr std::string_view ktls_file_data_warning =
+    "kTLS requires SSL_sendfile; forcing GET response data to 'file' (no per-response copying).";
 constexpr std::size_t max_header_size = 16384;
 constexpr unsigned server_connection_limit = 65536;
 // This pin identifies the deliberately public test fixture, not an authenticated server identity.
@@ -39,6 +41,16 @@ constexpr std::array<std::size_t, 10> size_presets{256,   512,   1024,   4096,  
 // Keep worker diagnostics together and off stdout, which also carries JSON control output.
 inline void log_warning(std::string_view message) {
     std::osyncstream(std::cerr) << "winlin: WARNING: " << message << '\n';
+}
+
+// Normalize recognized memory modes for kTLS, leaving unknown values for ordinary validation.
+// Return whether an override needs a warning; reports must contain the effective file setting.
+inline bool normalize_ktls_get_response_data(std::string_view tls, std::string& mode) {
+    if (tls != "ktls" || (mode != "copy" && mode != "shared")) {
+        return false;
+    }
+    mode = "file";
+    return true;
 }
 
 // Require the entire argument to be an unsigned integer; partial parses hide configuration errors.
@@ -469,7 +481,7 @@ struct RunConfig {
     unsigned server_workers{8};
     // The HTTP method to benchmark, or "mixed" for a mix of GET and PUT.
     std::string method{"get"};
-    // Select direct shared payload sends or a fresh copy into reusable response-private storage.
+    // Select shared/private memory, or the immutable file source required by kTLS sendfile.
     std::string get_response_data{"copy"};
     // The size of the GET response and PUT request bodies, in bytes.
     std::size_t get_size{4096};
@@ -497,8 +509,19 @@ struct RunConfig {
         if (method != "get" && method != "put" && method != "mixed") {
             throw std::invalid_argument("Method must be get, put or mixed");
         }
-        if (get_response_data != "shared" && get_response_data != "copy") {
-            throw std::invalid_argument("GET response data mode must be shared or copy");
+        if (tls == "ktls" && method != "get") {
+            throw std::invalid_argument(
+                "kTLS sendfile supports GET only; PUT/mixed are unsupported");
+        }
+        if (tls == "ktls" && get_response_data != "file") {
+            throw std::invalid_argument("kTLS requires file-backed GET data and sendfile");
+        }
+        if (get_response_data == "file" && tls != "ktls") {
+            throw std::invalid_argument("File-backed GET data requires kTLS");
+        }
+        if (get_response_data != "shared" && get_response_data != "copy" &&
+            get_response_data != "file") {
+            throw std::invalid_argument("GET response data mode must be shared, copy, or file");
         }
         if (!connections || connections > 16384 || !workers || workers > 256 ||
             workers > connections || !repetitions || repetitions > 1000 || duration <= 0 ||
