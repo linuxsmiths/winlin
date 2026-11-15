@@ -15,6 +15,9 @@ winlin run --target windows.json --benchmark syscall \
 winlin run --target linux.json --benchmark allocation \
   --allocation-size 4KiB --live-allocations 16 --memory-touch none \
   --server-workers 1 --duration 30 --repetitions 3
+
+winlin run --target linux.json --benchmark page-fault \
+  --region-size 64MiB --server-cpu 2 --repetitions 3
 ```
 
 Use `--output FILE` for a detailed JSON report; otherwise only console output is
@@ -24,6 +27,32 @@ continues to select their HTTP workload. Local benchmarks reject network-only
 options, including TLS, connections, client workers, and GET/PUT sizes.
 
 ## Workload definitions
+
+**Page-fault:** one fresh anonymous/private region per repetition, sized by
+`--region-size` (default 64 MiB, maximum 1024 MiB). Region size must be a multiple
+of the native base page size. A single pinned worker writes one volatile byte
+per page exactly once. One operation means one first-touch base page, not one
+inferred OS fault. This is a fixed-work pass and rejects `--duration`.
+
+Reservation and access enablement/commit finish before both CPU and wall-time
+boundaries. Workers park after touching, counters are sampled, and only then is
+the region released. One untimed warmup region precedes the repetitions; every
+measured repetition still uses a fresh region. No revisit or allocation/free
+work is included in cycles/page.
+
+Linux uses private anonymous `mmap`, `mprotect`, and `MADV_NOHUGEPAGE` on this
+mapping only; there is no global THP change or eager page population. Windows
+uses ordinary-page `VirtualAlloc` reservation and commit. Linux access enablement
+is not equivalent to Windows commit charging, but neither setup is measured.
+First touch includes demand-zero handling, page-table work, and a byte store.
+The native page size and backend are reported; large/huge pages are not used.
+
+Observed fault deltas cover the server process, including control and sampling
+activity. Linux distinguishes minor/major faults; Windows provides a total with
+minor/major unavailable. Page writes and observed faults need not match one for
+one. Reference cycles use whole-server CPU samples and include boundary sampling
+and background work. Short passes can be dominated by CPU-counter granularity;
+prefer larger regions on otherwise idle, comparable hosts.
 
 **Context-switch:** exactly two threads are pinned to the same logical CPU and
 exchange a token using a mutex and condition variable, without a userspace spin
@@ -64,7 +93,8 @@ Windows CPU indices are flattened across processor groups; Linux indices use
 native logical CPU numbering. The actual selected CPU is reported. Allocation
 workers are not pinned in this first version.
 
-A fixed two-second warmup precedes all repetitions. Workers are created for each
+A fixed two-second warmup precedes repetitions, except for page-fault's single
+untimed region. Workers are created for each
 stage outside sampling, so per-thread allocator caches can be cold even after
 global warmup. Setup, joins, and partial-allocation cleanup are outside measurement
 boundaries; workers park while final CPU counters are captured.

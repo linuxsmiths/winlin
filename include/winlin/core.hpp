@@ -54,7 +54,7 @@ inline std::uint64_t number(std::string_view text,
 }
 
 // Bound the value before multiplication so oversized inputs cannot wrap into a valid object size.
-inline std::size_t object_size(std::string text) {
+inline std::size_t object_size(std::string text, std::size_t maximum = max_object_size) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
     });
@@ -69,7 +69,7 @@ inline std::size_t object_size(std::string text) {
     } else if (!unit.empty() && unit != "b") {
         throw std::invalid_argument("Use bytes, KiB or MiB");
     }
-    return static_cast<std::size_t>(number(digits, max_object_size / multiplier) * multiplier);
+    return static_cast<std::size_t>(number(digits, maximum / multiplier) * multiplier);
 }
 
 // Reject infinities and NaNs as well as negative times before they reach deadline arithmetic.

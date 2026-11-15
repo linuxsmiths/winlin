@@ -110,6 +110,158 @@ void test_failures() {
     LocalBenchmark cancelled(
         BenchmarkOptions::parse({{"benchmark", "context-switch"}, {"duration", 30}}), native);
 }
+
+// Each region is untouched until the measured pass and released only after final samples.
+// Validate the actual writes at release, plus page/fault counts and failure cleanup.
+void test_page_faults() {
+    auto native = native_operations();
+    const auto reserve = native.reserve_commit;
+    const auto release = native.release_region;
+    const auto host = native.host;
+    unsigned regions{}, releases{}, samples{};
+    bool allocated{};
+    native.reserve_commit = [&](std::size_t size) {
+        require(!allocated, "A fresh region must replace the released previous one");
+        auto* region = reserve(size);
+        allocated = true;
+        ++regions;
+        return region;
+    };
+    native.release_region = [&](void* region, std::size_t size) {
+        auto* bytes = static_cast<volatile unsigned char*>(region);
+        bool correct = true;
+        for (std::size_t offset = 0; offset < size; offset += native.page_size) {
+            correct = correct && bytes[offset] == 1;
+        }
+        release(region, size);
+        allocated = false;
+        ++releases;
+        require(correct, "Every base page must receive its first-touch write");
+    };
+    native.host = [&] {
+        require(allocated, "Both CPU samples must precede region release and follow setup");
+        ++samples;
+        return host();
+    };
+    {
+        LocalBenchmark benchmark(
+            BenchmarkOptions::parse(
+                {{"benchmark", "page-fault"}, {"region_size", 1048576}, {"repetitions", 2}}),
+            native);
+        const auto sample = finish(benchmark);
+        require(sample.at("status") == "completed", sample.dump().c_str());
+        require(sample.at("results").size() == 2, "Each fresh-region pass needs a result");
+        for (const auto& result : sample.at("results")) {
+            require(result.at("operations").get<std::size_t>() == 1048576 / native.page_size,
+                    "First-touch operation counts are base pages, not inferred fault counts");
+            require(result.at("observed_page_faults").at("total").is_number(),
+                    "Native process page-fault observations must be reported");
+#ifndef _WIN32
+            require(result.at("observed_page_faults").at("minor").get<std::uint64_t>() >=
+                        result.at("operations").get<std::uint64_t>(),
+                    "Linux anonymous base pages must fault inside the measured pass");
+#else
+            require(result.at("observed_page_faults").at("minor").is_null() &&
+                        result.at("observed_page_faults").at("major").is_null(),
+                    "Windows unavailable fault classifications must remain unavailable");
+#endif
+        }
+    }
+    require(regions == 3 && releases == 3 && samples == 4,
+            "Warmup and measured regions must all be released outside CPU sampling");
+    try {
+        LocalBenchmark unaligned(BenchmarkOptions::parse({{"benchmark", "page-fault"},
+                                                          {"region_size", native.page_size + 1}}),
+                                 native);
+        throw std::runtime_error("Unaligned native-page region was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+    for (const auto& settings : {Json{{"benchmark", "page-fault"}, {"duration", 10}},
+                                 Json{{"benchmark", "page-fault"}, {"region_size", 0}},
+                                 Json{{"benchmark", "page-fault"}, {"region_size", 1073741825}}}) {
+        try {
+            BenchmarkOptions::parse(settings);
+            throw std::runtime_error("Invalid page-fault settings were accepted");
+        } catch (const std::invalid_argument&) {
+        }
+    }
+    native = native_operations();
+    native.reserve_commit = [](std::size_t) -> void* {
+        throw std::runtime_error("injected region setup failure");
+    };
+    {
+        LocalBenchmark failed(BenchmarkOptions::parse({{"benchmark", "page-fault"}}), native);
+        require(finish(failed).at("status") == "failed",
+                "Failed setup must not become a successful pass");
+    }
+
+    // A later release failure must retain completed passes and mark the run incomplete.
+    native = native_operations();
+    releases = 0;
+    native.release_region = [&](void* region, std::size_t size) {
+        release(region, size);
+        if (++releases == 3) {
+            throw std::runtime_error("injected region release failure");
+        }
+    };
+    {
+        LocalBenchmark failed(
+            BenchmarkOptions::parse(
+                {{"benchmark", "page-fault"}, {"region_size", 1048576}, {"repetitions", 2}}),
+            native);
+        const auto sample = finish(failed);
+        require(sample.at("status") == "failed" && sample.at("results").size() == 1 &&
+                    sample.at("failure") == "injected region release failure",
+                "Release failure must reach the client without discarding earlier passes");
+    }
+
+    // Failed boundary sampling must still start/unblock the worker and release its region.
+    native = native_operations();
+    releases = 0;
+    native.host = []() -> Json {
+        throw std::runtime_error("injected page CPU sampling failure");
+    };
+    native.release_region = [&](void* region, std::size_t size) {
+        release(region, size);
+        ++releases;
+    };
+    {
+        LocalBenchmark failed(
+            BenchmarkOptions::parse({{"benchmark", "page-fault"}, {"region_size", 1048576}}),
+            native);
+        require(finish(failed).at("status") == "failed",
+                "Boundary sampling failure must not produce a completed pass");
+    }
+    require(releases == 2, "Failed sampling must release warmup and measured regions");
+
+    // Cancel while a region is being prepared; joining must still release every allocation.
+    native = native_operations();
+    regions = releases = 0;
+    std::latch region_ready(1), allow_start(1), cancelling(1);
+    native.reserve_commit = [&](std::size_t size) {
+        auto* region = reserve(size);
+        if (++regions == 1) {
+            region_ready.count_down();
+        }
+        allow_start.wait();
+        return region;
+    };
+    native.release_region = [&](void* region, std::size_t size) {
+        release(region, size);
+        ++releases;
+    };
+    auto cancelled = std::make_unique<LocalBenchmark>(
+        BenchmarkOptions::parse({{"benchmark", "page-fault"}, {"region_size", 1048576}}), native);
+    region_ready.wait();
+    std::jthread cancellation([&] {
+        cancelling.count_down();
+        cancelled.reset();
+    });
+    cancelling.wait();
+    allow_start.count_down();
+    cancellation.join();
+    require(regions == releases, "Page-fault cancellation must release all prepared regions");
+}
 }
 
 // Native local tests need no listeners, credentials, or exclusive HTTP server guard.
@@ -117,6 +269,7 @@ int main() {
     try {
         test_workloads();
         test_failures();
+        test_page_faults();
         std::cout << "Native local benchmark tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

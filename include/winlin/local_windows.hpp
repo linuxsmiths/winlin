@@ -76,6 +76,33 @@ inline LocalOperations windows_local_operations() {
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     result.page_size = system.dwPageSize;
+    result.reserve_commit = [](std::size_t size) -> void* {
+        void* region = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+        if (!region) {
+            throw windows_error("Reserve page-fault region");
+        }
+        if (!VirtualAlloc(region, size, MEM_COMMIT, PAGE_READWRITE)) {
+            const auto error = windows_error("Commit page-fault region");
+            if (!VirtualFree(region, 0, MEM_RELEASE)) {
+                log_warning(windows_error("Release failed page-fault setup").what());
+            }
+            throw error;
+        }
+        return region;
+    };
+    result.release_region = [](void* region, std::size_t) {
+        if (!VirtualFree(region, 0, MEM_RELEASE)) {
+            throw windows_error("Release page-fault region");
+        }
+    };
+    result.page_faults = [] {
+        PROCESS_MEMORY_COUNTERS counters{};
+        if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+            throw windows_error("Sample process page faults");
+        }
+        return Json{{"total", counters.PageFaultCount}, {"minor", nullptr}, {"major", nullptr}};
+    };
+    result.memory_backend = "VirtualAlloc MEM_RESERVE / MEM_COMMIT; ordinary base pages";
     return result;
 }
 }

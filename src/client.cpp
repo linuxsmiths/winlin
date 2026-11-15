@@ -1151,6 +1151,9 @@ BenchmarkOptions local_configuration(const Args& args) {
     } else if (benchmark == "syscall") {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
                     "--server-cpu", "--operation"});
+    } else if (benchmark == "page-fault") {
+        args.allow({"--benchmark", "--target", "--repetitions", "--output", "--server-cpu",
+                    "--region-size"});
     } else {
         args.allow(
             {"--benchmark", "--target", "--duration", "--repetitions", "--output", "--server-cpu"});
@@ -1160,6 +1163,11 @@ BenchmarkOptions local_configuration(const Args& args) {
                   {"repetitions", number(args.get("--repetitions", "3"), 1000)},
                   {"workers",
                    benchmark == "allocation" ? number(args.get("--server-workers", "1"), 256) : 1}};
+    if (benchmark == "page-fault") {
+        settings.erase("duration");
+        settings["region_size"] =
+            object_size(args.get("--region-size", "64MiB"), std::size_t{1024} * 1024 * 1024);
+    }
     if (benchmark == "allocation") {
         settings["allocation_size"] = object_size(args.get("--allocation-size", "4KiB"));
         settings["live_allocations"] = number(args.get("--live-allocations", "1"), 65536);
@@ -1263,9 +1271,16 @@ int run_local(Target target, const BenchmarkOptions& options,
                                        options.benchmark == "context-switch" ? 2 : 1)
                       << '\n';
         }
+        if (options.benchmark == "page-fault") {
+            std::cout << "First touch only | region=" << options.region_size
+                      << " bytes | setup/release excluded\n";
+        }
         std::cout << "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op";
         if (options.benchmark == "context-switch") {
             std::cout << "     mean RTT(ns)      Sched CS/s";
+        }
+        if (options.benchmark == "page-fault") {
+            std::cout << "   Observed faults";
         }
         std::cout << '\n';
         const auto deadline = Clock::now() + std::chrono::duration<double>(
@@ -1303,6 +1318,16 @@ int run_local(Target target, const BenchmarkOptions& options,
                         std::cout << std::setw(16);
                         if (metric.is_number()) {
                             std::cout << metric.get<double>();
+                        } else {
+                            std::cout << "N/A";
+                        }
+                    }
+                    if (options.benchmark == "page-fault") {
+                        const auto faults = result.value("observed_page_faults", Json::object())
+                                                .value("total", Json(nullptr));
+                        std::cout << std::setw(18);
+                        if (faults.is_number()) {
+                            std::cout << faults;
                         } else {
                             std::cout << "N/A";
                         }
@@ -1808,7 +1833,8 @@ void interactive(std::string_view executable) {
                 run(target, config, output);
             } else if (action == "4") {
                 const auto benchmark =
-                    prompt("Benchmark: context-switch / syscall / allocation", "context-switch");
+                    prompt("Benchmark: context-switch / syscall / allocation / page-fault",
+                           "context-switch");
                 const auto target_path = select_target();
                 Json settings{{"benchmark", benchmark}, {"workers", 1}};
                 if (benchmark == "allocation") {
@@ -1818,6 +1844,10 @@ void interactive(std::string_view executable) {
                     settings["memory_touch"] = prompt("Memory touch: none / pages", "none");
                     settings["workers"] = number(prompt("Server workers", "1"), 256);
                 } else {
+                    if (benchmark == "page-fault") {
+                        settings["region_size"] = object_size(prompt("Fresh region size", "64MiB"),
+                                                              std::size_t{1024} * 1024 * 1024);
+                    }
                     const auto cpu = prompt("Server logical CPU (auto or index)", "auto");
                     if (cpu != "auto") {
                         settings["server_cpu"] = number(cpu, 65535);
@@ -1826,7 +1856,9 @@ void interactive(std::string_view executable) {
                         settings["operation"] = "minimal-query";
                     }
                 }
-                settings["duration"] = seconds(prompt("Measurement seconds", "30"), 3600);
+                if (benchmark != "page-fault") {
+                    settings["duration"] = seconds(prompt("Measurement seconds", "30"), 3600);
+                }
                 settings["repetitions"] = number(prompt("Repetitions", "3"), 1000);
                 const auto options = BenchmarkOptions::parse(settings);
                 std::optional<fs::path> output;
@@ -1839,8 +1871,12 @@ void interactive(std::string_view executable) {
                 std::cout << "\nNoninteractive command:\n"
                           << shell_argument(executable) << " run --target "
                           << shell_argument(target_path) << " --benchmark "
-                          << shell_argument(benchmark) << " --duration " << options.duration
-                          << " --repetitions " << options.repetitions;
+                          << shell_argument(benchmark) << " --repetitions " << options.repetitions;
+                if (benchmark == "page-fault") {
+                    std::cout << " --region-size " << options.region_size;
+                } else {
+                    std::cout << " --duration " << options.duration;
+                }
                 if (benchmark == "allocation") {
                     std::cout << " --allocation-size " << options.allocation_size
                               << " --live-allocations " << options.live_allocations
@@ -1902,6 +1938,9 @@ int main(int argc, char** argv) {
                    "           syscall: [--operation minimal-query]\n"
                    "           allocation: [--allocation-size 4KiB] [--live-allocations 1]\n"
                    "                       [--memory-touch none|pages] [--server-workers 1]\n"
+                   "winlin run --target FILE --benchmark page-fault [--region-size 64MiB]\n"
+                   "           [--server-cpu N] [--repetitions 3] [--output FILE]\n"
+                   "           One fresh region per repetition; first touch only, no --duration.\n"
                    "Without --output, results are displayed in the console only.\n"
                    "A fixed two-second warmup runs once before all repetitions.\n"
                    "Closed-loop persistent HTTP/HTTPS; paced load and handshake tests are not "

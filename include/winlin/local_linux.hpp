@@ -3,6 +3,7 @@
 #include "winlin/linux.hpp"
 #include "winlin/local_benchmark.hpp"
 #include <sched.h>
+#include <sys/mman.h>
 
 namespace winlin {
 // Resolve an allowed logical CPU from the service's inherited affinity, not host CPU numbering
@@ -50,6 +51,38 @@ inline LocalOperations linux_local_operations() {
         throw system_error("Inspect allocation page size");
     }
     result.page_size = static_cast<std::size_t>(page_size);
+    result.reserve_commit = [](std::size_t size) -> void* {
+        void* region = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) {
+            throw system_error("Reserve page-fault region");
+        }
+        // Disable THP only on this mapping. mprotect enables access but does not populate pages
+        // or provide Windows-style commit accounting; that native difference stays explicit.
+        if (madvise(region, size, MADV_NOHUGEPAGE) != 0 ||
+            mprotect(region, size, PROT_READ | PROT_WRITE) != 0) {
+            const auto error = system_error("Prepare ordinary page-fault region");
+            if (munmap(region, size) != 0) {
+                log_warning(system_error("Release failed page-fault setup").what());
+            }
+            throw error;
+        }
+        return region;
+    };
+    result.release_region = [](void* region, std::size_t size) {
+        if (munmap(region, size) != 0) {
+            throw system_error("Release page-fault region");
+        }
+    };
+    result.page_faults = [] {
+        rusage counters{};
+        if (getrusage(RUSAGE_SELF, &counters) != 0) {
+            throw system_error("Sample process page faults");
+        }
+        return Json{{"total", counters.ru_minflt + counters.ru_majflt},
+                    {"minor", counters.ru_minflt},
+                    {"major", counters.ru_majflt}};
+    };
+    result.memory_backend = "mmap anonymous private / mprotect; MADV_NOHUGEPAGE per region";
     return result;
 }
 }

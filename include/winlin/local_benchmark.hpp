@@ -18,8 +18,12 @@ struct LocalOperations {
     std::function<void()> query;
     std::function<Json()> host;
     std::function<Json()> process;
+    std::function<void*(std::size_t)> reserve_commit;
+    std::function<void(void*, std::size_t)> release_region;
+    std::function<Json()> page_faults;
     Json environment;
     std::string syscall_name;
+    std::string memory_backend;
     std::size_t page_size{};
 };
 
@@ -72,11 +76,17 @@ class LocalBenchmark final : public BenchmarkInstance {
             for (unsigned index = 0; index < count; ++index) {
                 workers.emplace_back([&, index] {
                     std::vector<void*> blocks;
+                    void* region{};
                     try {
                         if (options_.benchmark != "allocation") {
                             native_.bind_cpu(cpu_);
                         } else {
                             blocks.resize(options_.live_allocations);
+                        }
+                        if (options_.benchmark == "page-fault") {
+                            // Address reservation and commitment are outside every measured
+                            // boundary; each repetition receives a fresh, untouched region.
+                            region = native_.reserve_commit(options_.region_size);
                         }
                     } catch (const std::exception& exception) {
                         fail(exception);
@@ -93,7 +103,21 @@ class LocalBenchmark final : public BenchmarkInstance {
                                         (options_.allocation_size * options_.live_allocations)));
                     const auto deadline = begin + std::chrono::duration<double>(duration);
                     try {
-                        if (options_.benchmark == "context-switch") {
+                        if (options_.benchmark == "page-fault") {
+                            if (!failed) {
+                                // A volatile write faults in each ordinary base page exactly
+                                // once. Cancellation checks are batched; no per-page timer is used.
+                                auto* bytes = static_cast<volatile unsigned char*>(region);
+                                for (std::size_t offset = 0; offset < options_.region_size;
+                                     offset += native_.page_size) {
+                                    if ((completed % 256) == 0 && stop_) {
+                                        break;
+                                    }
+                                    bytes[offset] = 1;
+                                    ++completed;
+                                }
+                            }
+                        } else if (options_.benchmark == "context-switch") {
                             // A mutex/condition-variable handoff blocks instead of spinning.
                             // Both threads share one logical CPU; only thread zero counts a
                             // completed round trip (two directed handoffs).
@@ -174,6 +198,13 @@ class LocalBenchmark final : public BenchmarkInstance {
                     for (auto* block : blocks) {
                         std::free(block);
                     }
+                    if (region) {
+                        try {
+                            native_.release_region(region, options_.region_size);
+                        } catch (const std::exception& exception) {
+                            fail(exception);
+                        }
+                    }
                 });
             }
         } catch (...) {
@@ -188,10 +219,13 @@ class LocalBenchmark final : public BenchmarkInstance {
             throw;
         }
         ready.wait();
-        Json before, process_before, after, process_after;
+        Json before, process_before, after, process_after, faults_before, faults_after;
         try {
             if (measure) {
                 process_before = native_.process();
+                if (options_.benchmark == "page-fault") {
+                    faults_before = native_.page_faults();
+                }
                 before = native_.host();
             }
             begin = Clock::now();
@@ -200,6 +234,9 @@ class LocalBenchmark final : public BenchmarkInstance {
             const auto elapsed = std::chrono::duration<double>(Clock::now() - begin).count();
             if (measure) {
                 after = native_.host();
+                if (options_.benchmark == "page-fault") {
+                    faults_after = native_.page_faults();
+                }
                 process_after = native_.process();
             }
             release.count_down();
@@ -257,6 +294,25 @@ class LocalBenchmark final : public BenchmarkInstance {
                 result["round_trips"] = total / 2;
                 result["mean_round_trip_ns"] = seconds * 1e9 / (total / 2);
             }
+            if (options_.benchmark == "page-fault") {
+                result["region_size_bytes"] = options_.region_size;
+                result["native_page_size_bytes"] = native_.page_size;
+                result["observed_page_faults"] = Json::object();
+                for (const auto* key : {"total", "minor", "major"}) {
+                    Json delta = nullptr;
+                    if (measure && faults_before.value(key, Json(nullptr)).is_number() &&
+                        faults_after.value(key, Json(nullptr)).is_number()) {
+                        const auto count = faults_after.at(key).get<std::int64_t>() -
+                                           faults_before.at(key).get<std::int64_t>();
+                        if (count < 0) {
+                            throw std::runtime_error("Native page-fault counters decreased");
+                        }
+                        delta = count;
+                    }
+                    result["observed_page_faults"][key] = delta;
+                }
+                result["page_fault_counter_scope"] = "server process, including control threads";
+            }
             return result;
         } catch (...) {
             {
@@ -279,7 +335,11 @@ class LocalBenchmark final : public BenchmarkInstance {
     // Warm once, then preserve each completed repetition even if a later one fails.
     void execute() noexcept {
         try {
-            stage(2, false);
+            if (options_.benchmark == "page-fault") {
+                stage(0, false);
+            } else {
+                stage(2, false);
+            }
             for (unsigned repetition = 1; repetition <= options_.repetitions; ++repetition) {
                 auto result = stage(options_.duration, true);
                 result["repetition"] = repetition;
@@ -306,6 +366,15 @@ public:
         if (options_.benchmark != "allocation") {
             cpu_ = native_.resolve_cpu(options_.server_cpu);
         }
+        if (options_.benchmark == "page-fault") {
+            if (options_.region_size % native_.page_size != 0) {
+                throw std::invalid_argument(
+                    "Page-fault region must be a multiple of native page size");
+            }
+            if (!native_.reserve_commit || !native_.release_region || !native_.page_faults) {
+                throw std::invalid_argument("Native page-fault operations are unavailable");
+            }
+        }
         coordinator_ = std::jthread([this] {
             execute();
         });
@@ -329,18 +398,28 @@ public:
             {"transport", "server-local"},
             {"operation_unit", options_.benchmark == "context-switch" ? "directed handoff"
                                : options_.benchmark == "allocation"   ? "allocation/free pair"
+                               : options_.benchmark == "page-fault"   ? "first-touch base page"
                                                                       : "native kernel query"},
             {"server_cpu", options_.benchmark == "allocation" ? Json(nullptr) : Json(cpu_)},
             {"native_syscall",
              options_.benchmark == "syscall" ? Json(native_.syscall_name) : Json(nullptr)},
             {"environment", native_.environment},
-            {"warmup_seconds", 2},
+            {"warmup_seconds", options_.benchmark == "page-fault" ? Json(nullptr) : Json(2)},
+            {"warmup_regions", options_.benchmark == "page-fault" ? Json(1) : Json(nullptr)},
             {"execution_threads", options_.benchmark == "context-switch" ? 2 : options_.workers},
             {"native_page_size_bytes", native_.page_size},
+            {"memory_backend",
+             options_.benchmark == "page-fault" ? Json(native_.memory_backend) : Json(nullptr)},
+            {"measurement_scope", options_.benchmark == "page-fault"
+                                      ? "One fresh region: first write per base page; reserve, "
+                                        "commit, and release excluded"
+                                      : "Timed operation loop"},
             {"notes",
              {"Batch/loop and synchronization overhead is included.",
               "Mean operation latency is amortized, not a percentile distribution.",
               "Whole-server reference cycles include unrelated OS work; use an idle host.",
+              "First-touch page counts are not observed faults; fault counters include control "
+              "activity and short passes suffer CPU sample granularity.",
               "Scheduler counts are process-wide, including control activity; null means "
               "unavailable.",
               "Workers are recreated outside sampling for each stage; allocator thread caches may "

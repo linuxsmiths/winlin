@@ -50,7 +50,8 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Advertise local workloads or return completed and failed repetition snapshots."""
         if self.path == "/v1/capabilities":
-            self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation"]})
+            self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation",
+                                                   "page-fault"]})
         else:
             self.server.poll_seen.set()
             self.respond({
@@ -244,6 +245,34 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
                     process.kill()
                     process.communicate()
         assert server.stops == 8
+        server.running = False
+        output = directory / "page-fault.json"
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "page-fault",
+             "--region-size", "128MiB", "--repetitions", "1", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert server.settings[-1]["region_size"] == 128 * 1024 * 1024
+        assert "duration" not in server.settings[-1]
+        assert "Observed faults" in result.stdout
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "page-fault",
+             "--duration", "10"], capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "Unknown option: --duration" in result.stderr
+        result = subprocess.run(
+            [client], input="4\npage-fault\n1\n64MiB\nauto\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--region-size 67108864" in displayed.group(1), result.stdout
+        assert "--duration" not in displayed.group(1)
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
     finally:
         server.shutdown()
         server.server_close()

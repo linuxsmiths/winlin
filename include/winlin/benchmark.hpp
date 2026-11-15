@@ -16,6 +16,7 @@ struct BenchmarkOptions {
     unsigned repetitions{3};
     int server_cpu{-1};
     std::size_t allocation_size{4096}, live_allocations{1};
+    std::size_t region_size{64 * 1024 * 1024};
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
     std::string get_response_data{"copy"};
     unsigned workers{8}, lease_seconds{300};
@@ -27,7 +28,7 @@ struct BenchmarkOptions {
         }
         const auto benchmark = value.value("benchmark", std::string("https"));
         if (benchmark != "https" && benchmark != "context-switch" && benchmark != "syscall" &&
-            benchmark != "allocation") {
+            benchmark != "allocation" && benchmark != "page-fault") {
             throw std::invalid_argument("Unknown benchmark: " + benchmark);
         }
         for (const auto& [key, ignored] : value.items()) {
@@ -35,12 +36,14 @@ struct BenchmarkOptions {
             const bool network = benchmark == "https" &&
                                  (key == "tls" || key == "cipher" || key == "get_response_data");
             const bool local =
-                benchmark != "https" && (key == "duration" || key == "repetitions" ||
-                                         (key == "server_cpu" && benchmark != "allocation") ||
-                                         (key == "operation" && benchmark == "syscall") ||
-                                         (benchmark == "allocation" &&
-                                          (key == "allocation_size" || key == "live_allocations" ||
-                                           key == "memory_touch")));
+                benchmark != "https" &&
+                ((key == "duration" && benchmark != "page-fault") || key == "repetitions" ||
+                 (key == "server_cpu" && benchmark != "allocation") ||
+                 (key == "operation" && benchmark == "syscall") ||
+                 (benchmark == "allocation" &&
+                  (key == "allocation_size" || key == "live_allocations" ||
+                   key == "memory_touch")) ||
+                 (benchmark == "page-fault" && key == "region_size"));
             if (!common && !network && !local) {
                 throw std::invalid_argument("Unknown benchmark setting: " + key);
             }
@@ -70,7 +73,7 @@ struct BenchmarkOptions {
                 throw std::invalid_argument("Local benchmark duration must be 0.01-3600 seconds");
             }
             if (benchmark != "allocation" && result.workers != 1) {
-                throw std::invalid_argument("Context-switch and syscall use one CPU/pair");
+                throw std::invalid_argument("This local benchmark uses one CPU/worker or pair");
             }
             if (value.contains("server_cpu")) {
                 if (!value.at("server_cpu").is_number_integer()) {
@@ -89,6 +92,7 @@ struct BenchmarkOptions {
             result.allocation_size = bounded("allocation_size", 4096, max_object_size);
             result.live_allocations = bounded("live_allocations", 1, 65536);
             result.memory_touch = value.value("memory_touch", result.memory_touch);
+            result.region_size = bounded("region_size", 64 * 1024 * 1024, 1024 * 1024 * 1024);
             if (result.memory_touch != "none" && result.memory_touch != "pages") {
                 throw std::invalid_argument("memory_touch must be none or pages");
             }
@@ -115,9 +119,13 @@ struct BenchmarkOptions {
     Json json() const {
         if (benchmark != "https") {
             Json result{{"benchmark", benchmark},
-                        {"duration", duration},
                         {"repetitions", repetitions},
                         {"workers", workers}};
+            if (benchmark != "page-fault") {
+                result["duration"] = duration;
+            } else {
+                result["region_size"] = region_size;
+            }
             if (benchmark == "allocation") {
                 result["allocation_size"] = allocation_size;
                 result["live_allocations"] = live_allocations;
