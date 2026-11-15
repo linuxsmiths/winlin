@@ -444,10 +444,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert "state 'quoted' $literal" in replay_arguments[
                 replay_arguments.index("--target") + 1]
             assert ("--cipher" in replay_arguments) == (tls != "off")
+            assert ("--get-percent" in replay_arguments) == (method == "mixed")
+            if method == "mixed":
+                assert replay_arguments[replay_arguments.index("--get-percent") + 1] == "50"
             assert all(option in replay_arguments for option in (
                 "--tls", "--server-workers", "--method", "--get-response-data",
                 "--get-size", "--put-size",
-                "--get-percent", "--connections", "--workers", "--duration",
+                "--connections", "--workers", "--duration",
                 "--requests", "--repetitions", "--timeout",
             ))
             assert "--warmup" not in replay_arguments
@@ -485,7 +488,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             r"^\s*(\d+)\s+(\d+\.\d{2})\s+(\d+\.\d{2})\s+"
             r"(\d+\.\d{2})\s+(\d+\.\d{2})\s+(\d+)\s+"
             r"(N/A|\d+\.\d{2})\s+(\d+\.\d{2})\s+(N/A|\d+\.\d{2})\s+"
-            r"(N/A|\d+\.\d{2})\s*$", re.MULTILINE,
+            r"(N/A|\d+\.\d{2}K)\s*$", re.MULTILINE,
         )
         assert "Ref CPIO" in result.stdout
         assert "Avg CPU(%)" in result.stdout
@@ -637,7 +640,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(output.read_text())
         rows = table_row.findall(result.stdout)
-        assert [(row[0], row[-1]) for row in rows] == [("1", "5000.50"), ("2", "5000.50")]
+        assert [(row[0], row[-1]) for row in rows] == [("1", "5.00K"), ("2", "5.00K")]
         assert [row[-2] for row in rows] == ["200.00", "200.00"]
         assert "CPIO unavailable" not in result.stderr, result.stderr
         assert "{" not in result.stdout, result.stdout

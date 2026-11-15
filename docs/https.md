@@ -352,7 +352,9 @@ activation is **not** evidence of NIC cryptographic offload.
 The console shows a compact per-run table of throughput, p50/p90/p99 latency, errors,
 server-interface network throughput (`Net Gbps`), average client-process CPU
 (`Client CPU(%)`), average whole-server CPU utilization (`Avg CPU(%)`), and estimated
-reference cycles per I/O (`Ref CPIO`). Server CPU utilization is averaged over each
+reference cycles per I/O (`Ref CPIO`), displayed in thousands with a `K` suffix
+(for example, 24,288 cycles becomes `24.29K`). JSON retains unscaled cycles.
+Server CPU utilization is averaged over each
 repetition's server-side telemetry interval; process CPU uses timestamps captured
 next to its CPU counter reads. Each `client_process` and `server_process` records
 its `elapsed_seconds` and `elapsed_source`; legacy servers without process

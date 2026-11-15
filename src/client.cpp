@@ -1308,7 +1308,7 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
             if (cpio.is_null()) {
                 std::cout << std::setw(14) << "N/A";
             } else {
-                std::cout << std::setw(14) << cpio.get<double>();
+                std::cout << std::setw(13) << cpio.get<double>() / 1000.0 << 'K';
             }
             std::cout << '\n';
             for (const auto& warning : result.at("warnings")) {
@@ -1473,7 +1473,9 @@ std::string benchmark_command(std::string_view executable, const std::string& ta
     command << " --get-response-data " << shell_argument(config.get_response_data);
     command << " --get-size " << config.get_size;
     command << " --put-size " << config.put_size;
-    command << " --get-percent " << config.get_percent;
+    if (config.method == "mixed") {
+        command << " --get-percent " << config.get_percent;
+    }
     command << " --connections " << config.connections;
     command << " --workers " << config.workers;
     command << " --duration " << config.duration;
