@@ -243,7 +243,7 @@ public:
         Json result{{"environment", config.environment},
                     {"supported_benchmarks",
                      {"https", "context-switch", "syscall", "allocation", "page-fault",
-                      "thread-create", "lock-contention"}},
+                      "thread-create", "lock-contention", "cross-core-handoff"}},
                     {"supported_syscall_operations", {"minimal-query"}},
                     {"supported_memory_touch_modes", {"none", "pages"}},
                     {"supported_backends", config.supported_backends},

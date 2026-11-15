@@ -12,6 +12,9 @@ winlin run --target linux.json --benchmark context-switch \
 winlin run --target windows.json --benchmark context-switch \
   --threads 1024 --server-cpu 2 --duration 30 --repetitions 3
 
+winlin run --target linux.json --benchmark cross-core-handoff \
+  --server-cpu 2 --peer-cpu 4 --duration 30 --repetitions 3
+
 winlin run --target windows.json --benchmark thread-create \
   --duration 10 --repetitions 3
 
@@ -94,6 +97,32 @@ measurement. Scheduler counters, when available, cover the entire server
 process, including HTTP control threads; Windows currently reports them as
 unavailable. The JSON includes their rate, completed ring laps, and mean lap time.
 
+**Cross-core-handoff:** exactly two participants use the same
+`blocking-cv-ring-v1` mutex/condition-variable token exchange as the same-CPU
+test. `--server-cpu` and `--peer-cpu` are both required, must differ, and are
+validated against the native allowed/active CPUs. Each participant pins itself
+before measurement; affinity failure fails the run without an unpinned fallback.
+Thread count is fixed at two; `--threads` and `--server-workers` are rejected.
+
+One completed round trip counts two directed handoffs. Report handoffs/s,
+amortized mean ns/handoff, mean round-trip ns, whole-server CPU/reference
+cycles per handoff, and scheduler switch rate where available. Worker
+creation, affinity changes, and joins remain outside sampling. Cancellation
+and failures wake both participants and join them before lease release.
+
+Despite the command name, distinct logical CPU IDs can be SMT siblings, separate
+physical cores, or different NUMA nodes. The benchmark reports the selected pair,
+does not infer their topology, and never assumes adjacent IDs are separate cores.
+On Linux, use `lscpu -e=CPU,CORE,SOCKET,NODE` to choose a pair; select equivalent
+relationships on Windows using its processor topology information.
+
+This measures blocking synchronization, scheduling, and cross-CPU cache
+communication together, not a pure cache-line transfer or guaranteed scheduler
+switch per handoff. A participant may observe the token before sleeping; native
+mutex/wait implementations may spin internally. Compare against a two-thread
+same-CPU run and control topology/background load before attributing a difference
+solely to the OS.
+
 **Syscall:** Linux calls `syscall(SYS_gettid)` explicitly; Windows calls
 `NtQueryInformationThread(ThreadBasicInformation)` on the current thread. These
 enter the kernel rather than reading a cached userspace thread ID. They do
@@ -161,8 +190,9 @@ it is not by itself proof of a particular fairness policy.
 Acquisition latency spans immediately before locking to immediately after
 successful acquisition, excluding the protected increment and unlock. Each
 worker samples its first operation and then every `--latency-sample-every`
-operations (default 1024, range 1–1048576). Mean/p50/p99 in microseconds and the
-sample count are reported separately from amortized whole-operation timing.
+operations (default 1024, range 1–1048576). The console reports acquisition
+mean/p50/p99 in nanoseconds. JSON retains explicitly named `_us` fields in
+microseconds and a sample count, separately from amortized whole-operation timing.
 Worker-local bounded histograms are merged only after CPU sampling.
 
 Sampled acquisitions include clock overhead; their second timestamp extends

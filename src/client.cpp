@@ -1165,6 +1165,9 @@ BenchmarkOptions local_configuration(const Args& args) {
     } else if (benchmark == "lock-contention") {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
                     "--server-workers", "--latency-sample-every"});
+    } else if (benchmark == "cross-core-handoff") {
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
+                    "--server-cpu", "--peer-cpu"});
     } else {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
                     "--server-cpu", "--threads"});
@@ -1185,6 +1188,10 @@ BenchmarkOptions local_configuration(const Args& args) {
     }
     if (benchmark == "context-switch") {
         settings["threads"] = number(args.get("--threads", "2"), 1024);
+    }
+    if (benchmark == "cross-core-handoff") {
+        settings["server_cpu"] = number(args.require("--server-cpu"), 65535);
+        settings["peer_cpu"] = number(args.require("--peer-cpu"), 65535);
     }
     if (benchmark == "lock-contention") {
         settings["latency_sample_every"] =
@@ -1304,10 +1311,14 @@ int run_local(Target target, const BenchmarkOptions& options,
             std::cout << "First touch only | region=" << options.region_size
                       << " bytes | setup/release excluded\n";
         }
+        if (options.benchmark == "cross-core-handoff") {
+            std::cout << "Peer logical CPU=" << started.at("peer_cpu")
+                      << " | physical-core/NUMA relationship: user-selected, not inferred\n";
+        }
         std::cout << (options.benchmark == "thread-create"
                           ? "Run    operations/s life mean(us)     Avg CPU(%)     Ref cycles/op"
                           : "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op");
-        if (options.benchmark == "context-switch") {
+        if (options.benchmark == "context-switch" || options.benchmark == "cross-core-handoff") {
             std::cout << (options.threads == 2 ? "     mean RTT(ns)" : "     mean lap(ns)")
                       << "      Sched CS/s";
         }
@@ -1319,7 +1330,7 @@ int run_local(Target target, const BenchmarkOptions& options,
                          "    life p50(us)    life p99(us)";
         }
         if (options.benchmark == "lock-contention") {
-            std::cout << "    acq mean(us)     acq p50(us)     acq p99(us)"
+            std::cout << "    acq mean(ns)     acq p50(ns)     acq p99(ns)"
                          "   Min worker ops   Max worker ops";
         }
         std::cout << '\n';
@@ -1354,7 +1365,8 @@ int run_local(Target target, const BenchmarkOptions& options,
                         std::cout << "N/A";
                     }
                 }
-                if (options.benchmark == "context-switch") {
+                if (options.benchmark == "context-switch" ||
+                    options.benchmark == "cross-core-handoff") {
                     const auto* lap_key =
                         options.threads == 2 ? "mean_round_trip_ns" : "mean_ring_lap_ns";
                     for (const auto* key : {lap_key, "scheduler_context_switches_per_second"}) {
@@ -1389,7 +1401,7 @@ int run_local(Target target, const BenchmarkOptions& options,
                 if (options.benchmark == "lock-contention") {
                     const auto& acquisition = result.at("lock_acquisition_latency");
                     for (const auto* key : {"mean_us", "p50_us", "p99_us"}) {
-                        std::cout << std::setw(16) << acquisition.at(key).get<double>();
+                        std::cout << std::setw(16) << acquisition.at(key).get<double>() * 1000;
                     }
                     std::cout << std::setw(17)
                               << result.at("worker_operations_min").get<std::uint64_t>()
@@ -1896,9 +1908,10 @@ void interactive(std::string_view executable) {
                 std::cout << '\n';
                 run(target, config, output);
             } else if (action == "4") {
-                const auto benchmark = prompt("Benchmark: context-switch / syscall / allocation / "
-                                              "page-fault / thread-create / lock-contention",
-                                              "context-switch");
+                const auto benchmark =
+                    prompt("Benchmark: context-switch / syscall / allocation / "
+                           "page-fault / thread-create / lock-contention / cross-core-handoff",
+                           "context-switch");
                 const auto target_path = select_target();
                 Json settings{{"benchmark", benchmark}, {"workers", 1}};
                 if (benchmark == "context-switch") {
@@ -1914,6 +1927,10 @@ void interactive(std::string_view executable) {
                     settings["workers"] = number(prompt("Server workers", "8"), 256);
                     settings["latency_sample_every"] =
                         number(prompt("Acquisition sample interval per worker", "1024"), 1048576);
+                } else if (benchmark == "cross-core-handoff") {
+                    settings["server_cpu"] = number(prompt("First server logical CPU", "0"), 65535);
+                    settings["peer_cpu"] =
+                        number(prompt("Peer server logical CPU (must differ)", "1"), 65535);
                 } else if (benchmark != "thread-create") {
                     if (benchmark == "page-fault") {
                         settings["region_size"] = object_size(prompt("Fresh region size", "64MiB"),
@@ -1962,6 +1979,9 @@ void interactive(std::string_view executable) {
                     }
                     if (options.server_cpu >= 0) {
                         std::cout << " --server-cpu " << options.server_cpu;
+                    }
+                    if (benchmark == "cross-core-handoff") {
+                        std::cout << " --peer-cpu " << options.peer_cpu;
                     }
                 }
                 if (output) {
@@ -2017,6 +2037,10 @@ int main(int argc, char** argv) {
                    "           context-switch/syscall: [--server-cpu N] (default: auto)\n"
                    "           context-switch: [--threads 2] (2-1024, same-CPU blocking ring)\n"
                    "           thread-create: one unpinned creator, sequential create/exit/join\n"
+                   "winlin run --target FILE --benchmark cross-core-handoff --server-cpu N "
+                   "--peer-cpu M\n"
+                   "           [--duration 30] [--repetitions 3] [--output FILE]\n"
+                   "           Requires distinct logical CPUs; physical topology is not inferred.\n"
                    "           lock-contention: [--server-workers 8] [--latency-sample-every "
                    "1024]\n"
                    "           syscall: [--operation minimal-query]\n"

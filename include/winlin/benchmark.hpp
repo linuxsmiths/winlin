@@ -17,6 +17,7 @@ struct BenchmarkOptions {
     unsigned threads{2};
     unsigned latency_sample_every{1024};
     int server_cpu{-1};
+    int peer_cpu{-1};
     std::size_t allocation_size{4096}, live_allocations{1};
     std::size_t region_size{64 * 1024 * 1024};
     std::string tls{"on"}, cipher{"TLS_AES_128_GCM_SHA256"};
@@ -31,7 +32,8 @@ struct BenchmarkOptions {
         const auto benchmark = value.value("benchmark", std::string("https"));
         if (benchmark != "https" && benchmark != "context-switch" && benchmark != "syscall" &&
             benchmark != "allocation" && benchmark != "page-fault" &&
-            benchmark != "thread-create" && benchmark != "lock-contention") {
+            benchmark != "thread-create" && benchmark != "lock-contention" &&
+            benchmark != "cross-core-handoff") {
             throw std::invalid_argument("Unknown benchmark: " + benchmark);
         }
         for (const auto& [key, ignored] : value.items()) {
@@ -45,6 +47,7 @@ struct BenchmarkOptions {
                   benchmark != "thread-create" && benchmark != "lock-contention") ||
                  (key == "operation" && benchmark == "syscall") ||
                  (key == "threads" && benchmark == "context-switch") ||
+                 (key == "peer_cpu" && benchmark == "cross-core-handoff") ||
                  (benchmark == "allocation" &&
                   (key == "allocation_size" || key == "live_allocations" ||
                    key == "memory_touch")) ||
@@ -97,6 +100,18 @@ struct BenchmarkOptions {
                     throw std::invalid_argument("server_cpu is outside supported limits");
                 }
                 result.server_cpu = static_cast<int>(cpu);
+            }
+            if (benchmark == "cross-core-handoff") {
+                if (!value.contains("peer_cpu") || !value.at("peer_cpu").is_number_integer()) {
+                    throw std::invalid_argument("cross-core-handoff requires an integer peer_cpu");
+                }
+                const auto peer = value.at("peer_cpu").get<std::int64_t>();
+                if (peer < 0 || peer > 65535 || result.server_cpu < 0 ||
+                    peer == result.server_cpu) {
+                    throw std::invalid_argument(
+                        "cross-core-handoff requires two explicit, distinct logical CPU IDs");
+                }
+                result.peer_cpu = static_cast<int>(peer);
             }
             result.operation = value.value("operation", result.operation);
             if (result.operation != "minimal-query") {
@@ -151,6 +166,9 @@ struct BenchmarkOptions {
                     result["threads"] = threads;
                 }
                 result["server_cpu"] = server_cpu < 0 ? Json(nullptr) : Json(server_cpu);
+                if (benchmark == "cross-core-handoff") {
+                    result["peer_cpu"] = peer_cpu;
+                }
                 if (benchmark == "syscall") {
                     result["operation"] = operation;
                 }

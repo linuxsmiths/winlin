@@ -43,6 +43,7 @@ class LocalBenchmark final : public BenchmarkInstance {
     BenchmarkOptions options_;
     LocalOperations native_;
     unsigned cpu_{};
+    unsigned peer_cpu_{};
     std::atomic<bool> stop_{};
     std::atomic<bool> cancelled_{};
     std::mutex handoff_mutex_;
@@ -51,6 +52,11 @@ class LocalBenchmark final : public BenchmarkInstance {
     Json results_ = Json::array();
     std::string status_{"running"}, failure_;
     std::jthread coordinator_;
+
+    // Both handoff workloads share identical token passing; only participant affinity differs.
+    bool is_handoff() const {
+        return options_.benchmark == "context-switch" || options_.benchmark == "cross-core-handoff";
+    }
 
     // Broadcast only for shutdown or failure; steady-state handoffs target one successor.
     void wake_participants() {
@@ -62,8 +68,7 @@ class LocalBenchmark final : public BenchmarkInstance {
     // Execute one stage. Workers finish setup before the boundary and park after their last
     // operation until telemetry is captured, keeping thread teardown outside CPU sampling.
     Json stage(double duration, bool measure) {
-        const unsigned count =
-            options_.benchmark == "context-switch" ? options_.threads : options_.workers;
+        const unsigned count = is_handoff() ? options_.threads : options_.workers;
         std::latch ready(count), start(1), finished(count), release(1);
         std::vector<std::jthread> workers;
         std::vector<std::uint64_t> operations(count);
@@ -110,7 +115,9 @@ class LocalBenchmark final : public BenchmarkInstance {
                         if (options_.benchmark != "allocation" &&
                             options_.benchmark != "thread-create" &&
                             options_.benchmark != "lock-contention") {
-                            native_.bind_cpu(cpu_);
+                            native_.bind_cpu(
+                                options_.benchmark == "cross-core-handoff" && index == 1 ? peer_cpu_
+                                                                                         : cpu_);
                         } else if (options_.benchmark == "allocation") {
                             blocks.resize(options_.live_allocations);
                         }
@@ -207,8 +214,8 @@ class LocalBenchmark final : public BenchmarkInstance {
                                     ++completed;
                                 }
                             }
-                        } else if (options_.benchmark == "context-switch") {
-                            // Each participant has a dedicated blocking signal on the same CPU.
+                        } else if (is_handoff()) {
+                            // Each pinned participant has a dedicated blocking signal.
                             // Only thread zero counts completed laps, so unfinished token passes
                             // are never reported as successful handoffs.
                             std::unique_lock lock(handoff_mutex_);
@@ -349,9 +356,8 @@ class LocalBenchmark final : public BenchmarkInstance {
                 cycles = host.at("reference_cycles").get<double>() / total;
             }
             double seconds =
-                options_.benchmark == "context-switch"
-                    ? worker_seconds[0]
-                    : std::accumulate(worker_seconds.begin(), worker_seconds.end(), 0.0);
+                is_handoff() ? worker_seconds[0]
+                             : std::accumulate(worker_seconds.begin(), worker_seconds.end(), 0.0);
             Json result{{"operations", total},
                         {"elapsed_seconds", elapsed},
                         {"operations_per_second", total / elapsed},
@@ -413,7 +419,7 @@ class LocalBenchmark final : public BenchmarkInstance {
                 result["scheduler_context_switches"] = delta;
                 result["scheduler_context_switches_per_second"] = delta / elapsed;
             }
-            if (options_.benchmark == "context-switch") {
+            if (is_handoff()) {
                 result["ring_threads"] = count;
                 result["ring_laps"] = total / count;
                 result["mean_ring_lap_ns"] = seconds * 1e9 / (total / count);
@@ -495,7 +501,13 @@ public:
             options_.benchmark != "lock-contention") {
             cpu_ = native_.resolve_cpu(options_.server_cpu);
         }
-        if (options_.benchmark == "context-switch") {
+        if (options_.benchmark == "cross-core-handoff") {
+            peer_cpu_ = native_.resolve_cpu(options_.peer_cpu);
+            if (cpu_ == peer_cpu_) {
+                throw std::invalid_argument("Cross-core handoff requires distinct resolved CPUs");
+            }
+        }
+        if (is_handoff()) {
             for (unsigned index = 0; index < options_.threads; ++index) {
                 handoff_signals_.push_back(std::make_unique<std::condition_variable>());
             }
@@ -530,9 +542,9 @@ public:
         return {
             {"benchmark", options_.benchmark},
             {"transport", "server-local"},
-            {"operation_unit", options_.benchmark == "context-switch" ? "directed handoff"
-                               : options_.benchmark == "allocation"   ? "allocation/free pair"
-                               : options_.benchmark == "page-fault"   ? "first-touch base page"
+            {"operation_unit", is_handoff()                         ? "directed handoff"
+                               : options_.benchmark == "allocation" ? "allocation/free pair"
+                               : options_.benchmark == "page-fault" ? "first-touch base page"
                                : options_.benchmark == "thread-create"
                                    ? "create/exit/join lifecycle"
                                : options_.benchmark == "lock-contention" ? "lock/increment/unlock"
@@ -544,6 +556,12 @@ public:
                                : Json(cpu_)},
             {"thread_api",
              options_.benchmark == "thread-create" ? Json("std::thread") : Json(nullptr)},
+            {"peer_cpu",
+             options_.benchmark == "cross-core-handoff" ? Json(peer_cpu_) : Json(nullptr)},
+            {"cpu_topology_relationship", options_.benchmark == "cross-core-handoff"
+                                              ? Json("user-selected distinct logical CPUs; "
+                                                     "physical core/NUMA relationship not inferred")
+                                              : Json(nullptr)},
             {"child_threads_at_once",
              options_.benchmark == "thread-create" ? Json(1) : Json(nullptr)},
             {"mutex_api",
@@ -553,10 +571,8 @@ public:
             {"environment", native_.environment},
             {"warmup_seconds", options_.benchmark == "page-fault" ? Json(nullptr) : Json(2)},
             {"warmup_regions", options_.benchmark == "page-fault" ? Json(1) : Json(nullptr)},
-            {"execution_threads",
-             options_.benchmark == "context-switch" ? options_.threads : options_.workers},
-            {"handoff_implementation",
-             options_.benchmark == "context-switch" ? Json("blocking-cv-ring-v1") : Json(nullptr)},
+            {"execution_threads", is_handoff() ? options_.threads : options_.workers},
+            {"handoff_implementation", is_handoff() ? Json("blocking-cv-ring-v1") : Json(nullptr)},
             {"native_page_size_bytes", native_.page_size},
             {"memory_backend",
              options_.benchmark == "page-fault" ? Json(native_.memory_backend) : Json(nullptr)},

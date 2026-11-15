@@ -95,8 +95,8 @@ Use the foreground launchers:
 
 Server-local tests now also cover **same-CPU thread handoffs, minimal native
 syscall queries, allocation/free pairs, first-touch page faults, and thread
-creation/join lifecycles, and shared-mutex contention**. Select them with
-`winlin run --target FILE --benchmark context-switch|syscall|allocation|page-fault|thread-create|lock-contention`, or the
+creation/join lifecycles, shared-mutex contention, and cross-CPU handoffs**. Select them with
+`winlin run --target FILE --benchmark context-switch|syscall|allocation|page-fault|thread-create|lock-contention|cross-core-handoff`, or the
 server-local menu entry. See [local benchmark definitions and comparison limits](docs/local-benchmarks.md)
 for parameters, native operation differences, and cycles/operation accounting.
 

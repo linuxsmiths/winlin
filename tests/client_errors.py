@@ -56,7 +56,8 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/capabilities":
             self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation",
-                                                   "page-fault", "thread-create", "lock-contention"]})
+                                                   "page-fault", "thread-create", "lock-contention",
+                                                   "cross-core-handoff"]})
         else:
             self.server.poll_seen.set()
             self.respond(self.snapshot())
@@ -113,6 +114,7 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
                 "operation_unit": "fixture operation", "benchmark": settings["benchmark"],
                 "server_cpu": settings.get("server_cpu", 0),
                 "execution_threads": settings.get("threads", settings["workers"]),
+                "peer_cpu": settings.get("peer_cpu"),
             })
         else:
             self.server.stops += 1
@@ -382,8 +384,10 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "unpinned workers=4" in result.stdout and "acq p99(us)" in result.stdout
-        assert "3.25" in result.stdout and "Min worker ops" in result.stdout
+        assert "unpinned workers=4" in result.stdout and "acq p99(ns)" in result.stdout
+        assert "acq mean(ns)" in result.stdout and "acq p50(ns)" in result.stdout
+        assert re.search(r"500\.00\s+200\.00\s+3250\.00", result.stdout), result.stdout
+        assert "Min worker ops" in result.stdout
         assert server.settings[-1]["latency_sample_every"] == 7
         assert "server_cpu" not in server.settings[-1]
         report = json.loads(output.read_text())
@@ -414,6 +418,42 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
             result = subprocess.run(
                 [client, "run", "--target", str(target), "--benchmark", "lock-contention", *parameters],
                 capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
+        # Cross-core commands require a distinct explicit CPU pair and preserve RTT reporting.
+        output = directory / "cross-core-handoff.json"
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "cross-core-handoff",
+             "--server-cpu", "2", "--peer-cpu", "4", "--duration", "0.02",
+             "--repetitions", "1", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Peer logical CPU=4" in result.stdout and "mean RTT(ns)" in result.stdout
+        assert "123456.00" in result.stdout and "not inferred" in result.stdout
+        report = json.loads(output.read_text())
+        assert report["configuration"]["server_cpu"] == 2
+        assert report["configuration"]["peer_cpu"] == 4
+        result = subprocess.run(
+            [client], input="4\ncross-core-handoff\n1\n2\n4\n0.02\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--server-cpu 2 --peer-cpu 4" in displayed.group(1), result.stdout
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        for parameters in (
+            [], ["--server-cpu", "2"], ["--peer-cpu", "4"],
+            ["--server-cpu", "2", "--peer-cpu", "2"],
+            ["--server-cpu", "2", "--peer-cpu", "65536"],
+            ["--server-cpu", "2", "--peer-cpu", "4", "--threads", "2"],
+        ):
+            result = subprocess.run(
+                [client, "run", "--target", str(target), "--benchmark", "cross-core-handoff",
+                 *parameters], capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 1, result.stdout + result.stderr
         # Both polling and stop return histories above 64 KiB, including the supported maximum.

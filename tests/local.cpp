@@ -83,6 +83,15 @@ void test_failures() {
           Json{{"benchmark", "lock-contention"}, {"latency_sample_every", 0}},
           Json{{"benchmark", "lock-contention"}, {"latency_sample_every", 1048577}},
           Json{{"benchmark", "syscall"}, {"latency_sample_every", 7}},
+          Json{{"benchmark", "cross-core-handoff"}, {"server_cpu", 0}},
+          Json{{"benchmark", "cross-core-handoff"}, {"peer_cpu", 1}},
+          Json{{"benchmark", "cross-core-handoff"}, {"server_cpu", 0}, {"peer_cpu", 0}},
+          Json{{"benchmark", "cross-core-handoff"}, {"server_cpu", 0}, {"peer_cpu", -1}},
+          Json{{"benchmark", "cross-core-handoff"}, {"server_cpu", 0}, {"peer_cpu", 65536}},
+          Json{{"benchmark", "cross-core-handoff"},
+               {"server_cpu", 0},
+               {"peer_cpu", 1},
+               {"threads", 2}},
           Json{{"benchmark", "allocation"},
                {"allocation_size", 67108864},
                {"live_allocations", 65536}},
@@ -315,6 +324,100 @@ void test_lock_contention() {
     });
     cancelling.wait();
     allow_sampling.count_down();
+    cancellation.join();
+}
+
+// Check cross-CPU pinning and round-trip accounting with native affinity on every stage.
+void test_cross_core_handoff() {
+    auto native = native_operations();
+    const auto first = native.resolve_cpu(-1);
+    int peer = -1;
+    for (unsigned candidate = 0; candidate <= 65535; ++candidate) {
+        if (candidate == first) {
+            continue;
+        }
+        try {
+            native.resolve_cpu(static_cast<int>(candidate));
+            peer = static_cast<int>(candidate);
+            break;
+        } catch (const std::invalid_argument&) {
+        }
+    }
+    if (peer < 0) {
+        std::cout << "Cross-core native workload skipped: only one allowed logical CPU\n";
+        return;
+    }
+    const auto options = BenchmarkOptions::parse({{"benchmark", "cross-core-handoff"},
+                                                  {"server_cpu", first},
+                                                  {"peer_cpu", peer},
+                                                  {"duration", 0.02},
+                                                  {"repetitions", 2}});
+    const auto bind = native.bind_cpu;
+    std::atomic<unsigned> first_bindings{}, peer_bindings{};
+    native.bind_cpu = [&](unsigned selected) {
+        require(selected == first || selected == static_cast<unsigned>(peer),
+                "Handoff must pin to exactly the requested pair");
+        bind(selected);
+        if (selected == first) {
+            ++first_bindings;
+        } else {
+            ++peer_bindings;
+        }
+    };
+    {
+        LocalBenchmark benchmark(options, native);
+        const auto sample = finish(benchmark);
+        require(sample.at("status") == "completed", sample.dump().c_str());
+        require(sample.at("results").size() == 2, "Cross-core handoffs need both repetitions");
+        require(benchmark.describe().at("peer_cpu") == peer &&
+                    benchmark.describe().at("execution_threads") == 2,
+                "Metadata must expose the actual peer CPU and both threads");
+        for (const auto& result : sample.at("results")) {
+            require(result.at("operations").get<std::uint64_t>() > 0 &&
+                        result.at("operations").get<std::uint64_t>() ==
+                            2 * result.at("round_trips").get<std::uint64_t>(),
+                    "One cross-CPU round trip is two directed handoffs");
+            require(result.at("mean_round_trip_ns").get<double>() ==
+                        2 * result.at("mean_operation_ns").get<double>(),
+                    "Cross-core handoff latency must be half amortized round-trip time");
+        }
+    }
+    require(first_bindings == 3 && peer_bindings == 3,
+            "Each stage must pin one thread to each CPU");
+
+    // Failed peer affinity must wake the first thread and fail rather than run unpinned.
+    native.bind_cpu = [&](unsigned selected) {
+        if (selected == static_cast<unsigned>(peer)) {
+            throw std::runtime_error("injected cross-core affinity failure");
+        }
+        bind(selected);
+    };
+    {
+        LocalBenchmark failed(options, native);
+        const auto sample = finish(failed);
+        require(sample.at("status") == "failed" &&
+                    sample.at("failure") == "injected cross-core affinity failure",
+                "A failed cross-core peer must unblock the other participant");
+    }
+
+    // Cancellation while a participant is preparing must release both dedicated signals.
+    std::latch preparing(1), allow_setup(1), cancelling(1);
+    std::atomic<bool> first_setup{true};
+    native.bind_cpu = [&](unsigned selected) {
+        bind(selected);
+        if (first_setup.exchange(false)) {
+            preparing.count_down();
+            allow_setup.wait();
+        }
+    };
+    auto cancelled = std::make_unique<LocalBenchmark>(options, native);
+    preparing.wait();
+    std::jthread cancellation([&] {
+        cancelling.count_down();
+        cancelled.reset();
+    });
+    cancelling.wait();
+    allow_setup.count_down();
     cancellation.join();
 }
 
@@ -552,6 +655,7 @@ int main() {
         test_context_switch_ring();
         test_thread_creation();
         test_lock_contention();
+        test_cross_core_handoff();
         test_page_faults();
         std::cout << "Native local benchmark tests passed\n";
         return 0;
