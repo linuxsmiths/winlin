@@ -61,6 +61,8 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
                 "results": [] if self.server.running else [{
                     "repetition": 1, "operations": 100, "operations_per_second": 1000,
                     "mean_operation_ns": 1000000, "reference_cycles_per_operation": 2000,
+                    "mean_round_trip_ns": 123456, "mean_ring_lap_ns": 654321,
+                    "observed_page_faults": {"total": 7},
                     "server_host": {"cpu_utilization_percent": 100}, "errors": 0,
                 }],
             })
@@ -73,6 +75,8 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
             self.respond({
                 "run_id": "ab" * 32, "settings": settings, "transport": "server-local",
                 "operation_unit": "fixture operation", "benchmark": settings["benchmark"],
+                "server_cpu": settings.get("server_cpu", 0),
+                "execution_threads": settings.get("threads", settings["workers"]),
             })
         else:
             self.server.stops += 1
@@ -167,7 +171,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
     target.chmod(0o600)
     try:
         for benchmark, parameters in (
-            ("context-switch", ["--server-cpu", "2"]),
+            ("context-switch", ["--server-cpu", "2", "--threads", "32"]),
             ("syscall", ["--operation", "minimal-query"]),
             ("allocation", ["--allocation-size", "512B", "--live-allocations", "4",
                             "--memory-touch", "pages", "--server-workers", "2"]),
@@ -180,11 +184,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
             )
             assert result.returncode == 0, result.stdout + result.stderr
             assert f"Server-local {benchmark}" in result.stdout
+            if benchmark == "context-switch":
+                assert "mean lap(ns)" in result.stdout and "654321.00" in result.stdout
+                assert "execution threads=32" in result.stdout
             report = json.loads(output.read_text())
             assert report["status"] == "completed" and len(report["results"]) == 1
             assert "ab" * 32 not in output.read_text()
             assert not {"tls", "cipher", "get_response_data"} & server.settings[-1].keys()
         assert server.settings[0]["server_cpu"] == 2
+        assert server.settings[0]["threads"] == 32
         assert server.settings[2]["allocation_size"] == 512
         assert server.stops == 3
         server.fail_run = True
@@ -256,6 +264,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
         assert server.settings[-1]["region_size"] == 128 * 1024 * 1024
         assert "duration" not in server.settings[-1]
         assert "Observed faults" in result.stdout
+        assert re.search(r"\s7\n", result.stdout), result.stdout
         result = subprocess.run(
             [client, "run", "--target", str(target), "--benchmark", "page-fault",
              "--duration", "10"], capture_output=True, text=True, timeout=15,
@@ -273,6 +282,28 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
         replay = subprocess.run(shlex.split(displayed.group(1)),
                                 capture_output=True, text=True, timeout=15)
         assert replay.returncode == 0, replay.stdout + replay.stderr
+        result = subprocess.run(
+            [client], input="4\ncontext-switch\n1\n8\nauto\n0.02\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--threads 8" in displayed.group(1), result.stdout
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        assert server.settings[-1]["threads"] == 8
+        for benchmark, parameters in (
+            ("context-switch", ["--threads", "1"]),
+            ("context-switch", ["--threads", "1025"]),
+            ("syscall", ["--threads", "8"]),
+        ):
+            result = subprocess.run(
+                [client, "run", "--target", str(target), "--benchmark", benchmark, *parameters],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
     finally:
         server.shutdown()
         server.server_close()

@@ -9,6 +9,9 @@ run lease, including abandonment expiry and explicit stop/join cleanup.
 winlin run --target linux.json --benchmark context-switch \
   --server-cpu 2 --duration 30 --repetitions 3
 
+winlin run --target windows.json --benchmark context-switch \
+  --threads 1024 --server-cpu 2 --duration 30 --repetitions 3
+
 winlin run --target windows.json --benchmark syscall \
   --operation minimal-query --server-cpu 2 --duration 30 --repetitions 3
 
@@ -54,15 +57,33 @@ one. Reference cycles use whole-server CPU samples and include boundary sampling
 and background work. Short passes can be dominated by CPU-counter granularity;
 prefer larger regions on otherwise idle, comparable hosts.
 
-**Context-switch:** exactly two threads are pinned to the same logical CPU and
-exchange a token using a mutex and condition variable, without a userspace spin
-loop. Each full ping-pong counts two directed handoffs. Reported mean handoff
-latency is half the measured round-trip mean, not a directly timed one-way
-latency. Handoffs are not substituted for actual scheduler context switches.
+**Context-switch:** `--threads` selects 2–1024 participants (default two), all
+pinned to the same logical CPU. A shared mutex protects a token; each participant
+has its own condition variable and wakes only its successor, with the last waking
+the first. There is no userspace spin loop or wake-all on steady-state handoffs.
+Thread zero checks the deadline between complete laps and counts one directed
+handoff per participant per lap. A final lap may extend beyond the duration.
+Clock/check overhead is amortized once per lap, so it contributes less per
+handoff as participant count increases.
+Mean handoff latency is amortized lap time divided by participant count, not a
+directly timed one-way latency. Two participants retain the round-trip fields
+and console label; larger rings report mean lap time separately.
+
+This stresses a larger thread/synchronization/cache footprint, not a run queue
+of 1024 runnable tasks: normally only the current participant and its successor
+are runnable. Compare 2, 8, 32, 128, and 1024 threads on an otherwise idle CPU.
+Metadata identifies `blocking-cv-ring-v1`. Even the two-thread case now uses
+dedicated signals, so rerun the baseline when comparing against the older
+single-condition-variable implementation. Shutdown/failure wakes all blocked
+participants; normal final wakeups remain inside the sampling interval.
+Thread creation, joins, and stack release remain outside measurement.
+Native thread/resource failures fail the run rather than reducing thread count.
+
+Handoffs are not substituted for actual scheduler context switches.
 Native mutex/wait implementations differ across platforms and are part of the
 measurement. Scheduler counters, when available, cover the entire server
 process, including HTTP control threads; Windows currently reports them as
-unavailable. The JSON includes their rate and the round-trip mean separately.
+unavailable. The JSON includes their rate, completed ring laps, and mean lap time.
 
 **Syscall:** Linux calls `syscall(SYS_gettid)` explicitly; Windows calls
 `NtQueryInformationThread(ThreadBasicInformation)` on the current thread. These

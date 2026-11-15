@@ -14,6 +14,7 @@ struct BenchmarkOptions {
     std::string benchmark{"https"}, operation{"minimal-query"}, memory_touch{"none"};
     double duration{30};
     unsigned repetitions{3};
+    unsigned threads{2};
     int server_cpu{-1};
     std::size_t allocation_size{4096}, live_allocations{1};
     std::size_t region_size{64 * 1024 * 1024};
@@ -40,6 +41,7 @@ struct BenchmarkOptions {
                 ((key == "duration" && benchmark != "page-fault") || key == "repetitions" ||
                  (key == "server_cpu" && benchmark != "allocation") ||
                  (key == "operation" && benchmark == "syscall") ||
+                 (key == "threads" && benchmark == "context-switch") ||
                  (benchmark == "allocation" &&
                   (key == "allocation_size" || key == "live_allocations" ||
                    key == "memory_touch")) ||
@@ -68,6 +70,10 @@ struct BenchmarkOptions {
         if (benchmark != "https") {
             result.duration = value.value("duration", result.duration);
             result.repetitions = bounded("repetitions", result.repetitions, 1000);
+            result.threads = bounded("threads", 2, 1024);
+            if (result.threads < 2) {
+                throw std::invalid_argument("Context-switch requires 2-1024 threads");
+            }
             if (!std::isfinite(result.duration) || result.duration < 0.01 ||
                 result.duration > 3600) {
                 throw std::invalid_argument("Local benchmark duration must be 0.01-3600 seconds");
@@ -131,6 +137,9 @@ struct BenchmarkOptions {
                 result["live_allocations"] = live_allocations;
                 result["memory_touch"] = memory_touch;
             } else {
+                if (benchmark == "context-switch") {
+                    result["threads"] = threads;
+                }
                 result["server_cpu"] = server_cpu < 0 ? Json(nullptr) : Json(server_cpu);
                 if (benchmark == "syscall") {
                     result["operation"] = operation;

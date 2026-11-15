@@ -39,16 +39,24 @@ class LocalBenchmark final : public BenchmarkInstance {
     std::atomic<bool> stop_{};
     std::atomic<bool> cancelled_{};
     std::mutex handoff_mutex_;
-    std::condition_variable handoff_;
+    std::vector<std::unique_ptr<std::condition_variable>> handoff_signals_;
     mutable std::mutex results_mutex_;
     Json results_ = Json::array();
     std::string status_{"running"}, failure_;
     std::jthread coordinator_;
 
+    // Broadcast only for shutdown or failure; steady-state handoffs target one successor.
+    void wake_participants() {
+        for (const auto& signal : handoff_signals_) {
+            signal->notify_all();
+        }
+    }
+
     // Execute one stage. Workers finish setup before the boundary and park after their last
     // operation until telemetry is captured, keeping thread teardown outside CPU sampling.
     Json stage(double duration, bool measure) {
-        const unsigned count = options_.benchmark == "context-switch" ? 2 : options_.workers;
+        const unsigned count =
+            options_.benchmark == "context-switch" ? options_.threads : options_.workers;
         std::latch ready(count), start(1), finished(count), release(1);
         std::vector<std::jthread> workers;
         std::vector<std::uint64_t> operations(count);
@@ -56,7 +64,8 @@ class LocalBenchmark final : public BenchmarkInstance {
         std::mutex error_mutex;
         std::string error;
         std::atomic<bool> failed{};
-        bool turn{}, done{};
+        unsigned token{};
+        bool done{};
         Clock::time_point begin;
         // Retain the first worker error and wake a peer that might otherwise block forever.
         const auto fail = [&](const std::exception& exception) {
@@ -70,7 +79,7 @@ class LocalBenchmark final : public BenchmarkInstance {
                 std::lock_guard lock(handoff_mutex_);
                 failed = true;
             }
-            handoff_.notify_all();
+            wake_participants();
         };
         try {
             for (unsigned index = 0; index < count; ++index) {
@@ -118,33 +127,34 @@ class LocalBenchmark final : public BenchmarkInstance {
                                 }
                             }
                         } else if (options_.benchmark == "context-switch") {
-                            // A mutex/condition-variable handoff blocks instead of spinning.
-                            // Both threads share one logical CPU; only thread zero counts a
-                            // completed round trip (two directed handoffs).
+                            // Each participant has a dedicated blocking signal on the same CPU.
+                            // Only thread zero counts completed laps, so unfinished token passes
+                            // are never reported as successful handoffs.
                             std::unique_lock lock(handoff_mutex_);
                             if (index == 0) {
                                 while (!stop_ && !failed && Clock::now() < deadline) {
-                                    turn = true;
-                                    handoff_.notify_one();
-                                    handoff_.wait(lock, [&] {
-                                        return !turn || stop_ || failed;
+                                    token = 1;
+                                    handoff_signals_[1]->notify_one();
+                                    handoff_signals_[0]->wait(lock, [&] {
+                                        return token == 0 || stop_ || failed;
                                     });
                                     if (!stop_ && !failed) {
-                                        completed += 2;
+                                        completed += count;
                                     }
                                 }
                                 done = true;
-                                handoff_.notify_all();
+                                wake_participants();
                             } else {
+                                const auto successor = (index + 1) % count;
                                 for (;;) {
-                                    handoff_.wait(lock, [&] {
-                                        return turn || done || stop_ || failed;
+                                    handoff_signals_[index]->wait(lock, [&] {
+                                        return token == index || done || stop_ || failed;
                                     });
                                     if (done || stop_ || failed) {
                                         break;
                                     }
-                                    turn = false;
-                                    handoff_.notify_one();
+                                    token = successor;
+                                    handoff_signals_[successor]->notify_one();
                                 }
                             }
                         } else {
@@ -212,7 +222,7 @@ class LocalBenchmark final : public BenchmarkInstance {
                 std::lock_guard lock(handoff_mutex_);
                 stop_ = true;
             }
-            handoff_.notify_all();
+            wake_participants();
             start.count_down();
             release.count_down();
             workers.clear();
@@ -291,8 +301,13 @@ class LocalBenchmark final : public BenchmarkInstance {
                 result["scheduler_context_switches_per_second"] = delta / elapsed;
             }
             if (options_.benchmark == "context-switch") {
-                result["round_trips"] = total / 2;
-                result["mean_round_trip_ns"] = seconds * 1e9 / (total / 2);
+                result["ring_threads"] = count;
+                result["ring_laps"] = total / count;
+                result["mean_ring_lap_ns"] = seconds * 1e9 / (total / count);
+                if (count == 2) {
+                    result["round_trips"] = total / 2;
+                    result["mean_round_trip_ns"] = result["mean_ring_lap_ns"];
+                }
             }
             if (options_.benchmark == "page-fault") {
                 result["region_size_bytes"] = options_.region_size;
@@ -302,12 +317,12 @@ class LocalBenchmark final : public BenchmarkInstance {
                     Json delta = nullptr;
                     if (measure && faults_before.value(key, Json(nullptr)).is_number() &&
                         faults_after.value(key, Json(nullptr)).is_number()) {
-                        const auto count = faults_after.at(key).get<std::int64_t>() -
-                                           faults_before.at(key).get<std::int64_t>();
-                        if (count < 0) {
+                        const auto fault_delta = faults_after.at(key).get<std::int64_t>() -
+                                                 faults_before.at(key).get<std::int64_t>();
+                        if (fault_delta < 0) {
                             throw std::runtime_error("Native page-fault counters decreased");
                         }
-                        delta = count;
+                        delta = fault_delta;
                     }
                     result["observed_page_faults"][key] = delta;
                 }
@@ -319,7 +334,7 @@ class LocalBenchmark final : public BenchmarkInstance {
                 std::lock_guard lock(handoff_mutex_);
                 stop_ = true;
             }
-            handoff_.notify_all();
+            wake_participants();
             // If sampling failed before start, workers still need both gates released.
             if (!start.try_wait()) {
                 start.count_down();
@@ -366,6 +381,11 @@ public:
         if (options_.benchmark != "allocation") {
             cpu_ = native_.resolve_cpu(options_.server_cpu);
         }
+        if (options_.benchmark == "context-switch") {
+            for (unsigned index = 0; index < options_.threads; ++index) {
+                handoff_signals_.push_back(std::make_unique<std::condition_variable>());
+            }
+        }
         if (options_.benchmark == "page-fault") {
             if (options_.region_size % native_.page_size != 0) {
                 throw std::invalid_argument(
@@ -387,7 +407,7 @@ public:
             cancelled_ = true;
             stop_ = true;
         }
-        handoff_.notify_all();
+        wake_participants();
         coordinator_.join();
     }
 
@@ -406,7 +426,10 @@ public:
             {"environment", native_.environment},
             {"warmup_seconds", options_.benchmark == "page-fault" ? Json(nullptr) : Json(2)},
             {"warmup_regions", options_.benchmark == "page-fault" ? Json(1) : Json(nullptr)},
-            {"execution_threads", options_.benchmark == "context-switch" ? 2 : options_.workers},
+            {"execution_threads",
+             options_.benchmark == "context-switch" ? options_.threads : options_.workers},
+            {"handoff_implementation",
+             options_.benchmark == "context-switch" ? Json("blocking-cv-ring-v1") : Json(nullptr)},
             {"native_page_size_bytes", native_.page_size},
             {"memory_backend",
              options_.benchmark == "page-fault" ? Json(native_.memory_backend) : Json(nullptr)},

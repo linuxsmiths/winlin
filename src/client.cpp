@@ -1155,8 +1155,8 @@ BenchmarkOptions local_configuration(const Args& args) {
         args.allow({"--benchmark", "--target", "--repetitions", "--output", "--server-cpu",
                     "--region-size"});
     } else {
-        args.allow(
-            {"--benchmark", "--target", "--duration", "--repetitions", "--output", "--server-cpu"});
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
+                    "--server-cpu", "--threads"});
     }
     Json settings{{"benchmark", benchmark},
                   {"duration", seconds(args.get("--duration", "30"), 3600)},
@@ -1167,6 +1167,9 @@ BenchmarkOptions local_configuration(const Args& args) {
         settings.erase("duration");
         settings["region_size"] =
             object_size(args.get("--region-size", "64MiB"), std::size_t{1024} * 1024 * 1024);
+    }
+    if (benchmark == "context-switch") {
+        settings["threads"] = number(args.get("--threads", "2"), 1024);
     }
     if (benchmark == "allocation") {
         settings["allocation_size"] = object_size(args.get("--allocation-size", "4KiB"));
@@ -1268,7 +1271,7 @@ int run_local(Target target, const BenchmarkOptions& options,
             std::cout << "Server logical CPU=" << started.at("server_cpu")
                       << " | execution threads="
                       << started.value("execution_threads",
-                                       options.benchmark == "context-switch" ? 2 : 1)
+                                       options.benchmark == "context-switch" ? options.threads : 1)
                       << '\n';
         }
         if (options.benchmark == "page-fault") {
@@ -1277,7 +1280,8 @@ int run_local(Target target, const BenchmarkOptions& options,
         }
         std::cout << "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op";
         if (options.benchmark == "context-switch") {
-            std::cout << "     mean RTT(ns)      Sched CS/s";
+            std::cout << (options.threads == 2 ? "     mean RTT(ns)" : "     mean lap(ns)")
+                      << "      Sched CS/s";
         }
         if (options.benchmark == "page-fault") {
             std::cout << "   Observed faults";
@@ -1312,8 +1316,9 @@ int run_local(Target target, const BenchmarkOptions& options,
                     }
                 }
                 if (options.benchmark == "context-switch") {
-                    for (const auto* key :
-                         {"mean_round_trip_ns", "scheduler_context_switches_per_second"}) {
+                    const auto* lap_key =
+                        options.threads == 2 ? "mean_round_trip_ns" : "mean_ring_lap_ns";
+                    for (const auto* key : {lap_key, "scheduler_context_switches_per_second"}) {
                         const auto metric = result.value(key, Json(nullptr));
                         std::cout << std::setw(16);
                         if (metric.is_number()) {
@@ -1322,15 +1327,15 @@ int run_local(Target target, const BenchmarkOptions& options,
                             std::cout << "N/A";
                         }
                     }
-                    if (options.benchmark == "page-fault") {
-                        const auto faults = result.value("observed_page_faults", Json::object())
-                                                .value("total", Json(nullptr));
-                        std::cout << std::setw(18);
-                        if (faults.is_number()) {
-                            std::cout << faults;
-                        } else {
-                            std::cout << "N/A";
-                        }
+                }
+                if (options.benchmark == "page-fault") {
+                    const auto faults = result.value("observed_page_faults", Json::object())
+                                            .value("total", Json(nullptr));
+                    std::cout << std::setw(18);
+                    if (faults.is_number()) {
+                        std::cout << faults.get<std::int64_t>();
+                    } else {
+                        std::cout << "N/A";
                     }
                 }
                 std::cout << '\n';
@@ -1837,6 +1842,9 @@ void interactive(std::string_view executable) {
                            "context-switch");
                 const auto target_path = select_target();
                 Json settings{{"benchmark", benchmark}, {"workers", 1}};
+                if (benchmark == "context-switch") {
+                    settings["threads"] = number(prompt("Ring threads (2-1024)", "2"), 1024);
+                }
                 if (benchmark == "allocation") {
                     settings["allocation_size"] = object_size(prompt("Allocation size", "4KiB"));
                     settings["live_allocations"] =
@@ -1882,8 +1890,13 @@ void interactive(std::string_view executable) {
                               << " --live-allocations " << options.live_allocations
                               << " --memory-touch " << shell_argument(options.memory_touch)
                               << " --server-workers " << options.workers;
-                } else if (options.server_cpu >= 0) {
-                    std::cout << " --server-cpu " << options.server_cpu;
+                } else {
+                    if (benchmark == "context-switch") {
+                        std::cout << " --threads " << options.threads;
+                    }
+                    if (options.server_cpu >= 0) {
+                        std::cout << " --server-cpu " << options.server_cpu;
+                    }
                 }
                 if (output) {
                     std::cout << " --output " << shell_argument(output->string());
@@ -1935,6 +1948,7 @@ int main(int argc, char** argv) {
                    "winlin run --target FILE --benchmark context-switch|syscall|allocation\n"
                    "           [--duration 30] [--repetitions 3] [--output FILE]\n"
                    "           context-switch/syscall: [--server-cpu N] (default: auto)\n"
+                   "           context-switch: [--threads 2] (2-1024, same-CPU blocking ring)\n"
                    "           syscall: [--operation minimal-query]\n"
                    "           allocation: [--allocation-size 4KiB] [--live-allocations 1]\n"
                    "                       [--memory-touch none|pages] [--server-workers 1]\n"

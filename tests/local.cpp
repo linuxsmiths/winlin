@@ -73,6 +73,9 @@ void test_workloads() {
 void test_failures() {
     for (const auto& value : {Json{{"benchmark", "syscall"}, {"tls", "on"}},
                               Json{{"benchmark", "context-switch"}, {"workers", 2}},
+                              Json{{"benchmark", "context-switch"}, {"threads", 1}},
+                              Json{{"benchmark", "context-switch"}, {"threads", 1025}},
+                              Json{{"benchmark", "syscall"}, {"threads", 8}},
                               Json{{"benchmark", "allocation"},
                                    {"allocation_size", 67108864},
                                    {"live_allocations", 65536}},
@@ -109,6 +112,79 @@ void test_failures() {
     native = native_operations();
     LocalBenchmark cancelled(
         BenchmarkOptions::parse({{"benchmark", "context-switch"}, {"duration", 30}}), native);
+}
+
+// Larger rings must circulate across repetitions on the requested CPU and retain handoff units.
+void test_context_switch_ring() {
+    for (unsigned participants : {8u, 32u}) {
+        auto native = native_operations();
+        const auto bind = native.bind_cpu;
+        const auto cpu = native.resolve_cpu(-1);
+        std::atomic<unsigned> bindings{};
+        native.bind_cpu = [&](unsigned selected_cpu) {
+            require(selected_cpu == cpu, "All ring participants must share the selected CPU");
+            bind(selected_cpu);
+            ++bindings;
+        };
+        LocalBenchmark benchmark(BenchmarkOptions::parse({{"benchmark", "context-switch"},
+                                                          {"threads", participants},
+                                                          {"duration", 0.02},
+                                                          {"repetitions", 2}}),
+                                 native);
+        const auto sample = finish(benchmark);
+        require(sample.at("status") == "completed", sample.dump().c_str());
+        require(sample.at("results").size() == 2, "Ring stages must restart after each repetition");
+        for (const auto& result : sample.at("results")) {
+            const auto laps = result.at("ring_laps").get<std::uint64_t>();
+            require(laps > 0 && result.at("operations").get<std::uint64_t>() == participants * laps,
+                    "Only complete laps count, with one directed handoff per participant");
+            require(result.at("mean_ring_lap_ns").get<double>() > 0 &&
+                        !result.contains("mean_round_trip_ns"),
+                    "A many-thread lap must not be mislabeled as a two-thread round trip");
+        }
+        require(bindings == participants * 3, "Every stage must pin all of its participants");
+    }
+
+    // One failed participant must wake the whole ring rather than strand its predecessor.
+    auto native = native_operations();
+    const auto bind = native.bind_cpu;
+    std::atomic<unsigned> bindings{};
+    native.bind_cpu = [&](unsigned cpu) {
+        bind(cpu);
+        if (++bindings == 3) {
+            throw std::runtime_error("injected ring participant failure");
+        }
+    };
+    {
+        LocalBenchmark failed(
+            BenchmarkOptions::parse({{"benchmark", "context-switch"}, {"threads", 8}}), native);
+        const auto sample = finish(failed);
+        require(sample.at("status") == "failed" &&
+                    sample.at("failure") == "injected ring participant failure",
+                "Ring failures must reach the coordinator without a deadlock");
+    }
+
+    // Cancellation during setup must release start gates and all dedicated blocking signals.
+    native = native_operations();
+    std::latch preparing(1), allow_setup(1), cancelling(1);
+    bindings = 0;
+    native.bind_cpu = [&](unsigned cpu) {
+        bind(cpu);
+        if (++bindings == 1) {
+            preparing.count_down();
+            allow_setup.wait();
+        }
+    };
+    auto cancelled = std::make_unique<LocalBenchmark>(
+        BenchmarkOptions::parse({{"benchmark", "context-switch"}, {"threads", 8}}), native);
+    preparing.wait();
+    std::jthread cancellation([&] {
+        cancelling.count_down();
+        cancelled.reset();
+    });
+    cancelling.wait();
+    allow_setup.count_down();
+    cancellation.join();
 }
 
 // Each region is untouched until the measured pass and released only after final samples.
@@ -269,6 +345,7 @@ int main() {
     try {
         test_workloads();
         test_failures();
+        test_context_switch_ring();
         test_page_faults();
         std::cout << "Native local benchmark tests passed\n";
         return 0;
