@@ -28,6 +28,10 @@ yet.** The broader architecture and benchmark areas below describe
 the intended suite, not a completed feature list. This first implementation is
 not yet a validated 100 Gbps or cross-OS performance comparison tool.
 
+The [performance study draft](docs/performance-study.md) explains the
+XStore-relevant motivation, benchmark methodology, and results framework.
+It is a review draft, not a finalized cross-OS performance report.
+
 ## Building and trying it
 
 The Linux targets require a C++23 compiler, CMake 3.24 or newer, and OpenSSL 3
