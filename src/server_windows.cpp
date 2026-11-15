@@ -190,6 +190,7 @@ AgentConfig windows_config() {
     config.process_cpu_scope =
         "application process only; excludes HTTP.sys/Schannel work charged to System";
     config.environment["workload_inline_sync_completions"] = true;
+    config.environment["workload_completion_success_fast_path"] = true;
     return config;
 }
 

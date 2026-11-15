@@ -299,6 +299,12 @@ completion delivery, not response caching, payload copies, TLS, or IOCP batch si
 Environment metadata identifies `workload_inline_sync_completions`. Startup fails
 explicitly if Windows cannot apply the notification modes.
 
+For dequeued completions, exact native success is recognized from the retained
+`OVERLAPPED` status without another `GetOverlappedResult` call. Other native
+statuses still use Windows error translation, and explicit submission errors
+take precedence. Packet byte counts, buffer lifetimes, and shutdown accounting
+are unchanged. Metadata identifies `workload_completion_success_fast_path`.
+
 ## Tests
 
 Ordinary Windows tests cover the shared agent, core behavior, native credential

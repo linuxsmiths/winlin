@@ -54,11 +54,15 @@ inline void initialize_reference_clock() {
 }
 
 // Decode one already-dequeued completion without waiting. A successful batch dequeue does not
-// imply successful I/O; ask Windows to translate each native OVERLAPPED result to a Win32 error.
-// Synthetic submission failures already carry a Win32 error and have no native result to query.
+// imply successful I/O. Exact native STATUS_SUCCESS needs no result query; other statuses retain
+// Windows' Win32 error translation. Inspect Internal only after completion, never on pending I/O.
+// Synthetic submission failures take precedence even when their OVERLAPPED status is zero.
 inline ULONG completion_error(HANDLE handle, OVERLAPPED* overlapped, ULONG immediate_error) {
     if (immediate_error) {
         return immediate_error;
+    }
+    if (overlapped->Internal == 0) {
+        return NO_ERROR;
     }
     DWORD transferred{};
     return GetOverlappedResult(handle, overlapped, &transferred, FALSE) ? NO_ERROR : GetLastError();

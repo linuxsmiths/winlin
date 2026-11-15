@@ -251,6 +251,12 @@ void test_synchronous_completions() {
                 entries[0].dwNumberOfBytesTransferred == sent.size() &&
                 completion_error(pipe.value, &read, NO_ERROR) == NO_ERROR,
             "An explicit yield packet must preserve native completion status and byte count");
+    // A native result query requires a valid handle. Passing an invalid handle after a real
+    // successful completion proves the success path uses only its retained status.
+    require(completion_error(INVALID_HANDLE_VALUE, &read, NO_ERROR) == NO_ERROR,
+            "Successful completion must not query the native handle again");
+    require(completion_error(INVALID_HANDLE_VALUE, &read, ERROR_INVALID_DATA) == ERROR_INVALID_DATA,
+            "Synthetic errors must override a retained successful native status");
 }
 }
 
