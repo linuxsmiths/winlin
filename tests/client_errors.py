@@ -695,6 +695,29 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             multiple_workers[multiple_workers.index(option) + 1] = "2"
 
         if faults:
+            # A syscall-level probe rejects pre-write EPOLLOUT and repeated interest masks.
+            # Force both a blocked write and a partial header; framing and request limits
+            # must remain correct across connections and consecutive repetitions.
+            output = directory / "optimistic-epoll.json"
+            arguments = benchmark.copy()
+            for option, value in (("--connections", "2"), ("--workers", "1"),
+                                  ("--requests", "8")):
+                arguments[arguments.index(option) + 1] = value
+            result = subprocess.run(
+                [*arguments, "--tls", "off", "--output", str(output)],
+                capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, LD_PRELOAD=faults,
+                         WINLIN_TEST_DATA_PORT=str(plain.server_port),
+                         WINLIN_TEST_OPTIMISTIC_WRITES="1"),
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            for marker in ("injected blocked optimistic write", "injected partial request write",
+                           "verified optimistic request write"):
+                assert marker in result.stderr, result.stderr
+            optimistic = json.loads(output.read_text())
+            assert all(entry["issued"] == 8 and entry["completed"] == 8 and entry["errors"] == 0
+                       for entry in optimistic["results"])
+
             # Check the TLS write itself and exact body framing through retries, multiple
             # connections/repetitions, and mixed requests. Include empty and multi-record PUTs.
             for size in (0, 256, 16384, 65536):

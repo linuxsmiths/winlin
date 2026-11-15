@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,18 @@ struct TlsRetry {
 };
 
 thread_local TlsRetry tls_retry;
+
+// Track only one test worker's registrations and observed write backpressure. This lets the
+// preload shim reject redundant MODs and premature write-readiness requests without production
+// instrumentation. The focused fixture uses a few descriptors, never the full benchmark limit.
+struct EpollProbe {
+    std::array<std::uint32_t, 4096> masks{};
+    std::array<bool, 4096> seen{};
+    std::array<bool, 4096> parked{};
+    std::array<bool, 4096> blocked{};
+};
+
+thread_local EpollProbe epoll_probe;
 
 // Resolve libc directly so an injected syscall can delegate without recursively calling itself.
 template <typename Function> Function next_symbol(const char* name) {
@@ -192,7 +205,72 @@ extern "C" ssize_t send(int fd, const void* buffer, std::size_t length, int flag
         std::fprintf(stderr, "Fatal test shim error: MSG_MORE is enabled in baseline transport\n");
         std::_Exit(127);
     }
-    return real_send(fd, buffer, length, flags);
+    static const bool optimistic = std::getenv("WINLIN_TEST_OPTIMISTIC_WRITES") != nullptr;
+    if (!optimistic || !workload_socket(fd)) {
+        return real_send(fd, buffer, length, flags);
+    }
+    if (fd < 0 || static_cast<std::size_t>(fd) >= epoll_probe.masks.size()) {
+        std::fprintf(stderr, "Fatal test shim error: epoll probe descriptor limit exceeded\n");
+        std::_Exit(127);
+    }
+    static std::atomic<bool> blocked_once{}, partial_once{}, checked{};
+    if (!blocked_once.exchange(true)) {
+        epoll_probe.blocked[fd] = true;
+        std::fprintf(stderr, "winlin-test: injected blocked optimistic write\n");
+        errno = EAGAIN;
+        return -1;
+    }
+    if (epoll_probe.blocked[fd] && length > 1 && !partial_once.exchange(true)) {
+        const auto sent = real_send(fd, buffer, length / 2, flags);
+        if (sent > 0) {
+            epoll_probe.blocked[fd] = false;
+            std::fprintf(stderr, "winlin-test: injected partial request write\n");
+        }
+        return sent;
+    }
+    const auto sent = real_send(fd, buffer, length, flags);
+    epoll_probe.blocked[fd] =
+        sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+    if (sent > 0 && epoll_probe.parked[fd] && !(epoll_probe.masks[fd] & EPOLLOUT) &&
+        !checked.exchange(true)) {
+        std::fprintf(stderr, "winlin-test: verified optimistic request write\n");
+    }
+    return sent;
+}
+
+// Check syscall-level behavior, including setup masks, rather than just counting successful I/O.
+extern "C" int epoll_ctl(int poller, int operation, int fd, epoll_event* event) {
+    static const auto real_control = next_symbol<decltype(&epoll_ctl)>("epoll_ctl");
+    static const bool verify = std::getenv("WINLIN_TEST_OPTIMISTIC_WRITES") != nullptr;
+    if (!verify || !event) {
+        return real_control(poller, operation, fd, event);
+    }
+    if (fd < 0 || static_cast<std::size_t>(fd) >= epoll_probe.masks.size()) {
+        std::fprintf(stderr, "Fatal test shim error: epoll probe descriptor limit exceeded\n");
+        std::_Exit(127);
+    }
+    if (operation == EPOLL_CTL_MOD && epoll_probe.seen[fd] && workload_socket(fd)) {
+        if (event->events == epoll_probe.masks[fd]) {
+            std::fprintf(stderr, "Fatal test shim error: redundant epoll interest update\n");
+            std::_Exit(127);
+        }
+        if (event->events == EPOLLOUT && epoll_probe.parked[fd] && !epoll_probe.blocked[fd]) {
+            std::fprintf(stderr, "Fatal test shim error: EPOLLOUT armed before a blocked write\n");
+            std::_Exit(127);
+        }
+    }
+    const int result = real_control(poller, operation, fd, event);
+    if (result == 0) {
+        epoll_probe.seen[fd] = true;
+        epoll_probe.masks[fd] = event->events;
+        if (operation == EPOLL_CTL_ADD) {
+            epoll_probe.parked[fd] = false;
+            epoll_probe.blocked[fd] = false;
+        } else if (event->events == 0) {
+            epoll_probe.parked[fd] = true;
+        }
+    }
+    return result;
 }
 
 // Deliver an already-ready response only after its deadline has passed.

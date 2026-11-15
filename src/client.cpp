@@ -432,6 +432,8 @@ struct LoadConnection {
         read_body
     } state{State::handshake};
     bool alive{true}, get{};
+    // Cache the last successful epoll registration; one worker owns all updates.
+    std::uint32_t registered_events{};
     // Borrow the immutable header (plus the first body bytes for TLS PUTs) through retries.
     std::string_view header;
     // buffer: accumulate response headers directly, then reuse it to discard response body bytes
@@ -488,13 +490,13 @@ struct LoadConnection {
     // It returns true when the connection is idle and ready for a new request, or false when
     // more processing is needed. The caller must wait for the socket to be ready for reading
     // or writing before calling pump() again. The socket.want field is updated to indicate
-    // which events the socket is waiting for. The caller must handle EPOLLIN and EPOLLOUT events
-    // and call pump() again when the socket is ready.
+    // which events the socket is waiting for. write_only attempts a newly issued request without
+    // waiting for writability, then stops before response reads and requests EPOLLIN.
     //
     // payload: outgoing PUT request body, passed by reference to avoid copying. It must be
     //          at least config.put_size bytes long.
     bool pump(const Target& target, const RunConfig& config, const std::vector<char>& payload,
-              Stats& stats, Clock::duration request_timeout) {
+              Stats& stats, Clock::duration request_timeout, bool write_only = false) {
         // Every pump() call makes forward progress on the current request.
         // It returns true when the request is complete and the connection is idle, or false
         // when more processing is needed. The caller must wait for the socket to be ready
@@ -551,6 +553,12 @@ struct LoadConnection {
                     offset += count;
                 }
             } else if (state == State::read_head) {
+                // A fresh request can be written immediately, but its response belongs to the
+                // next readiness turn. Do not chain completed requests in the optimistic path.
+                if (write_only) {
+                    socket.want = EPOLLIN;
+                    return false;
+                }
                 const std::string_view received(buffer.data(), header_received);
                 // Find the end of the HTTP response header in the received bytes,
                 // searching only new bytes and the overlap needed for a split delimiter.
@@ -691,6 +699,14 @@ class LoadWorker {
     std::unordered_map<int, std::unique_ptr<LoadConnection>> connections_;
     std::array<epoll_event, 256> events_{};
 
+    // Level-triggered interests remain armed; update the cache only after a successful MOD.
+    void set_events(LoadConnection& connection, std::uint32_t events) {
+        if (connection.registered_events != events) {
+            poller_.set(connection.socket.fd.value, events);
+            connection.registered_events = events;
+        }
+    }
+
 public:
     // target: Target details (host, port, pin, run_id) for this worker's connections.
     // config: RunConfig details (method, sizes, counts, timeouts) for this worker's requests.
@@ -717,6 +733,7 @@ public:
             const int fd = connection->socket.fd.value;
             // Register the connection's socket fd with epoll for both read and write events
             poller_.set(fd, EPOLLIN | EPOLLOUT, true);
+            connection->registered_events = EPOLLIN | EPOLLOUT;
             connections_.emplace(fd, std::move(connection));
         }
         const auto deadline = Clock::now() + std::chrono::duration<double>(config_.timeout);
@@ -737,9 +754,9 @@ public:
                 // payload_ is not used here, but we pass it to satisfy the pump() signature.
                 if (connection.pump(target_, config_, payload_, unused, request_timeout_)) {
                     ++ready;
-                    poller_.set(connection.socket.fd.value, 0);
+                    set_events(connection, 0);
                 } else {
-                    poller_.set(connection.socket.fd.value, connection.socket.want);
+                    set_events(connection, connection.socket.want);
                 }
             }
         }
@@ -758,6 +775,18 @@ public:
         const auto deadline = start + std::chrono::duration<double>(duration);
         std::size_t active{};
 
+        // Initial optimistic writes and readiness processing retire failures identically.
+        // Closing removes the socket from epoll without replacing the failed connection.
+        auto fail_connection = [&](LoadConnection& connection, const std::string& message) {
+            stats.fail(message);
+            log_warning("Workload connection fd " + std::to_string(connection.socket.fd.value) +
+                        " became dead: " + message +
+                        ". Closing it without replacement; remaining connections continue.");
+            connection.alive = false;
+            connection.socket.fd = Fd{};
+            --active;
+        };
+
         auto issue = [&](LoadConnection& connection) {
             // Stop issuance on cancellation as well as the normal time/connection limits.
             if (!connection.alive || Clock::now() >= deadline ||
@@ -775,12 +804,18 @@ public:
                 // Reserve the next ticket atomically; retry if another worker reserved it first.
             } while (!issued.compare_exchange_weak(ticket, ticket + 1, std::memory_order_relaxed));
 
-            // Start the request on this connection, which sets its state to send_head and begins
-            // the request. The connection will then be driven by pump() until it is idle again
-            // and ready for another request.
+            // Reserve active ownership before attempting I/O so an immediate failure is
+            // counted once, just like a failure discovered by a later readiness event.
             connection.begin(headers_, config_, ticket);
-            // Enable write notifications for the socket already registered with epoll.
-            poller_.set(connection.socket.fd.value, EPOLLOUT);
+            ++active;
+            try {
+                // Try the write before arming EPOLLOUT. Stop before response reads; this adds
+                // at most one bounded write pump after completion of the previous request.
+                connection.pump(target_, config_, payload_, stats, request_timeout_, true);
+                set_events(connection, connection.socket.want);
+            } catch (const std::exception& error) {
+                fail_connection(connection, error.what());
+            }
             return true;
         };
 
@@ -789,22 +824,8 @@ public:
         // requests as they complete, while the limits still allow new requests.
         for (auto& [fd, connection] : connections_) {
             (void)fd;
-            if (issue(*connection)) {
-                ++active;
-            }
+            issue(*connection);
         }
-
-        // Retire each failed request once, regardless of whether readiness or a deadline
-        // sweep discovers it. Closing removes the socket from epoll without replacing it.
-        auto fail_connection = [&](LoadConnection& connection, const std::string& message) {
-            stats.fail(message);
-            log_warning("Workload connection fd " + std::to_string(connection.socket.fd.value) +
-                        " became dead: " + message +
-                        ". Closing it without replacement; remaining connections continue.");
-            connection.alive = false;
-            connection.socket.fd = Fd{};
-            --active;
-        };
 
         // The main loop of the phase. It continues until there are no more active requests,
         // either because issuance has stopped and outstanding requests have been drained,
@@ -863,20 +884,18 @@ public:
                         // and is now idle, ready for a new request. Try to issue a new request on
                         // this connection, if the time and request limits allow.
                         --active;
-                        if (issue(connection)) {
-                            ++active;
-                        } else {
+                        if (!issue(connection)) {
                             // No further request was assigned for this phase. Disable normal
                             // read/write notifications, but leave the socket registered and open.
                             // Errors or hangups may still be reported. Keep live connections for
                             // measurement after warmup; worker destruction eventually closes them.
-                            poller_.set(connection.socket.fd.value, 0);
+                            set_events(connection, 0);
                         }
                     } else {
                         // False return from pump() means the connection is still processing
                         // its current request, and we need to wait for it to be ready for
                         // reading or writing again, or resume after yielding its step budget.
-                        poller_.set(connection.socket.fd.value, connection.socket.want);
+                        set_events(connection, connection.socket.want);
                     }
                 } catch (const std::exception& error) {
                     fail_connection(connection, error.what());
