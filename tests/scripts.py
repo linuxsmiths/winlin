@@ -84,7 +84,7 @@ class Scripts(unittest.TestCase):
         (self.checkout / "scripts").mkdir(parents=True)
         (self.checkout / "build").mkdir()
         (self.checkout / ".winlin-local").mkdir()
-        for script in ("run-client.sh", "run-server.sh"):
+        for script in ("run-client.sh", "run-server.sh", "sweep-https.sh"):
             shutil.copy2(ROOT / "scripts" / script, self.checkout / "scripts" / script)
         shutil.copytree(ROOT / "certs", self.checkout / "certs")
         for name in ("winlin", "winlin-server"):
@@ -96,7 +96,7 @@ class Scripts(unittest.TestCase):
 
     def run_script(self, script, *arguments, expected=0, fd_limits=None, **environment):
         """Run from outside the repository to catch accidental working-directory assumptions."""
-        root = self.checkout if script in ("run-client.sh", "run-server.sh") else ROOT
+        root = self.checkout if script in ("run-client.sh", "run-server.sh", "sweep-https.sh") else ROOT
         result = subprocess.run(
             ["bash", str(root / "scripts" / script), *arguments],
             cwd=self.directory,
@@ -324,6 +324,64 @@ class Scripts(unittest.TestCase):
                 self.assertIn("Raise the hard nofile limit", result.stderr)
                 self.assertEqual(len(self.calls(binary)), before)
                 self.run_script(script, "--", "--help", fd_limits=(1024, 4096))
+
+    def test_https_sweep_matrix(self):
+        """Verify all workload combinations, baseline/load order, defaults and quoted paths."""
+        linux = self.directory / "linux target.json"
+        windows = self.directory / "windows target.json"
+        linux.write_text("{}")
+        windows.write_text("{}")
+        result = self.run_script(
+            "sweep-https.sh", "--linux-target", str(linux), "--windows-target", str(windows),
+        )
+        calls = self.calls("winlin")
+        self.assertEqual(len(calls), 80)
+        index = 0
+        for size in ("256B", "512B", "1KiB", "4KiB", "8KiB", "16KiB", "64KiB",
+                     "256KiB", "1MiB", "4MiB"):
+            for method in ("get", "put"):
+                for phase, connections, workers, target in (
+                    ("baseline", "1", "1", linux), ("baseline", "1", "1", windows),
+                    ("load", "1024", "32", linux), ("load", "1024", "32", windows),
+                ):
+                    arguments = calls[index]
+                    index += 1
+                    self.assertEqual(arguments[0], "run")
+                    options = dict(zip(arguments[1::2], arguments[2::2]))
+                    self.assertEqual(options, {
+                        "--target": str(target), "--tls": "on",
+                        "--cipher": "TLS_AES_128_GCM_SHA256", "--server-workers": "32",
+                        "--workers": workers, "--connections": connections, "--method": method,
+                        "--get-response-data": "copy", "--get-size": size, "--put-size": size,
+                        "--duration": "30", "--requests": "0", "--repetitions": "3",
+                        "--timeout": "10",
+                    })
+                    os_name = "Linux" if target == linux else "Windows"
+                    self.assertIn(
+                        f"{os_name} | {method.upper()} | size={size} | {phase} | "
+                        f"connections={connections} | client workers={workers}", result.stdout,
+                    )
+
+    def test_https_sweep_errors_and_overrides(self):
+        """Stop on native failure, propagate its status, and reject invalid options before I/O."""
+        target = self.directory / "target.json"
+        target.write_text("{}")
+        result = self.run_script(
+            "sweep-https.sh", "--linux-target", str(target), "--windows-target", str(target),
+            "--repetitions", "5", "--duration", "1",
+            "--build-dir", str(self.checkout / "build"),
+            expected=23, WINLIN_TEST_NATIVE_EXIT="23",
+        )
+        self.assertEqual(len(self.calls("winlin")), 1)
+        self.assertIn("sweep incomplete", result.stderr)
+        arguments = self.calls("winlin")[0]
+        self.assertEqual(arguments[arguments.index("--repetitions") + 1], "5")
+        self.assertEqual(arguments[arguments.index("--duration") + 1], "1")
+        for arguments in ((), ("--repetitions", "0"), ("--duration", "abc"),
+                          ("--linux-target",), ("--unexpected",)):
+            self.run_script("sweep-https.sh", *arguments, expected=2)
+        self.assertEqual(len(self.calls("winlin")), 1)
+        self.assertIn("Usage:", self.run_script("sweep-https.sh", "--help").stdout)
 
 
 if __name__ == "__main__":

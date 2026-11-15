@@ -110,6 +110,21 @@ Choose server tuning in the client benchmark menu, or for example:
 ```
 
 Both use the repository's `build/` directory; `--build-dir PATH` overrides it.
+To sweep HTTPS GET/PUT sizes across both servers, including one-connection
+latency baselines before each 1,024-connection comparison:
+
+```sh
+./scripts/sweep-https.sh --linux-target linux.json --windows-target windows.json \
+  --repetitions 3
+```
+
+For each size, GET precedes PUT; each method runs Linux and Windows baselines,
+then Linux and Windows load runs. Server workers are 32; client workers are one
+for baselines and 32 for load runs. GET uses copy mode. Defaults are 30 seconds
+per repetition and three repetitions, plus each invocation's two-second warmup:
+80 invocations take roughly two hours before setup/drain overhead. Console
+results have labeled headers; failures stop the sweep. Use `--help` for options.
+
 The server also accepts `--state-dir PATH`. Put launcher options before native
 arguments, optionally separated by `--`. Use `--help` for launcher help or
 `-- --help` for native help. **Add server** discovers the endpoint and saves the
