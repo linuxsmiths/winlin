@@ -47,6 +47,34 @@ inline std::runtime_error tls_error(std::string message) {
     return std::runtime_error(std::move(message) + ": " + buffer);
 }
 
+// Direct client/server launches need the same descriptor capacity as their shell launchers.
+// Run before creating workers or sockets, preserve larger soft limits, and never alter the
+// inherited hard ceiling. The application name is used only in startup failure diagnostics.
+inline void ensure_file_descriptor_limit(std::string_view application) {
+    constexpr rlim_t minimum_fd_limit = 524288;
+    rlimit limits{};
+    if (getrlimit(RLIMIT_NOFILE, &limits) != 0) {
+        throw system_error("Inspect " + std::string(application) + " file-descriptor limit");
+    }
+    if (limits.rlim_cur >= minimum_fd_limit) {
+        return;
+    }
+    if (limits.rlim_max < minimum_fd_limit) {
+        throw std::runtime_error(
+            std::string(application) + " needs at least " + std::to_string(minimum_fd_limit) +
+            " file descriptors; soft=" + std::to_string(limits.rlim_cur) +
+            ", hard=" + std::to_string(limits.rlim_max) +
+            ". Raise the hard nofile limit for this login/service, then retry.");
+    }
+
+    limits.rlim_cur = minimum_fd_limit;
+    if (setrlimit(RLIMIT_NOFILE, &limits) != 0) {
+        throw system_error("Cannot raise " + std::string(application) +
+                           " soft file-descriptor limit to " + std::to_string(minimum_fd_limit) +
+                           " with hard limit " + std::to_string(limits.rlim_max));
+    }
+}
+
 // Give sockets, files and epoll descriptors one move-only owner. Native helpers transfer ownership
 // with std::exchange; never retry a failed close because the descriptor may already be reused.
 struct Fd {

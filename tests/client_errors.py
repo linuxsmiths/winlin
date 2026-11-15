@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import resource
 import shlex
 import signal
 import socket
@@ -31,6 +32,76 @@ class StalledHandshake(socketserver.BaseRequestHandler):
 
 client = sys.argv[1]
 faults = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
+native_server = str(Path(sys.argv[3]).resolve()) if len(sys.argv) > 3 else None
+
+# Set limits in a separate, single-threaded child before exec, never in the test runner or a
+# preexec_fn used after the HTTP fixture has started threads.
+limited_client = [
+    sys.executable, "-c",
+    "import os, resource, sys\n"
+    "resource.setrlimit(resource.RLIMIT_NOFILE, (int(sys.argv[1]), int(sys.argv[2])))\n"
+    "os.execv(sys.argv[3], sys.argv[3:])\n",
+]
+
+for arguments, input_text in ((["inspect", "--target", "/nonexistent-winlin-target"], None),
+                              ([], "0\n")):
+    result = subprocess.run(
+        [*limited_client, "16", "64", client, *arguments], input=input_text,
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "winlin: FATAL:" in result.stderr, result.stderr
+    assert "524288 file descriptors; soft=16, hard=64" in result.stderr, result.stderr
+    assert "Raise the hard nofile limit" in result.stderr, result.stderr
+
+# Help stays available even when the process cannot obtain benchmark descriptor capacity.
+for command in ("--help", "help"):
+    result = subprocess.run(
+        [*limited_client, "16", "64", client, command],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "winlin run" in result.stdout, result.stdout
+
+if native_server:
+    # Failure must precede guard/listener acquisition, so these checks coexist with a live server.
+    result = subprocess.run(
+        [*limited_client, "16", "64", native_server, "--port", "0"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "winlin-server: FATAL:" in result.stderr, result.stderr
+    assert "524288 file descriptors; soft=16, hard=64" in result.stderr, result.stderr
+    for arguments in ([], ["--help"]):
+        result = subprocess.run(
+            [*limited_client, "16", "64", native_server, *arguments],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "winlin-server" in result.stdout, result.stdout
+
+if faults:
+    # Verify real kernel limits after native startup without binding any server sockets. Invalid
+    # arguments stop both executables before discovery or guard acquisition.
+    hard_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    higher_soft_limit = (524289 if hard_fd_limit == resource.RLIM_INFINITY
+                         else min(524289, hard_fd_limit))
+    executables = [(client, ["winlin-test-invalid"])]
+    if native_server:
+        executables.append((native_server, ["--winlin-test-invalid", "1"]))
+    for executable, invalid_arguments in executables:
+        for soft_limit in (16, higher_soft_limit):
+            result = subprocess.run(
+                [*limited_client, str(soft_limit), str(hard_fd_limit), executable,
+                 *invalid_arguments],
+                capture_output=True, text=True, timeout=15,
+                env=dict(os.environ, LD_PRELOAD=faults, WINLIN_TEST_VERIFY_FD_LIMIT="1"),
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
+            assert "Unknown" in result.stderr, result.stderr
+            assert ("verified native descriptor-limit increase" in result.stderr) == (
+                soft_limit < 524288), result.stderr
+
 with tempfile.TemporaryDirectory(prefix="winlin-client-errors-") as temporary:
     directory = Path(temporary)
     target = directory / "unreachable.json"
@@ -693,6 +764,23 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         multiple_workers = single_repetition.copy()
         for option in ("--connections", "--workers"):
             multiple_workers[multiple_workers.index(option) + 1] = "2"
+
+        # Launch the native binary without its shell wrapper. Sixteen workload sockets plus
+        # control/epoll descriptors exceed the inherited soft limit unless startup raises it.
+        output = directory / "native-fd-limit.json"
+        arguments = benchmark.copy()
+        for option, value in (("--connections", "16"), ("--workers", "1"), ("--requests", "8")):
+            arguments[arguments.index(option) + 1] = value
+        hard_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        result = subprocess.run(
+            [*limited_client, "16", str(hard_fd_limit), *arguments,
+             "--tls", "off", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(output.read_text())
+        assert all(entry["issued"] == 8 and entry["completed"] == 8 and entry["errors"] == 0
+                   for entry in report["results"])
 
         if faults:
             # A syscall-level probe rejects pre-write EPOLLOUT and repeated interest masks.

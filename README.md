@@ -120,10 +120,12 @@ authentication.** It is for isolated synthetic benchmarks only. The client
 recognizes it automatically; custom certificates/pins remain supported. See
 [the fixture documentation](certs/benchmark/README.md).
 
-Linux runtime launches ensure a soft file-descriptor limit of at least **524,288**,
-preserving higher limits. If the inherited hard limit is too low, startup fails
-with instructions to raise it for the login/service. Only the launched process
-is affected; no system-wide settings or hard limits are changed.
+The native Linux client and server enforce a soft file-descriptor limit of at least
+**524,288** at startup, including direct binary launches and client interactive mode.
+Linux runtime launchers enforce the same minimum. Higher soft limits are preserved. If the
+inherited hard limit is too low, startup fails with instructions to raise it for
+the login/service; help remains available. Only the launched process is
+affected; no system-wide settings or hard limits are changed.
 
 On **Windows Server 2022 or Windows 11, x86_64**, use PowerShell:
 

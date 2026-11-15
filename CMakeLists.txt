@@ -113,9 +113,13 @@ if(BUILD_TESTING)
     add_test(NAME scripts COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts.py")
     if(TARGET winlin)
+      set(client_test_server)
+      if(TARGET winlin-server)
+        set(client_test_server "$<TARGET_FILE:winlin-server>")
+      endif()
       add_test(NAME client-errors COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/client_errors.py" "$<TARGET_FILE:winlin>"
-        "$<TARGET_FILE:winlin-test-faults>")
+        "$<TARGET_FILE:winlin-test-faults>" ${client_test_server})
     endif()
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET winlin-server AND TARGET winlin)

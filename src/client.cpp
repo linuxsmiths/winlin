@@ -1601,6 +1601,7 @@ int main(int argc, char** argv) {
         std::signal(SIGPIPE, SIG_IGN);
         // If started w/o options, start interactive mode.
         if (argc == 1) {
+            ensure_file_descriptor_limit("Client");
             interactive(argv[0]);
             return 0;
         }
@@ -1626,6 +1627,7 @@ int main(int argc, char** argv) {
                    "implemented yet.\n";
             return 0;
         }
+        ensure_file_descriptor_limit("Client");
         Args args(argc, argv, 2);
         if (command == "add" || command == "pair") {
             args.allow({"--host", "--port", "--fingerprint", "--target"});

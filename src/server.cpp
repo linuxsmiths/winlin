@@ -772,6 +772,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
+        ensure_file_descriptor_limit("Server");
         std::signal(SIGPIPE, SIG_IGN);
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);

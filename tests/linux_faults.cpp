@@ -478,6 +478,33 @@ extern "C" int getrusage(int who, rusage* data) noexcept {
     return result;
 }
 
+// Verify the actual kernel soft limit and unchanged hard ceiling after native startup raises it.
+extern "C" int setrlimit(int resource, const rlimit* limits) noexcept {
+    static const auto real_set = next_symbol<decltype(&setrlimit)>("setrlimit");
+    static const bool enabled = std::getenv("WINLIN_TEST_VERIFY_FD_LIMIT") != nullptr;
+    // The Python bootstrap also calls setrlimit before exec; inspect only the native minimum.
+    const bool verify = enabled && resource == RLIMIT_NOFILE && limits->rlim_cur == 524288;
+    rlimit before{};
+    if (verify && getrlimit(RLIMIT_NOFILE, &before) != 0) {
+        std::perror("Fatal winlin test shim initial descriptor-limit query error");
+        std::_Exit(127);
+    }
+    const int result = real_set(resource, limits);
+    if (verify && result == 0) {
+        rlimit after{};
+        if (getrlimit(RLIMIT_NOFILE, &after) != 0) {
+            std::perror("Fatal winlin test shim descriptor-limit query error");
+            std::_Exit(127);
+        }
+        if (after.rlim_cur != 524288 || after.rlim_max != before.rlim_max) {
+            std::fprintf(stderr, "Fatal winlin test shim error: incorrect descriptor limits\n");
+            std::_Exit(127);
+        }
+        std::fprintf(stderr, "winlin-test: verified native descriptor-limit increase\n");
+    }
+    return result;
+}
+
 // Leave one real worker alive, then force thread creation failure to exercise missing participants.
 extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attributes,
                               void* (*start)(void*), void* argument) noexcept {
