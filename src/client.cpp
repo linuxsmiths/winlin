@@ -16,6 +16,76 @@ namespace {
 using namespace winlin;
 namespace fs = std::filesystem;
 
+// Signals only publish cancellation. Cleanup and synchronization run in ordinary thread context.
+std::atomic<int> interruption_signal{};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+// Publish a signal safely without allocating, logging, throwing, or making control requests.
+void interrupt_run(int signal_number) {
+    interruption_signal.store(signal_number, std::memory_order_relaxed);
+}
+
+// Carry cancellation through normal exception cleanup without treating it as a successful run.
+// The signal remains available after the run restores the process's previous signal handlers.
+struct RunInterrupted : std::runtime_error {
+    int signal_number;
+
+    // Retain the signal so command-line callers can return its conventional nonzero exit status.
+    explicit RunInterrupted(int number)
+        : std::runtime_error(number == SIGINT ? "Benchmark interrupted by SIGINT"
+                                              : "Benchmark interrupted by SIGTERM"),
+          signal_number(number) {
+    }
+};
+
+// Own process-wide cancellation handlers for one run, installed only by the calling thread.
+// Workers observe the lock-free flag; they never own handlers or perform server cleanup.
+// Restore prior behavior before returning to the interactive menu or exiting the command.
+class RunSignals {
+    struct sigaction previous_int_{}, previous_term_{};
+
+public:
+    // Start a fresh cancellation scope and roll back SIGINT ownership if SIGTERM setup fails.
+    RunSignals() {
+        interruption_signal.store(0, std::memory_order_relaxed);
+        struct sigaction action{};
+        action.sa_handler = interrupt_run;
+        if (sigemptyset(&action.sa_mask) != 0 || sigaction(SIGINT, &action, &previous_int_) != 0) {
+            throw system_error("Cannot install benchmark SIGINT handler");
+        }
+        if (sigaction(SIGTERM, &action, &previous_term_) != 0) {
+            const auto error = system_error("Cannot install benchmark SIGTERM handler");
+            if (sigaction(SIGINT, &previous_int_, nullptr) != 0) {
+                log_warning(system_error("Cannot restore SIGINT handler").what());
+            }
+            throw error;
+        }
+    }
+
+    // Signal-handler ownership belongs to exactly one scope.
+    RunSignals(const RunSignals&) = delete;
+    // Do not duplicate process-wide handler ownership through assignment.
+    RunSignals& operator=(const RunSignals&) = delete;
+
+    // Restore both handlers independently and diagnose failures without throwing from cleanup.
+    ~RunSignals() {
+        if (sigaction(SIGINT, &previous_int_, nullptr) != 0) {
+            log_warning(system_error("Cannot restore SIGINT handler").what());
+        }
+        if (sigaction(SIGTERM, &previous_term_, nullptr) != 0) {
+            log_warning(system_error("Cannot restore SIGTERM handler").what());
+        }
+    }
+};
+
+// Leave blocking phases cooperatively; worker callers must still participate in every barrier.
+void check_interruption() {
+    const int signal_number = interruption_signal.load(std::memory_order_relaxed);
+    if (signal_number) {
+        throw RunInterrupted(signal_number);
+    }
+}
+
 // Hold the server address, expected workload certificate and optional workload lease.
 // Load workers share this read-only; control always uses plain HTTP.
 // Run IDs exist only in memory and must not be serialized into results or saved targets.
@@ -558,8 +628,8 @@ struct LoadConnection {
 };
 
 // Run benchmark requests over several connections using one thread, rather than one thread per
-// connection. trial() creates the worker threads and divides the connections between them.
-// This class does not create a thread itself; its methods run on the thread created by trial().
+// connection. trials() creates the worker threads and divides the connections between them.
+// This class does not create a thread itself; its methods run on the thread created by trials().
 //
 // Each LoadConnection knows how to send a request and read its response. LoadWorker decides which
 // connection to work on next. It asks epoll which sockets are ready, then calls pump() on those
@@ -578,7 +648,8 @@ struct LoadConnection {
 //
 // Once the phase's time or request limit is reached, the worker stops starting new requests.
 // It continues processing requests already started until they finish, fail, or time out.
-// phase() returns this worker's statistics; trial() combines the measured results from all workers.
+// phase() returns this worker's statistics; trials() combines the measured results from all
+// workers.
 //
 // Only this worker's thread uses its connections, epoll queue, and local statistics. The target,
 // configuration, and PUT payload are not copied into the worker: it holds read-only references
@@ -616,6 +687,7 @@ public:
     // load.
     void setup(SSL_CTX* ctx, unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
+            check_interruption();
             // Connect to the server and create a LoadConnection for it.
             // connect_socket() may return before the nonblocking TCP connection has completed.
             // pump() finishes TCP/TLS setup when readiness events arrive.
@@ -630,6 +702,7 @@ public:
         unsigned ready{};
         Stats unused;
         while (ready != count) {
+            check_interruption();
             if (Clock::now() >= deadline) {
                 throw std::runtime_error("Connection setup timed out");
             }
@@ -659,13 +732,15 @@ public:
     // timeout.
     Stats phase(Clock::time_point start, double duration, std::atomic<std::uint64_t>& issued,
                 std::uint64_t limit) {
+        check_interruption();
         Stats stats;
         const auto deadline = start + std::chrono::duration<double>(duration);
         std::size_t active{};
 
         auto issue = [&](LoadConnection& connection) {
-            // If time limit is reached or the connection is dead, do not issue a new request.
-            if (!connection.alive || Clock::now() >= deadline) {
+            // Stop issuance on cancellation as well as the normal time/connection limits.
+            if (!connection.alive || Clock::now() >= deadline ||
+                interruption_signal.load(std::memory_order_relaxed)) {
                 return false;
             }
             // The reserved-request count is also the candidate ticket for the next request.
@@ -714,6 +789,7 @@ public:
         // either because issuance has stopped and outstanding requests have been drained,
         // or because all connections have failed.
         while (active) {
+            check_interruption();
             // Expire requests before handling readiness, and never deliberately sleep past
             // the nearest deadline. Millisecond rounding reflects epoll_wait's resolution.
             const auto now = Clock::now();
@@ -742,6 +818,8 @@ public:
             // connection as far as possible without blocking. If the connection becomes idle,
             // issue() will start a new request on it, if the time and request limits allow
             for (int i = 0; i < count; ++i) {
+                // Cancellation is not a connection error: unwind outside the per-I/O handler.
+                check_interruption();
                 auto& connection = *connections_.at(events_[i].data.fd);
                 // Connections can be closed by the server or fail during the phase, skip
                 // them, also skip connections that are idle. Note that typically an idle
@@ -784,44 +862,31 @@ public:
                 }
             }
         }
+        check_interruption();
         stats.end = Clock::now();
         return stats;
     }
 };
 
-// Run one benchmark repetition using several worker threads, then combine their results into a
-// JSON report. Each thread creates a LoadWorker and owns a share of the configured connections.
-// The calling thread coordinates when the workers start warmup and measurement, and collects
-// client and server telemetry around the measured workload.
-//
-// First, wait for every worker to finish establishing its connections. Release them together
-// using a common warmup start time. Next, wait for every worker to finish warmup, including all
-// outstanding warmup requests, before collecting the initial telemetry. Only then release the
-// workers for measurement using a common measurement start time. This keeps connection setup
-// and warmup requests out of the measured workload.
-//
-// Three latches announce setup, warmup, and measurement completion. The barrier releases the
-// workers into warmup, measurement, and finally teardown, after final telemetry is captured.
-// A worker that encounters a fatal error records it and skips further workload, but must still
-// signal every latch and participate in every barrier wait. Otherwise, the calling thread or
-// another worker could wait forever for a participant that exited early. If a thread cannot be
-// created, the calling thread accounts for its missing latch signals and barrier participation.
-//
-// Join all workers before reading their results or allowing the objects they reference to go
-// out of scope. If a fatal error was recorded, throw it after the threads have finished.
-// Final telemetry precedes connection teardown, thread joins, and histogram merging. Otherwise,
-// those costs would enter the CPU counters without entering the measured request interval.
-// After joining, merge the measured request statistics and return the
-// report with warnings for request failures or possible client CPU saturation.
-Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
-           const std::vector<char>& payload, unsigned repetition, const Target& control_target,
-           const std::string& run_id) {
+// Format a completed measurement independently of worker ownership and report persistence.
+Json trial_result(const RunConfig& config, unsigned repetition, Clock::time_point measure_start,
+                  std::uint64_t issued, const Stats& combined, const Json& client_before,
+                  const Json& client_after, const Json& server_before, const Json& server_after);
+
+// Keep workers and connections alive for one warmup and every measured repetition. Workers
+// park at each measurement boundary while the caller samples telemetry and saves completed
+// results. Even on failure, all participants complete the current barriers before joining.
+template <typename ReportResult>
+void trials(SSL_CTX* ctx, const Target& target, const RunConfig& config,
+            const std::vector<char>& payload, const Target& control_target,
+            const std::string& run_id, ReportResult report_result) {
+    check_interruption();
     const LoadHeaders headers(target, config);
-    std::latch setup_done(config.workers), warmup_done(config.workers),
-        measurement_done(config.workers);
+    std::latch setup_done(config.workers), warmup_done(config.workers);
     std::barrier gate(static_cast<std::ptrdiff_t>(config.workers + 1));
     std::atomic<bool> abort{};
     std::atomic<std::uint64_t> warmup_issued{}, issued{};
+    bool finished = false;
     Clock::time_point warmup_start, measure_start;
     std::mutex failure_mutex;
     std::string failure;
@@ -835,6 +900,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
         abort = true;
     };
     try {
+        check_interruption();
         // Create one thread per worker, each of which will create its own LoadWorker and manage
         // its share of the configured connections. The threads will wait for the calling thread
         // to signal when to start warmup and measurement, and will report any fatal errors back
@@ -857,9 +923,9 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
                 gate.arrive_and_wait();
                 if (!abort) {
                     try {
-                        // Issue warmup requests for config.warmup seconds, then drain them.
-                        const auto warmup =
-                            worker->phase(warmup_start, config.warmup, warmup_issued, 0);
+                        // Warm once without consuming any repetition's measured request limit.
+                        const auto warmup = worker->phase(warmup_start, RunConfig::warmup_seconds,
+                                                          warmup_issued, 0);
                         if (warmup.errors) {
                             fail("Warmup failed: " + warmup.first_error);
                         }
@@ -870,24 +936,23 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
                 // Synchronize with the calling thread to ensure all workers have finished
                 // warmup before starting measurement.
                 warmup_done.count_down();
-                gate.arrive_and_wait();
-                if (!abort) {
-                    try {
-                        // Issue measurement requests for config.duration seconds or until
-                        // config.requests have been issued, whichever comes first.
-                        // Then drain outstanding requests before returning the results.
-                        // The issued counter is shared across all workers, so the request limit
-                        // applies to the whole run.
-                        results[index] =
-                            worker->phase(measure_start, config.duration, issued, config.requests);
-                    } catch (const std::exception& error) {
-                        fail(error.what());
+                while (true) {
+                    // The caller resets counters and publishes the next start time while parked.
+                    gate.arrive_and_wait();
+                    if (finished) {
+                        break;
                     }
+                    if (!abort) {
+                        try {
+                            results[index] = worker->phase(measure_start, config.duration, issued,
+                                                           config.requests);
+                        } catch (const std::exception& error) {
+                            fail(error.what());
+                        }
+                    }
+                    // Do not touch results or sockets until sampling/reporting has finished.
+                    gate.arrive_and_wait();
                 }
-                // Preserve worker/socket ownership until the caller has sampled both ends.
-                // Failed workers must also participate so telemetry failures cannot deadlock join.
-                measurement_done.count_down();
-                gate.arrive_and_wait();
             });
         }
     } catch (const std::exception& error) {
@@ -896,7 +961,6 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
             // Threads that were never started cannot participate in latches or barrier phases.
             setup_done.count_down();
             warmup_done.count_down();
-            measurement_done.count_down();
             gate.arrive_and_drop();
         }
     }
@@ -907,47 +971,56 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     // Drain warmup before taking the baseline; no warmup request may leak into measurement.
     warmup_done.wait();
 
-    // All workers have signalled warmup completion. They wait at the barrier before proceeding
-    // to measurement, unless a failure causes them to skip the measured workload.
-    Json server_before, client_before;
-    if (!abort) {
+    for (unsigned repetition = 1; repetition <= config.repetitions && !abort; ++repetition) {
+        Json server_before, client_before;
         try {
-            // Collect baseline telemetry before starting measurement, so that the measurement
-            // phase can be compared against the baseline. The server telemetry is collected via
-            // the control API, and the client telemetry is collected via the usage() function.
+            check_interruption();
             server_before = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
             client_before = usage();
         } catch (const std::exception& error) {
             fail(error.what());
+            break;
         }
-    }
-    measure_start = Clock::now();
-    // Release worker threads to start measurement phase
-    gate.arrive_and_wait();
+        // Reset per-repetition state without reopening the warmed connections.
+        issued = 0;
+        measure_start = Clock::now();
+        gate.arrive_and_wait();
+        gate.arrive_and_wait();
 
-    // Sample before releasing parked workers to destroy their connections. Catch failures
-    // here so the final barrier is always released, even if a telemetry request throws.
-    measurement_done.wait();
-    Json client_after, server_after;
-    if (!abort) {
+        // Workers remain parked until the next start or teardown, including on report failure.
+        if (abort) {
+            break;
+        }
         try {
-            client_after = usage();
-            server_after = control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
+            check_interruption();
+            const auto client_after = usage();
+            const auto server_after =
+                control(control_target, "/v1/benchmark/telemetry?run_id=" + run_id);
+            Stats combined;
+            for (const auto& stats : results) {
+                combined.merge(stats);
+            }
+            report_result(trial_result(config, repetition, measure_start, issued.load(), combined,
+                                       client_before, client_after, server_before, server_after));
         } catch (const std::exception& error) {
             fail(error.what());
         }
     }
+    // Publish teardown only while workers are waiting at the next-start barrier. No exception
+    // escapes before every worker has been released and joined, so lease cleanup stays safe.
+    finished = true;
     gate.arrive_and_wait();
-
-    // Destroying the jthread objects joins every worker before their results are read.
     threads.clear();
+    check_interruption();
     if (abort) {
         throw std::runtime_error(failure);
     }
-    Stats combined;
-    for (const auto& stats : results) {
-        combined.merge(stats);
-    }
+}
+
+// Format one completed measurement; warmup, reporting, and connection teardown are excluded.
+Json trial_result(const RunConfig& config, unsigned repetition, Clock::time_point measure_start,
+                  std::uint64_t issued, const Stats& combined, const Json& client_before,
+                  const Json& client_after, const Json& server_before, const Json& server_after) {
     const double elapsed = std::chrono::duration<double>(combined.end - measure_start).count();
     auto client_usage = usage_delta(client_before, client_after, elapsed);
     auto server_usage =
@@ -975,7 +1048,7 @@ Json trial(SSL_CTX* ctx, const Target& target, const RunConfig& config,
     }
     return {{"repetition", repetition},
             {"elapsed_seconds", elapsed},
-            {"issued", issued.load()},
+            {"issued", issued},
             {"completed", combined.completed},
             {"errors", combined.errors},
             {"first_error", combined.first_error},
@@ -1018,7 +1091,6 @@ RunConfig configuration(const Args& args) {
                             config.connections,
                             std::min(8u, std::max(1u, std::thread::hardware_concurrency()))))),
                256);
-    config.warmup = seconds(args.get("--warmup", "10"));
     config.duration = seconds(args.get("--duration", "30"));
     config.repetitions = number(args.get("--repetitions", "3"), 1000);
     config.requests = number(args.get("--requests", "0"));
@@ -1029,8 +1101,9 @@ RunConfig configuration(const Args& args) {
 
 // Always report console metrics and failures; persist detailed repetitions and final status only
 // when requested. Console-only runs still collect the telemetry needed for metrics and warnings.
-int run(Target target, const RunConfig& config, const std::optional<fs::path>& output) {
+int run_benchmark(Target target, const RunConfig& config, const std::optional<fs::path>& output) {
     auto capabilities = control(target, "/v1/capabilities");
+    check_interruption();
     if (!capabilities.contains("supported_tls_modes") || !capabilities.contains("limits") ||
         !capabilities.contains("supported_get_response_data_modes")) {
         throw std::runtime_error("Server capabilities are outdated; update and restart the server");
@@ -1140,15 +1213,19 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
         return Json::parse(response.body);
     };
     try {
-        const Json settings{
-            {"tls", config.tls},
-            {"cipher", config.cipher},
-            {"workers", config.server_workers},
-            {"get_response_data", config.get_response_data},
-            {"lease_seconds", static_cast<unsigned>(std::ceil(config.warmup + config.duration +
-                                                              3 * config.timeout + 60))}};
+        check_interruption();
+        const Json settings{{"tls", config.tls},
+                            {"cipher", config.cipher},
+                            {"workers", config.server_workers},
+                            {"get_response_data", config.get_response_data},
+                            {"lease_seconds", static_cast<unsigned>(std::ceil(
+                                                  RunConfig::warmup_seconds + config.duration +
+                                                  3 * config.timeout + 60))}};
         const auto started = command("/v1/benchmark/start", settings.dump());
         run_id = started.at("run_id");
+        // Consume an in-flight start reply before honoring cancellation: cleanup needs this ID.
+        // Neither acquisition nor stop exchanges are interrupted by the cancellation flag.
+        check_interruption();
         // Setup the final Target
         Target workload{target.host, std::to_string(started.at("port").get<unsigned>()), target.pin,
                         run_id};
@@ -1175,12 +1252,8 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
         }
         std::cout << "Run  requests/s     p50(us)     p90(us)     p99(us)   errors    Net Gbps"
                      "   Client CPU(%)   Avg CPU(%)       Ref CPIO\n";
-        for (unsigned index = 1; index <= config.repetitions; ++index) {
-            // Run trial() for each repetition, which creates the worker threads, assigns
-            // a subset of connections to each worker, issues requests, and collects the
-            // measured telemetry.
-            auto result =
-                trial(workload_ctx.get(), workload, config, payload, index, target, run_id);
+        trials(workload_ctx.get(), workload, config, payload, target, run_id, [&](Json result) {
+            const auto index = result.at("repetition").get<unsigned>();
             errors = errors || result.at("errors").get<std::uint64_t>() != 0 ||
                      result.at("completed").get<std::uint64_t>() == 0;
             std::cout << std::fixed << std::setprecision(2) << std::setw(3) << index
@@ -1224,9 +1297,10 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
             if (output) {
                 write_private(*output, report, false);
             }
-        }
+        });
         report["server_final_telemetry"] = command("/v1/benchmark/stop?run_id=" + run_id);
         run_id.clear();
+        check_interruption();
         report["status"] = errors ? "completed_with_errors" : "completed";
         if (output) {
             write_private(*output, report, false);
@@ -1236,14 +1310,23 @@ int run(Target target, const RunConfig& config, const std::optional<fs::path>& o
             try {
                 command("/v1/benchmark/stop?run_id=" + run_id);
             } catch (const std::exception& cleanup) {
+                report["cleanup_failure"] = cleanup.what();
                 log_warning(std::string("Cannot stop workload; its bounded lease will expire: ") +
                             cleanup.what());
             }
         }
-        report["status"] = "failed";
+        const int signal_number = interruption_signal.load(std::memory_order_relaxed);
+        if (signal_number && dynamic_cast<const RunInterrupted*>(&error) == nullptr) {
+            // Cancellation must not conceal a concurrent transport or result-writing failure.
+            log_warning(std::string("Benchmark interrupted after failure: ") + error.what());
+        }
+        report["status"] = signal_number ? "interrupted" : "failed";
         report["failure"] = error.what();
         if (output) {
             write_private(*output, report, false);
+        }
+        if (signal_number) {
+            throw RunInterrupted(signal_number);
         }
         throw;
     }
@@ -1289,6 +1372,23 @@ std::string default_output(const RunConfig& config) {
            ".json";
 }
 
+// Honor cancellation even when discovery or validation fails before a lease is acquired.
+int run(Target target, const RunConfig& config, const std::optional<fs::path>& output) {
+    RunSignals signals;
+    try {
+        return run_benchmark(std::move(target), config, output);
+    } catch (const RunInterrupted&) {
+        throw;
+    } catch (const std::exception& error) {
+        if (interruption_signal.load(std::memory_order_relaxed)) {
+            log_warning(std::string("Benchmark interrupted after failure: ") + error.what());
+            check_interruption();
+        }
+        throw;
+    }
+}
+
+// Read one menu answer, substituting the default when the user leaves it blank.
 std::string prompt(const std::string& label, const std::string& fallback = {}) {
     std::cout << label;
     if (!fallback.empty()) {
@@ -1355,7 +1455,6 @@ std::string benchmark_command(std::string_view executable, const std::string& ta
     command << " --get-percent " << config.get_percent;
     command << " --connections " << config.connections;
     command << " --workers " << config.workers;
-    command << " --warmup " << config.warmup;
     command << " --duration " << config.duration;
     command << " --requests " << config.requests;
     command << " --repetitions " << config.repetitions;
@@ -1419,7 +1518,6 @@ void interactive(std::string_view executable) {
                                config.connections,
                                std::min(8u, std::max(1u, std::thread::hardware_concurrency()))))),
                     256);
-                config.warmup = seconds(prompt("Warmup seconds", "10"));
                 config.duration = seconds(prompt("Measurement seconds", "30"));
                 config.requests = number(prompt("Request limit (0 = duration only)", "0"));
                 config.repetitions = number(prompt("Repetitions", "3"), 1000);
@@ -1443,6 +1541,11 @@ void interactive(std::string_view executable) {
             } else {
                 std::cout << "Unknown selection\n";
             }
+        } catch (const RunInterrupted& error) {
+            if (error.signal_number != SIGINT) {
+                throw;
+            }
+            log_warning(error.what());
         } catch (const std::exception& error) {
             log_warning(error.what());
         }
@@ -1473,9 +1576,10 @@ int main(int argc, char** argv) {
                    "           [--get-response-data shared|copy] (default: copy)\n"
                    "           [--tls on|off|ktls] [--server-workers 8]\n"
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
-                   "           [--workers N] [--warmup 10] [--duration 30] [--requests 0]\n"
+                   "           [--workers N] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
                    "Without --output, results are displayed in the console only.\n"
+                   "A fixed two-second warmup runs once before all repetitions.\n"
                    "Closed-loop persistent HTTP/HTTPS; paced load and handshake tests are not "
                    "implemented yet.\n";
             return 0;
@@ -1496,8 +1600,8 @@ int main(int argc, char** argv) {
         }
         if (command == "run") {
             args.allow({"--target", "--method", "--get-size", "--get-response-data", "--put-size",
-                        "--get-percent", "--connections", "--workers", "--warmup", "--duration",
-                        "--requests", "--repetitions", "--timeout", "--output", "--cipher", "--tls",
+                        "--get-percent", "--connections", "--workers", "--duration", "--requests",
+                        "--repetitions", "--timeout", "--output", "--cipher", "--tls",
                         "--server-workers"});
             const auto config = configuration(args);
             auto target = load_target(args.require("--target"));
@@ -1508,6 +1612,9 @@ int main(int argc, char** argv) {
             return run(target, config, output);
         }
         throw std::invalid_argument("Unknown command; use winlin --help");
+    } catch (const RunInterrupted& error) {
+        log_warning(error.what());
+        return 128 + error.signal_number;
     } catch (const std::exception& error) {
         std::cerr << "winlin: FATAL: " << error.what() << '\n';
         return 1;

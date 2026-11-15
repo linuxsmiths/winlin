@@ -216,7 +216,7 @@ The bundled public certificate needs no fingerprint entry:
 ./scripts/run-client.sh run --target .winlin-local/windows.json \
   --tls off --server-workers 4 \
   --method mixed --get-percent 50 --get-size 4KiB --put-size 16KiB \
-  --connections 256 --warmup 10 --duration 30 --repetitions 3
+  --connections 256 --duration 30 --repetitions 3
 ```
 
 The same interactive Linux menu can register Windows targets. See the

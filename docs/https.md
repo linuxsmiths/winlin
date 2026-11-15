@@ -11,7 +11,8 @@ For Windows server provisioning, see the [Windows guide](windows.md).
 - Plain HTTP control on both platforms, independent of workload HTTP/HTTPS selection.
 - Client-controlled server worker count, TLS/kTLS mode, and cipher.
 - Persistent GET, PUT, or mixed workloads with configurable object sizes,
-  connections, worker threads, warmup, duration, request limit, and repetitions.
+  connections, worker threads, duration, request limit, and repetitions, with one
+  fixed two-second warmup per benchmark.
 - Shared or copy-per-response GET payloads on both server platforms.
 - Interactive target selection and benchmark configuration, or noninteractive
   `add`, `inspect`, and `run` commands.
@@ -171,7 +172,7 @@ will correctly reject a different certificate.
 ```sh
 ./scripts/run-client.sh run --target .winlin-local/local.json \
   --method get --get-size 4KiB \
-  --connections 256 --warmup 10 --duration 30 --repetitions 3
+  --connections 256 --duration 30 --repetitions 3
 
 ./scripts/run-client.sh run --target .winlin-local/local.json \
   --method put --put-size 64KiB \
@@ -197,6 +198,18 @@ per endpoint, advertised in `limits.max_connections`; it is not a run setting.
 Client `--connections` still selects offered load concurrency (up to 16,384).
 OS resources may impose a lower practical capacity; the ceiling is not a throughput
 or resource-availability guarantee.
+
+The current experimental Linux server keeps `TCP_NODELAY` enabled and applies
+`TCP_CORK` only while submitting workload GET responses. It retains corking across
+writable retries, flushes before peer-dependent TLS reads, and uncorks immediately
+after the final response bytes are queued. Full segments can transmit while corked;
+this does not buffer the whole response or change TLS record sizes. Cork/uncork
+adds two socket-option calls per GET, plus any peer-dependent retry transitions.
+Environment metadata records `workload_tcp_nodelay: true` and
+`workload_tcp_cork: "per-get-response"`. Client, HTTP control, PUT acknowledgements,
+and Windows behavior remain unchanged. Compare small-response tail latency as well
+as bulk CPU/packet rates; lower reported PPS is not guaranteed.
+
 The interactive benchmark menu exposes these same settings. After the final
 prompt it prints a shell-quoted `winlin run` command with the selected target
 and effective settings, including defaults. The menu first asks whether to save
@@ -230,8 +243,11 @@ Sizes accept bytes or binary `KiB`/`MiB` suffixes, including custom values up to
 64 MiB. The interactive menu advertises 256 B, 512 B, 1, 4, 8, 16, 64, 256 KiB,
 1 MiB, and 4 MiB presets; zero-byte objects are also accepted.
 
-The default is 256 connections, 10 seconds of warmup, 30 seconds of measurement,
-and 3 repetitions. `--workers` defaults to the smaller of 8, available logical
+The default is 256 connections, 30 seconds of measurement per repetition,
+and 3 repetitions. A fixed two-second warmup runs once before the first
+measurement; it is not configurable, and the former `--warmup` option is rejected.
+This reduces cold-start effects but does not guarantee system-wide stabilization.
+`--workers` defaults to the smaller of 8, available logical
 CPUs, and connection count. Connections are configurable from 1 to 16,384,
 subject to file descriptor, memory, server, and other host limits.
 `--timeout` bounds connection setup and individual requests (default 10 seconds).
@@ -243,8 +259,11 @@ timeout. Reported elapsed time includes that drain; it can exceed the requested
 duration. Errors are counted without automatically reconnecting or retrying.
 Warmup requests do not consume the measured request limit.
 
-Each repetition establishes its connections before warmup and measurement, then
-reuses them throughout both phases. TLS handshakes are excluded from request
+The benchmark establishes its connections once before warmup, then reuses the
+same connections, workers, and buffers across all repetitions. Each repetition
+has fresh request counters, latency statistics, and telemetry baselines. Failed
+connections remain closed without replacement for the rest of the benchmark.
+TLS handshakes are excluded from request
 latencies and throughput. There is one outstanding request per connection:
 HTTP pipelining, HTTP/2, and paced/open-loop arrivals are not implemented.
 
@@ -453,6 +472,14 @@ and process allocator selection does not describe HTTP.sys kernel allocations.
 
 Important limitations:
 
+- Client SIGINT (Ctrl-C) and SIGTERM cancel cooperatively: workers unwind before the
+  client stops its owned server lease. Requested result files retain completed
+  repetitions and record `status: "interrupted"`; command-line exits are 130 and
+  143 respectively. Ctrl-C returns an interactive run to the menu. An in-flight
+  start/control exchange may finish its bounded wait before cancellation completes,
+  because the client must receive the run ID before it can stop that lease.
+  SIGKILL or an unreachable/failing control endpoint cannot perform cleanup; the
+  bounded server lease remains the fallback. Other clients' runs are never stopped.
 - This is a closed-loop generator. It does not measure latency under a fixed
   external arrival rate and must not be used to claim a latency SLA.
 - Server telemetry is process-wide; the server enforces one active benchmark

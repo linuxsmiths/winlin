@@ -480,10 +480,8 @@ struct RunConfig {
     unsigned connections{256};
     // How many concurrent client workers to start
     unsigned workers{1};
-    // How many seconds to warm up before measuring. Warmup does the same IOs as the benchmark,
-    // but does not count toward the measured duration. This is useful to avoid measuring
-    // cold-start effects.
-    double warmup{10};
+    // Warm the persistent connections once before all measured repetitions.
+    static constexpr double warmup_seconds = 2;
     // Benchmark duration in seconds. The benchmark will run for this long, and then stop.
     double duration{30};
     // How many times to repeat the benchmark. Each repetition will run for 'duration' seconds.
@@ -504,9 +502,9 @@ struct RunConfig {
         }
         if (!connections || connections > 16384 || !workers || workers > 256 ||
             workers > connections || !repetitions || repetitions > 1000 || duration <= 0 ||
-            !std::isfinite(duration) || duration > 86400 || warmup < 0 || !std::isfinite(warmup) ||
-            warmup > 86400 || timeout <= 0 || !std::isfinite(timeout) || timeout > 3600 ||
-            get_size > max_object_size || put_size > max_object_size || get_percent > 100) {
+            !std::isfinite(duration) || duration > 86400 || timeout <= 0 ||
+            !std::isfinite(timeout) || timeout > 3600 || get_size > max_object_size ||
+            put_size > max_object_size || get_percent > 100) {
             throw std::invalid_argument("Run configuration is outside supported limits");
         }
     }
@@ -525,7 +523,8 @@ struct RunConfig {
                 {"get_percent", get_percent},
                 {"connections", connections},
                 {"workers", workers},
-                {"warmup_seconds", warmup},
+                {"warmup_seconds", warmup_seconds},
+                {"warmup_scope", "benchmark"},
                 {"duration_seconds", duration},
                 {"repetitions", repetitions},
                 {"request_limit", requests},

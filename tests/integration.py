@@ -33,9 +33,10 @@ def command(*arguments, expected=0, **kwargs):
 class Controller:
     """Own only test-created processes; keep their guard and diagnostics isolated."""
 
-    def __init__(self, directory, bind=None, extra=(), inject_accept_errors=False):
+    def __init__(self, directory, bind=None, extra=(), inject_accept_errors=False, cork_retry="write"):
         self.directory = directory
         self.inject_accept_errors = inject_accept_errors
+        self.cork_retry = cork_retry
         arguments = [
             str(ROOT / "scripts/run-server.sh"), "--build-dir", str(Path(SERVER).parent),
             "--state-dir", str(directory), "--port", "0", "--http-port", "0",
@@ -45,7 +46,9 @@ class Controller:
             arguments += ["--bind", bind]
         environment = dict(os.environ)
         if inject_accept_errors:
-            environment.update(LD_PRELOAD=FAULTS, WINLIN_TEST_ACCEPT_ERRORS="1")
+            environment.update(LD_PRELOAD=FAULTS, WINLIN_TEST_ACCEPT_ERRORS="1",
+                               WINLIN_TEST_VERIFY_SERVER_NODELAY="1",
+                               WINLIN_TEST_CORK_RETRY=cork_retry)
         self.process = subprocess.Popen(
             arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=environment,
@@ -73,6 +76,13 @@ class Controller:
         assert self.process.returncode == 0, stderr
         if self.inject_accept_errors:
             assert stderr.count("Retrying listener after connection-local accept failure:") == 4, stderr
+            assert "winlin-test: control TCP_NODELAY=1" in stderr, stderr
+            assert "winlin-test: workload TCP_NODELAY=1" in stderr, stderr
+            assert "winlin-test: workload TCP_CORK=1" in stderr, stderr
+            assert "winlin-test: workload TCP_CORK=0" in stderr, stderr
+            wait_marker = ("uncorked TLS read" if self.cork_retry == "read" else "corked TLS write")
+            assert f"winlin-test: checked {wait_marker} wait" in stderr, stderr
+            assert "winlin-test: preserved TLS retry buffer" in stderr, stderr
 
     def listening_ports(self):
         """Inspect this test-owned process's listeners, not other servers in its network namespace."""
@@ -202,6 +212,52 @@ def exercise_tls_send_backpressure(lease):
                     headers[name.lower()] = value.strip()
                 assert int(headers[b"content-length"]) == size
                 assert len(reader.read(size)) == size
+    finally:
+        raw.close()
+
+
+def exercise_tls_peer_retry(lease):
+    """Trigger peer readiness only after a forced TLS read retry flushes its first record."""
+    raw = tls_context().wrap_socket(
+        socket.create_connection(("127.0.0.1", lease["port"]), timeout=5),
+        server_hostname="localhost",
+    )
+    try:
+        run_header = f"Host: localhost\r\nX-Winlin-Run: {lease['run_id']}\r\n".encode()
+        raw.sendall(b"GET /v1/object?size=65536 HTTP/1.1\r\n" + run_header + b"\r\n")
+        first_record = raw.recv(16384)
+        assert len(first_record) == 16384
+        header_size = first_record.index(b"\r\n\r\n") + 4
+        assert first_record.startswith(b"HTTP/1.1 200 ")
+
+        # The first response is still pending. This next request makes the descriptor readable,
+        # allowing the server to retry with the same write buffer and then process the pipeline.
+        raw.sendall(b"GET /v1/object?size=256 HTTP/1.1\r\n" + run_header + b"\r\n")
+        with raw.makefile("rb") as reader:
+            remaining = header_size + 65536 - len(first_record)
+            assert len(reader.read(remaining)) == remaining
+            assert reader.readline().startswith(b"HTTP/1.1 200 ")
+            while True:
+                line = reader.readline()
+                assert line, "Connection closed inside the pipelined response"
+                if line == b"\r\n":
+                    break
+            assert len(reader.read(256)) == 256
+    finally:
+        raw.close()
+
+
+def exercise_abandoned_get(lease):
+    """Abandon a backpressured GET after receiving data; teardown must clear the socket cork."""
+    transport = socket.create_connection(("127.0.0.1", lease["port"]), timeout=5)
+    transport.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    raw = tls_context().wrap_socket(transport, server_hostname="localhost")
+    try:
+        raw.sendall(
+            (f"GET /v1/object?size=67108864 HTTP/1.1\r\nHost: localhost\r\n"
+             f"X-Winlin-Run: {lease['run_id']}\r\n\r\n").encode()
+        )
+        assert raw.recv(16384).startswith(b"HTTP/1.1 200 ")
     finally:
         raw.close()
 
@@ -350,7 +406,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         # A workload pin has no role in HTTP discovery, but HTTPS must still reject mismatches.
         refused = command(
             CLIENT, "run", "--target", bad_target, "--tls", "on", "--connections", "1",
-            "--workers", "1", "--server-workers", "1", "--warmup", "0", "--duration", "1",
+            "--workers", "1", "--server-workers", "1", "--duration", "1",
             "--requests", "1", "--repetitions", "1", "--output", directory / "wrong-pin-result.json",
             expected=1,
         )
@@ -479,7 +535,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 "--method", "mixed",
                 "--get-response-data", data_mode,
                 "--get-size", "512", "--put-size", "256", "--connections", "4", "--workers", "2",
-                "--warmup", "0.02", "--duration", "1", "--requests", "100", "--repetitions", "2",
+                "--duration", "1", "--requests", "100", "--repetitions", "2",
                 "--output", output,
             )
             report = json.loads(output.read_text())
@@ -558,7 +614,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             [CLIENT, "run", "--target", str(target), "--tls", "ktls", "--server-workers", "2",
              "--method", "get", "--get-size", "64KiB", "--connections", "2", "--workers", "1",
              "--get-response-data", "copy",
-             "--warmup", "0", "--duration", "1", "--requests", "10", "--repetitions", "1",
+             "--duration", "1", "--requests", "10", "--repetitions", "1",
              "--output", str(output)],
             capture_output=True, text=True, timeout=30,
         )
@@ -579,6 +635,19 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         controller.finish(short)
     finally:
         controller.stop()
+
+    if FAULTS is not None:
+        controller = Controller(directory, inject_accept_errors=True, cork_retry="read")
+        try:
+            lease = controller.start(tls="on", workers=1, get_response_data="copy")
+            try:
+                exercise_tls_peer_retry(lease)
+                assert controller.telemetry(lease)["get_completed"] == 2
+                exercise_abandoned_get(lease)
+            finally:
+                controller.finish(lease)
+        finally:
+            controller.stop()
 
     controller = Controller(directory, bind="127.0.0.1")
     try:
@@ -627,7 +696,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
         for selected, expected in ((default_target, 1), (target, 0)):
             result = command(
                 CLIENT, "run", "--target", selected, "--tls", "on", "--connections", "1",
-                "--workers", "1", "--server-workers", "1", "--warmup", "0", "--duration", "1",
+                "--workers", "1", "--server-workers", "1", "--duration", "1",
                 "--requests", "2", "--repetitions", "1",
                 "--output", custom / f"{selected.stem}-result.json", expected=expected,
             )

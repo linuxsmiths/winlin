@@ -6,12 +6,26 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+
+
+class StalledHandshake(socketserver.BaseRequestHandler):
+    """Receive ClientHello but never reply, so cancellation must escape TLS setup polling."""
+
+    def handle(self):
+        """Keep the test-owned transport open until the interrupted client closes it."""
+        if self.request.recv(16384):
+            self.server.hello_received.set()
+            while self.request.recv(16384):
+                pass
 
 
 client = sys.argv[1]
@@ -57,6 +71,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
         if self.server.is_workload:
             with self.server.connection_condition:
                 self.server.open_connections += 1
+                self.server.connections_created += 1
                 self.server.connection_condition.notify_all()
 
     def finish(self):
@@ -75,10 +90,23 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             self.respond({"error": "Use HTTP control for metadata"}, status=404)
             return
         if self.path.startswith("/v1/object?size="):
+            measuring, pause = self.observe_workload()
+            if pause:
+                self.server.request_paused.set()
+                assert self.server.release_request.wait(10), "Paused workload was not released"
+                # Deliberately leave this response unfinished after the client cancels it.
+                return
             self.respond(b"x" * int(self.path.split("=")[1]),
-                         status=503 if self.server.fail_workload else None)
+                         status=503 if self.server.fail_workload and
+                         (measuring or self.server.fail_warmup) else None)
         elif self.path.startswith("/v1/benchmark/telemetry?run_id="):
             self.server.telemetry_in_run += 1
+            data = self.server.current_workload
+            self.server.warmup_samples.append(data.warmup_requests)
+            if self.server.telemetry_in_run == 1:
+                self.server.warmup_elapsed = time.monotonic() - data.first_warmup_request
+                if self.server.measurement_marker is not None:
+                    self.server.measurement_marker.touch()
             if self.server.telemetry_in_run == self.server.fail_telemetry_at:
                 self.respond({"error": "fixture telemetry failed"}, status=503)
                 return
@@ -143,6 +171,11 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             })
         else:
             self.server.capability_queries += 1
+            if self.server.pause_capabilities:
+                self.server.capabilities_seen.set()
+                assert self.server.release_capabilities.wait(10)
+                self.respond({"error": "fixture discovery failed"}, status=503)
+                return
             payload = {
                 "supported_tls_modes": ["on", "off"],
                 "supported_get_response_data_modes": self.server.get_response_data_modes,
@@ -161,6 +194,16 @@ class RegistrationHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/benchmark/start":
             settings = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            with self.server.lease_condition:
+                if self.server.enforce_leases and self.server.active_run is not None:
+                    self.respond({"error": "A benchmark is already active on this server"},
+                                 status=409)
+                    return
+                run_id = "aa" * 32
+                if self.server.enforce_leases:
+                    self.server.run_sequence += 1
+                    run_id = f"{self.server.run_sequence:064x}"
+                    self.server.active_run = run_id
             assert "max_connections" not in settings
             assert settings["get_response_data"] in ("shared", "copy")
             self.server.current_get_response_data = settings["get_response_data"]
@@ -169,34 +212,66 @@ class RegistrationHandler(BaseHTTPRequestHandler):
             data = self.server.plain if settings["tls"] == "off" else self.server.secure
             self.server.current_workload = data
             self.server.telemetry_in_run = 0
+            data.first_warmup_request = None
             applied = dict(settings)
             if self.server.misreport_workers:
                 applied["workers"] += 1
             if self.server.misreport_get_response_data:
                 applied["get_response_data"] = "shared"
+            self.server.start_seen.set()
+            if self.server.pause_start:
+                assert self.server.release_start.wait(10), "Paused start was not released"
             self.respond({
-                "run_id": "aa" * 32,
+                "run_id": run_id,
                 "port": self.server.workload_port_override or data.server_port,
                 "transport": "http" if settings["tls"] == "off" else "https",
                 "backend": "test",
                 "settings": applied,
             })
         elif self.path.startswith("/v1/benchmark/stop?run_id="):
+            if self.server.fail_stop:
+                self.respond({"error": "fixture stop failed"}, status=503)
+                return
+            with self.server.lease_condition:
+                if (self.server.enforce_leases and
+                        self.path.split("run_id=", 1)[1] != self.server.active_run):
+                    self.respond({"error": "Workload run ID does not match active lease"}, status=409)
+                    return
+                if self.server.enforce_leases:
+                    self.server.active_run = None
             self.server.stop_requests += 1
+            self.server.stop_seen.set()
             self.respond({"stopped": True})
         else:
             self.respond({"error": "Unsupported route"}, status=404)
 
     def do_PUT(self):
         """Consume the complete dummy PUT before acknowledging an interactive workload."""
+        self.observe_workload()
         self.rfile.read(int(self.headers["Content-Length"]))
         self.respond(b"")
+
+    def observe_workload(self):
+        """Separate warmup from measurement to make lifecycle assertions independent of rate."""
+        with self.server.connection_condition:
+            measuring = self.server.control.telemetry_in_run > 0
+            if measuring:
+                self.server.workload_requests += 1
+                self.server.measurement_request_seen.set()
+            else:
+                self.server.warmup_requests += 1
+                if self.server.first_warmup_request is None:
+                    self.server.first_warmup_request = time.monotonic()
+            pause = measuring and self.server.workload_requests == self.server.pause_request_at
+        self.server.request_seen.set()
+        return measuring, pause
 
     def respond(self, payload, status=None):
         self.server.authorizations.append(self.headers.get("Authorization"))
         self.server.run_ids.append(self.headers.get("X-Winlin-Run"))
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
-        if self.server.is_workload and self.server.raw_response_parts:
+        if (self.server.is_workload and self.server.raw_response_parts and
+                self.server.control.telemetry_in_run > 0):
             for part in self.server.raw_response_parts:
                 self.wfile.write(part)
             return
@@ -221,6 +296,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.run_ids = []
         endpoint.response_status = 200
         endpoint.fail_workload = False
+        endpoint.fail_warmup = False
         endpoint.raw_response_parts = ()
         endpoint.is_workload = endpoint is not server
         endpoint.metadata_requests = []
@@ -228,6 +304,15 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         endpoint.telemetry_samples = 0
         endpoint.connection_condition = threading.Condition()
         endpoint.open_connections = 0
+        endpoint.connections_created = 0
+        endpoint.warmup_requests = 0
+        endpoint.first_warmup_request = None
+        endpoint.workload_requests = 0
+        endpoint.pause_request_at = 0
+        endpoint.request_seen = threading.Event()
+        endpoint.measurement_request_seen = threading.Event()
+        endpoint.request_paused = threading.Event()
+        endpoint.release_request = threading.Event()
         endpoint.cycles_available = False
         endpoint.reference_available = False
         endpoint.host_cpu_available = True
@@ -241,11 +326,26 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
     server.misreport_workers = False
     server.misreport_get_response_data = False
     server.telemetry_in_run = 0
+    server.warmup_samples = []
+    server.measurement_marker = None
+    plain.control = secure.control = server
     server.fail_telemetry_at = 0
     server.expected_live_connections = 0
     server.sampled_connections = []
     server.workload_port_override = None
     server.stop_requests = 0
+    server.fail_stop = False
+    server.enforce_leases = False
+    server.active_run = None
+    server.run_sequence = 0
+    server.lease_condition = threading.Condition()
+    server.start_seen = threading.Event()
+    server.stop_seen = threading.Event()
+    server.pause_start = False
+    server.release_start = threading.Event()
+    server.pause_capabilities = False
+    server.capabilities_seen = threading.Event()
+    server.release_capabilities = threading.Event()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_3
     context.load_cert_chain(fixtures / "server.pem", fixtures / "server.key")
@@ -300,7 +400,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             result = subprocess.run(
                 [str(menu_client)],
                 input=(f"3\n1\n{tls_input}1\n{method}\n{size_input}"
-                       f"1\n1\n0\n0.12345678912345678\n2\n1\nyes\n{output}\n0\n"),
+                       f"1\n1\n0.12345678912345678\n2\n1\nyes\n{output}\n0\n"),
                 capture_output=True, text=True, timeout=15,
                 env=menu_environment,
             )
@@ -309,6 +409,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert ("GET size" in result.stdout) == (method != "put")
             assert ("PUT size" in result.stdout) == (method != "get")
             assert ("GET response data:" in result.stdout) == (method != "put")
+            assert "Warmup seconds" not in result.stdout
             report = json.loads(output.read_text())
             assert report["status"] == "completed", report
             if method != "put":
@@ -333,9 +434,10 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert all(option in replay_arguments for option in (
                 "--tls", "--server-workers", "--method", "--get-response-data",
                 "--get-size", "--put-size",
-                "--get-percent", "--connections", "--workers", "--warmup", "--duration",
+                "--get-percent", "--connections", "--workers", "--duration",
                 "--requests", "--repetitions", "--timeout",
             ))
+            assert "--warmup" not in replay_arguments
             replay_output = directory / f"replay-{method}-{tls}-{data_mode}.json"
             replay_arguments[replay_arguments.index("--output") + 1] = str(replay_output)
             replay = subprocess.run(
@@ -350,11 +452,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
 
         benchmark = [
             client, "run", "--target", str(target), "--get-size", "256",
-            "--connections", "1", "--workers", "1", "--warmup", "0",
+            "--connections", "1", "--workers", "1",
             "--duration", "1", "--requests", "2", "--repetitions", "2",
         ]
         output = directory / "benchmark.json"
         queries_before = server.capability_queries
+        connections_before = secure.connections_created
+        server.warmup_samples = []
         result = subprocess.run(
             [*benchmark, "--output", str(output)],
             capture_output=True, text=True, timeout=15,
@@ -384,6 +488,14 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             "Reference CPIO unavailable: fixture invariant TSC unavailable") == 1
         assert report["schema_version"] == 5
         assert len(report["results"]) == 2
+        # Warmup lasts two seconds once; both measurements reuse the same warmed connection.
+        assert secure.connections_created == connections_before + 1
+        assert server.warmup_elapsed >= 1.9, server.warmup_elapsed
+        assert len(server.warmup_samples) == 4
+        assert server.warmup_samples[0] > 0
+        assert len(set(server.warmup_samples)) == 1, server.warmup_samples
+        assert all(repetition["issued"] == 2 and repetition["completed"] == 2
+                   for repetition in report["results"])
         for row, repetition in zip(rows, report["results"]):
             assert row[3] == f'{repetition["latency"]["p90_us"]:.2f}'
             assert row[-3] == f'{repetition["client_process"]["cpu_utilization_percent"]:.2f}'
@@ -397,6 +509,31 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 assert "cpu_core_equivalents" not in repetition[process]
             assert 0 < repetition["server_process"]["user_cpu_seconds"] < 0.001
             assert "server_before" in repetition and "server_after" in repetition
+
+        # Multiple workers must stay live at every boundary, with independent measured limits.
+        server.expected_live_connections = 2
+        server.sampled_connections = []
+        server.warmup_samples = []
+        connections_before = plain.connections_created
+        output = directory / "persistent-workers.json"
+        arguments = benchmark.copy()
+        for option in ("--connections", "--workers"):
+            arguments[arguments.index(option) + 1] = "2"
+        arguments[arguments.index("--repetitions") + 1] = "3"
+        result = subprocess.run(
+            [*arguments, "--tls", "off", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        server.expected_live_connections = 0
+        assert result.returncode == 0, result.stdout + result.stderr
+        persistent = json.loads(output.read_text())
+        assert plain.connections_created == connections_before + 2
+        assert server.sampled_connections == [2] * 6, server.sampled_connections
+        assert len(set(server.warmup_samples)) == 1, server.warmup_samples
+        assert [entry["repetition"] for entry in persistent["results"]] == [1, 2, 3]
+        assert all(entry["issued"] == 2 and entry["completed"] == 2 and entry["errors"] == 0
+                   for entry in persistent["results"])
+
         notes = report["notes"]
         assert notes and len(notes) == len(set(notes))
         assert any("Closed-loop" in note for note in notes)
@@ -423,7 +560,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         for answer in ("no", ""):
             result = subprocess.run(
                 [str(menu_client)],
-                input=(f"3\n1\noff\n1\nget\n512\nshared\n1\n1\n0\n1\n2\n1\n"
+                input=(f"3\n1\noff\n1\nget\n512\nshared\n1\n1\n1\n2\n1\n"
                        f"{answer}\n0\n"),
                 cwd=console_directory, env=menu_environment,
                 capture_output=True, text=True, timeout=15,
@@ -439,6 +576,10 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert not list(console_directory.iterdir())
 
         # Reject invalid or unadvertised modes before creating a workload or report.
+        result = subprocess.run(
+            [*benchmark, "--warmup", "0"], capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "Unknown option: --warmup" in result.stderr, result.stderr
         result = subprocess.run(
             [*benchmark, "--get-response-data", "generated"],
             capture_output=True, text=True, timeout=15,
@@ -544,13 +685,16 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                 ("WINLIN_TEST_LATE_RECV", "delayed received response"),
             ):
                 output = directory / f"{variable}.json"
+                server.measurement_marker = directory / f"{variable}.ready"
                 result = subprocess.run(
                     [*single_repetition, "--tls", "off", "--timeout", "0.05",
                      "--output", str(output)],
                     capture_output=True, text=True, timeout=15,
                     env=dict(os.environ, LD_PRELOAD=faults, WINLIN_TEST_DATA_PORT=str(plain.server_port),
+                             WINLIN_TEST_MEASUREMENT_MARKER=str(server.measurement_marker),
                              **{variable: "1"}),
                 )
+                server.measurement_marker = None
                 assert result.returncode == 2, result.stdout + result.stderr
                 assert marker in result.stderr, result.stderr
                 repetition = json.loads(output.read_text())["results"][0]
@@ -596,7 +740,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert "Cannot start load workers" in report["failure"], report
 
         # Every failure stage must release parked workers and stop the benchmark lease.
-        for stage in ("setup", "warmup", "baseline", "final"):
+        for stage in ("setup", "warmup", "baseline", "final", "later-baseline", "later-final"):
             output = directory / f"{stage}-failure.json"
             stops_before = server.stop_requests
             arguments = [*multiple_workers, "--tls", "off", "--output", str(output)]
@@ -606,25 +750,201 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
                     server.workload_port_override = refused.getsockname()[1]
                 elif stage == "warmup":
                     plain.fail_workload = True
-                    arguments[arguments.index("--warmup") + 1] = "0.05"
+                    plain.fail_warmup = True
                 else:
-                    server.fail_telemetry_at = 1 if stage == "baseline" else 2
+                    server.fail_telemetry_at = {
+                        "baseline": 1, "final": 2, "later-baseline": 3, "later-final": 4,
+                    }[stage]
+                    if stage.startswith("later-"):
+                        arguments[arguments.index("--repetitions") + 1] = "2"
                 result = subprocess.run(
                     arguments, capture_output=True, text=True, timeout=15,
                 )
             server.workload_port_override = None
             plain.fail_workload = False
+            plain.fail_warmup = False
             server.fail_telemetry_at = 0
             assert result.returncode == 1, result.stdout + result.stderr
             report = json.loads(output.read_text())
             assert report["status"] == "failed", report
+            assert len(report["results"]) == (1 if stage.startswith("later-") else 0), report
             assert server.stop_requests == stops_before + 1
-            if stage in ("baseline", "final"):
+            if stage not in ("setup", "warmup"):
                 assert "Server rejected control request (HTTP 503)" in report["failure"], report
             with plain.connection_condition:
                 assert plain.connection_condition.wait_for(
                     lambda: plain.open_connections == 0, timeout=1,
                 ), stage
+
+        # Signals must unwind every worker phase, stop only the owned lease, and allow an
+        # immediate restart. Pausing the start reply also tests cancellation before ID receipt.
+        for cancellation in (signal.SIGINT, signal.SIGTERM):
+            for menu_mode in (False, True):
+                server.pause_capabilities = True
+                server.capabilities_seen.clear()
+                server.release_capabilities.clear()
+                stops_before = server.stop_requests
+                process = subprocess.Popen(
+                    [client] if menu_mode else [*single_repetition, "--tls", "off"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=menu_environment,
+                )
+                try:
+                    if menu_mode:
+                        process.stdin.write(
+                            "3\n1\noff\n1\nget\n256\ncopy\n1\n1\n1\n2\n1\nno\n0\n")
+                        process.stdin.flush()
+                    assert server.capabilities_seen.wait(5)
+                    process.send_signal(cancellation)
+                    server.release_capabilities.set()
+                    stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    server.release_capabilities.set()
+                    server.pause_capabilities = False
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+                expected = 0 if menu_mode and cancellation == signal.SIGINT else 128 + cancellation
+                assert process.returncode == expected, stdout + stderr
+                assert "Server rejected control request (HTTP 503)" in stderr, stderr
+                assert ("SIGINT" if cancellation == signal.SIGINT else "SIGTERM") in stderr
+                assert server.stop_requests == stops_before
+
+        server.enforce_leases = True
+        handshake = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StalledHandshake)
+        handshake.hello_received = threading.Event()
+        handshake_worker = threading.Thread(target=handshake.serve_forever)
+        handshake_worker.start()
+        try:
+            for stage, cancellation in (
+                ("start", signal.SIGINT), ("setup", signal.SIGINT),
+                ("warmup", signal.SIGINT), ("measurement", signal.SIGINT),
+                ("measurement", signal.SIGTERM), ("later-repetition", signal.SIGINT),
+                ("cleanup-failure", signal.SIGINT),
+            ):
+                output = directory / f"interrupted-{stage}-{cancellation}.json"
+                arguments = [*multiple_workers, "--tls", "off", "--output", str(output)]
+                arguments[arguments.index("--requests") + 1] = "0"
+                arguments[arguments.index("--duration") + 1] = "30"
+                server.start_seen.clear()
+                server.stop_seen.clear()
+                server.release_start.clear()
+                plain.request_seen.clear()
+                plain.measurement_request_seen.clear()
+                plain.request_paused.clear()
+                plain.release_request.clear()
+                plain.workload_requests = 0
+                server.pause_start = stage == "start"
+                server.fail_stop = stage == "cleanup-failure"
+                if stage == "setup":
+                    arguments[arguments.index("--tls") + 1] = "on"
+                    server.workload_port_override = handshake.server_address[1]
+                    handshake.hello_received.clear()
+                elif stage == "later-repetition":
+                    arguments[arguments.index("--requests") + 1] = "2"
+                    arguments[arguments.index("--repetitions") + 1] = "2"
+                    plain.pause_request_at = 3
+                stops_before = server.stop_requests
+                process = subprocess.Popen(
+                    arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    assert server.start_seen.wait(5), "Client never acquired a run"
+                    if stage == "setup":
+                        assert handshake.hello_received.wait(5), "TLS setup did not start"
+                    elif stage == "later-repetition":
+                        assert plain.request_paused.wait(5), "Second repetition did not start"
+                    elif stage == "warmup":
+                        assert plain.request_seen.wait(5), "Load phase did not start"
+                    elif stage in ("measurement", "cleanup-failure"):
+                        assert plain.measurement_request_seen.wait(5), "Measurement did not start"
+                    process.send_signal(cancellation)
+                    server.release_start.set()
+                    stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    server.release_start.set()
+                    plain.release_request.set()
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate()
+                    server.pause_start = False
+                    server.fail_stop = False
+                    server.workload_port_override = None
+                    plain.pause_request_at = 0
+                assert process.returncode == 128 + cancellation, stdout + stderr
+                report = json.loads(output.read_text())
+                assert report["status"] == "interrupted", report
+                assert len(report["results"]) == (1 if stage == "later-repetition" else 0)
+                if stage == "later-repetition":
+                    assert report["results"][0]["completed"] == 2
+                assert "run_id" not in output.read_text()
+                expected_signal = "SIGINT" if cancellation == signal.SIGINT else "SIGTERM"
+                assert expected_signal in stderr
+                if stage == "cleanup-failure":
+                    assert "bounded lease will expire" in stderr, stderr
+                    assert "HTTP 503" in report["cleanup_failure"], report
+                    assert server.active_run is not None
+                    # A cleanup failure cannot authorize stealing or silently resetting the run.
+                    retry = subprocess.run(
+                        [*single_repetition, "--tls", "off"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    assert retry.returncode == 1 and "HTTP 409" in retry.stderr
+                    server.active_run = None
+                    assert server.stop_requests == stops_before
+                else:
+                    assert server.stop_requests == stops_before + 1
+                assert server.active_run is None
+                restarted = subprocess.run(
+                    [*single_repetition, "--tls", "off"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+                assert server.active_run is None
+
+            # A conflicting run is never ours to stop, including when start itself returns 409.
+            server.active_run = "bb" * 32
+            stops_before = server.stop_requests
+            refused = subprocess.run(
+                [*single_repetition, "--tls", "off"],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert refused.returncode == 1, refused.stdout + refused.stderr
+            assert "HTTP 409" in refused.stderr
+            assert server.stop_requests == stops_before
+            assert server.active_run == "bb" * 32
+            server.active_run = None
+
+            # The interactive process must restore/reset cancellation state before another run.
+            plain.request_seen.clear()
+            server.stop_seen.clear()
+            menu = subprocess.Popen(
+                [client], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=menu_environment,
+            )
+            try:
+                menu.stdin.write("3\n1\noff\n1\nget\n256\ncopy\n2\n2\n30\n0\n1\nno\n")
+                menu.stdin.flush()
+                assert plain.request_seen.wait(5), "Interactive workload did not start"
+                menu.send_signal(signal.SIGINT)
+                assert server.stop_seen.wait(5), "Interactive cancellation did not stop its run"
+                stdout, stderr = menu.communicate(
+                    input="3\n1\noff\n1\nget\n256\ncopy\n2\n2\n1\n2\n1\nno\n0\n",
+                    timeout=10,
+                )
+            finally:
+                if menu.poll() is None:
+                    menu.kill()
+                    menu.communicate()
+            assert menu.returncode == 0, stdout + stderr
+            assert "SIGINT" in stderr
+            assert server.active_run is None
+        finally:
+            server.enforce_leases = False
+            server.active_run = None
+            handshake.shutdown()
+            handshake.server_close()
+            handshake_worker.join()
 
         # Header fragments and preloaded bodies must work across repeated responses on the same
         # connection. Separate writes also split the header across TLS records.
@@ -665,8 +985,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert result.returncode == 2, result.stdout + result.stderr
             report = json.loads(output.read_text())
             assert report["status"] == "completed_with_errors"
-            assert all(repetition["completed"] == 0 and repetition["errors"] > 0
-                       for repetition in report["results"])
+            assert report["results"][0]["errors"] > 0
+            assert all(repetition["completed"] == 0 for repetition in report["results"])
             assert result.stderr.count("became dead:") == sum(
                 repetition["errors"] for repetition in report["results"]
             ), result.stderr
@@ -685,11 +1005,12 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             repetition["errors"] for repetition in report["results"]
         ), result.stderr
         for repetition in report["results"]:
-            assert repetition["errors"] > 0
+            assert repetition["completed"] == 0
             assert repetition["server_reference_cycles_per_io"] is None
             assert repetition["warnings"], repetition
             for warning in repetition["warnings"]:
                 assert warning in result.stderr
+        assert report["results"][0]["errors"] > 0
         assert [row[-1] for row in table_row.findall(result.stdout)] == ["N/A", "N/A"]
         for note in report["notes"]:
             assert note not in result.stdout + result.stderr

@@ -35,6 +35,8 @@ AgentConfig linux_config() {
          {"requirement",
           "Kernel/OpenSSL support and verified activation for the requested direction"}}};
     config.environment = environment();
+    config.environment["workload_tcp_nodelay"] = true;
+    config.environment["workload_tcp_cork"] = "per-get-response";
     return config;
 }
 
@@ -173,6 +175,8 @@ struct Session {
     std::size_t offset{}, body_remaining{}, body_size{};
     bool close{}, object_response{}, get{}, put{};
     bool combined_response{};
+    // Only GET responses use corking. Keep the actual socket state across pump() yields.
+    bool cork_response{}, corked{};
     ConnectionInfo connection;
     GetResponsePayload get_payload;
     const char* get_data{};
@@ -186,9 +190,59 @@ struct Session {
         server.record_network_address(fd);
     }
 
-    // Release the connection slot when the worker removes this session or shuts down.
+    // Flush a failed/abandoned response before closing, then release the connection slot.
+    // Destruction cannot throw; an uncork failure is diagnosed and socket ownership still ends.
     ~Session() {
+        if (corked) {
+            const int disabled = 0;
+            if (setsockopt(socket.fd.value, IPPROTO_TCP, TCP_CORK, &disabled, sizeof(disabled)) !=
+                0) {
+                log_warning(system_error("Cannot uncork closing workload socket").what());
+            }
+        }
         --server.active;
+    }
+
+    // Change socket corking only at response/retry boundaries, not for each TLS record.
+    void set_cork(bool enabled) {
+        if (corked == enabled) {
+            return;
+        }
+        const int value = enabled ? 1 : 0;
+        if (setsockopt(socket.fd.value, IPPROTO_TCP, TCP_CORK, &value, sizeof(value)) != 0) {
+            throw system_error(enabled ? "Cannot cork workload response"
+                                       : "Cannot uncork workload response");
+        }
+        corked = enabled;
+    }
+
+    // Batch GET writes across writable retries without changing OpenSSL's pending buffer.
+    // Flush before a peer-dependent TLS read: its reply may require our queued TLS bytes first.
+    int write_response(const char* data, std::size_t size) {
+        if (cork_response) {
+            set_cork(true);
+        }
+        const int bytes = socket.write(data, size);
+        if (!bytes && (socket.want & EPOLLIN)) {
+            set_cork(false);
+        }
+        return bytes;
+    }
+
+    // Flush the final partial segment before accounting success or waiting for another request.
+    // Completion happens in the final write's step, even when that step exhausts pump()'s budget.
+    bool complete_response() {
+        set_cork(false);
+        cork_response = false;
+        if (get) {
+            ++server.gets;
+            server.get_bytes += body_size;
+        }
+        if (close) {
+            return false;
+        }
+        state = State::header;
+        return true;
     }
 
     // Borrow bytes received but not yet consumed. The view is invalidated by the next buffer read
@@ -242,6 +296,8 @@ struct Session {
         }
 
         offset = 0;
+        // The handshake and request have completed; no handshake/control/PUT traffic is corked.
+        cork_response = object_response && server.config.role == AgentConfig::Role::workload;
         state = combined_response ? State::send_body : State::send_header;
     }
 
@@ -327,14 +383,20 @@ struct Session {
             } else if (state == State::send_header) {
                 // Preserve the offset on partial writes, including retries required by OpenSSL.
                 // Start the response body only after every header byte has been written.
-                const int bytes = socket.write(output.data() + offset, output.size() - offset);
+                const int bytes = write_response(output.data() + offset, output.size() - offset);
                 if (!bytes) {
                     return true;
                 }
                 offset += bytes;
                 if (offset == output.size()) {
-                    offset = 0;
-                    state = State::send_body;
+                    if (!body_size) {
+                        if (!complete_response()) {
+                            return false;
+                        }
+                    } else {
+                        offset = 0;
+                        state = State::send_body;
+                    }
                 }
             } else if (state == State::send_body) {
                 // A copied TLS GET includes its header in this transfer. Keep the full buffer,
@@ -344,20 +406,16 @@ struct Session {
                 const auto transfer_size = prefix_size + body_size;
                 if (offset < transfer_size) {
                     const char* data = object_response ? get_data - prefix_size : text_body.data();
-                    const int bytes = socket.write(data + offset, transfer_size - offset);
+                    const int bytes = write_response(data + offset, transfer_size - offset);
                     if (!bytes) {
                         return true;
                     }
                     offset += bytes;
-                } else {
-                    if (get) {
-                        ++server.gets;
-                        server.get_bytes += body_size;
-                    }
-                    if (close) {
+                }
+                if (offset == transfer_size) {
+                    if (!complete_response()) {
                         return false;
                     }
-                    state = State::header;
                 }
             } else if (state == State::body) {
                 // Discard a PUT body without storing it. Account for bytes already read alongside
