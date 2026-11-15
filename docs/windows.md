@@ -288,9 +288,16 @@ Completion workers retrieve up to eight already-ready IOCP entries per call;
 they do not wait for a full batch. Native I/O errors and synthetic submission
 failures are decoded per entry, and shutdown processes every dequeued reference.
 The request queue uses `FILE_SKIP_SET_EVENT_ON_HANDLE` because workers consume
-IOCP packets rather than waiting on the queue handle's implicit event. Completion
-packets remain enabled even for operations that finish synchronously. Startup
-fails explicitly if Windows cannot apply the notification mode.
+IOCP packets rather than waiting on the queue handle's implicit event. It also uses
+`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`: operations that finish immediately are
+processed inline by the submitting worker instead of generating native completion
+packets. Caller and completion references still protect buffers through nested
+callbacks. Inline nesting is limited to eight levels; initial receives outside a
+worker, exhausted chains, and immediate submission errors enqueue explicit IOCP
+packets. Pending operations retain native completion packets. This changes only
+completion delivery, not response caching, payload copies, TLS, or IOCP batch size.
+Environment metadata identifies `workload_inline_sync_completions`. Startup fails
+explicitly if Windows cannot apply the notification modes.
 
 ## Tests
 

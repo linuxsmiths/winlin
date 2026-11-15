@@ -189,6 +189,7 @@ AgentConfig windows_config() {
                                        "kernel_tls_cpu_attribution"});
     config.process_cpu_scope =
         "application process only; excludes HTTP.sys/Schannel work charged to System";
+    config.environment["workload_inline_sync_completions"] = true;
     return config;
 }
 
@@ -277,9 +278,9 @@ struct RequestCache;
 // HTTP.sys owns the connection and TLS state, including reuse across successive requests.
 //
 // Runtime posts receives before requests arrive. Each Request submits one operation at a time,
-// and an IOCP worker calls complete() when that operation finishes. The next completion may run on
-// a different worker thread, even before the submitting callback returns. References keep both
-// the submitter and each outstanding completion alive until they finish using this object.
+// and a worker calls complete() inline for immediate success or through IOCP for pending I/O.
+// Pending completions may run on a different thread before the submitting callback returns.
+// References keep both the submitter and each completion alive until they stop using this object.
 //
 // Store headers, body buffers, response structures, and OVERLAPPED state here because HTTP.sys may
 // still reference them after an API call returns. The final reference returns this object and its
@@ -323,11 +324,11 @@ struct Request {
 
     void prepare();
     void release(RequestCache* cache) noexcept;
-    void receive();
-    void read_body();
-    void send();
+    void receive(RequestCache* cache);
+    void read_body(RequestCache& cache);
+    void send(RequestCache& cache);
     void complete(ULONG error, DWORD bytes, RequestCache& cache) noexcept;
-    void submitted(ULONG result);
+    void submitted(ULONG result, RequestCache* cache);
 };
 
 static_assert(offsetof(Request::Operation, overlapped) == 0);
@@ -496,10 +497,12 @@ struct Runtime {
         if (!completion_port.value) {
             throw windows_error("CreateIoCompletionPort");
         }
-        // IOCP carries every completion; no worker waits on the queue handle's implicit event.
-        // Skip that shared event's signaling without suppressing synchronous-success packets.
-        if (!SetFileCompletionNotificationModes(queue.value, FILE_SKIP_SET_EVENT_ON_HANDLE)) {
-            throw windows_error("Disable HTTP.sys request-queue event signaling");
+        // Pending I/O still arrives through IOCP. Immediate successes are handled by the
+        // submitting worker, avoiding a packet and another dequeue for already-completed work.
+        if (!SetFileCompletionNotificationModes(queue.value,
+                                                FILE_SKIP_SET_EVENT_ON_HANDLE |
+                                                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
+            throw windows_error("Configure HTTP.sys completion notification modes");
         }
     }
 
@@ -550,7 +553,7 @@ struct Runtime {
             }
             request->prepare();
             const RequestReference reference(request, RequestReleaser{cache});
-            request->receive();
+            request->receive(cache);
         }
     }
 
@@ -727,40 +730,60 @@ void Request::release(RequestCache* cache) noexcept {
     --owner.live;
 }
 
-// Handle the submission result, not the eventual I/O result. Successful and pending operations
-// already produce IOCP packets. An immediate failure has no native packet, so enqueue one to let
-// complete() perform the same error handling and cleanup. If enqueueing also fails, no operation
-// is pending: drop its completion reference and report a fatal runtime error. The caller still
-// owns a reference until the submission returns, so this cannot recycle a context underneath it.
-void Request::submitted(ULONG result) {
-    if (result != NO_ERROR && result != ERROR_IO_PENDING) {
-        RequestReference completion(this, RequestReleaser{});
-        operation.immediate_error = result;
-        if (PostQueuedCompletionStatus(runtime.completion_port.value, 0, 0,
-                                       &operation.overlapped)) {
-            completion.release();
-        } else {
-            runtime.fail("Cannot enqueue HTTP.sys I/O error");
+// Pending I/O retains its native IOCP reference. Immediate successes have no native packet:
+// process them inline when a worker cache is available, with a bounded chain to prevent an
+// always-ready receive/body stream from recursing indefinitely or starving queued completions.
+// Initial receives, exhausted chains, and immediate errors use explicit IOCP packets instead.
+// The caller retains its separate reference through submission, including nested callbacks.
+void Request::submitted(ULONG result, RequestCache* cache) {
+    if (result == ERROR_IO_PENDING) {
+        return;
+    }
+
+    RequestReference completion(this, RequestReleaser{cache});
+    DWORD bytes{};
+    ULONG error = result;
+    if (result == NO_ERROR) {
+        // Query the already-completed native operation without waiting; body callbacks need its
+        // exact byte count, including when a bounded inline chain yields back to IOCP.
+        if (!GetOverlappedResult(runtime.queue.value, &operation.overlapped, &bytes, FALSE)) {
+            error = GetLastError();
         }
+        static thread_local unsigned inline_depth{};
+        if (cache && inline_depth < 8) {
+            ++inline_depth;
+            complete(error, bytes, *cache);
+            --inline_depth;
+            return;
+        }
+    }
+
+    operation.immediate_error = error;
+    if (PostQueuedCompletionStatus(runtime.completion_port.value, bytes, 0,
+                                   &operation.overlapped)) {
+        completion.release();
+    } else {
+        runtime.fail("Cannot enqueue HTTP.sys completion");
     }
 }
 
 // Submit a header receive for the next available request. The storage and operation remain owned
-// by this Request until completion, even when the API reports immediate success.
-void Request::receive() {
+// by this Request until completion. Immediate success can enter a bounded nested callback.
+void Request::receive(RequestCache* cache) {
     state = State::receive;
     operation.overlapped = {};
     operation.immediate_error = 0;
     references.fetch_add(1, std::memory_order_relaxed);
     submitted(HttpReceiveHttpRequest(runtime.queue.value, HTTP_NULL_ID, 0, header(),
                                      static_cast<ULONG>(storage.size() * sizeof(std::max_align_t)),
-                                     nullptr, &operation.overlapped));
+                                     nullptr, &operation.overlapped),
+              cache);
 }
 
 // Read the declared body in bounded chunks. PUT bytes are discarded, while control JSON is kept
 // for shared dispatch. Only after the complete body arrives may PUT counters advance or the
 // control command execute; then submit the response.
-void Request::read_body() {
+void Request::read_body(RequestCache& cache) {
     if (!remaining) {
         if (reply.kind == AgentReply::Kind::consume_control) {
             reply = runtime.agent.request(parsed_head, connection, control_body);
@@ -771,7 +794,7 @@ void Request::read_body() {
             reply = AgentReply{};
             reply.close = close;
         }
-        send();
+        send(cache);
         return;
     }
     state = State::body;
@@ -781,7 +804,8 @@ void Request::read_body() {
     submitted(
         HttpReceiveRequestEntityBody(runtime.queue.value, id, 0, body_buffer.data(),
                                      static_cast<ULONG>(std::min(body_buffer.size(), remaining)),
-                                     nullptr, &operation.overlapped));
+                                     nullptr, &operation.overlapped),
+        &cache);
 }
 
 // Build a native HTTP_RESPONSE and submit it to HTTP.sys, which serializes the wire headers and
@@ -791,7 +815,7 @@ void Request::read_body() {
 // Keep all referenced headers, body data, and OVERLAPPED storage alive until send completion.
 // Disable caching both in the response and the HTTP.sys cache policy so repeated GETs still use
 // the native request/response path rather than cached responses.
-void Request::send() {
+void Request::send(RequestCache& cache) {
     state = State::send;
     response = {};
     response.Version = HTTP_VERSION{1, 1};
@@ -836,8 +860,9 @@ void Request::send() {
     operation.immediate_error = 0;
     references.fetch_add(1, std::memory_order_relaxed);
     submitted(HttpSendHttpResponse(
-        runtime.queue.value, id, reply.close ? HTTP_SEND_RESPONSE_FLAG_DISCONNECT : 0, &response,
-        &cache_policy, nullptr, nullptr, 0, &operation.overlapped, nullptr));
+                  runtime.queue.value, id, reply.close ? HTTP_SEND_RESPONSE_FLAG_DISCONNECT : 0,
+                  &response, &cache_policy, nullptr, nullptr, 0, &operation.overlapped, nullptr),
+              &cache);
 }
 
 // Advance this request after one operation completes. Header completion dispatches through Agent,
@@ -895,16 +920,16 @@ void Request::complete(ULONG error, DWORD bytes, RequestCache& cache) noexcept {
                     control_body.reserve(reply.size);
                 }
                 remaining = reply.size;
-                read_body();
+                read_body(cache);
             } else {
-                send();
+                send(cache);
             }
         } else if (state == State::body) {
             // Reject an incomplete or oversized body chunk. Preserve control JSON, but discard
             // PUT contents after counting how many declared bytes remain.
             if (!bytes || bytes > remaining) {
                 reply = AgentReply::error(400, "Incomplete request body");
-                send();
+                send(cache);
             } else {
                 // Successful send completion means HTTP.sys finished this response operation,
                 // not that the client application has confirmed receipt.
@@ -912,7 +937,7 @@ void Request::complete(ULONG error, DWORD bytes, RequestCache& cache) noexcept {
                     control_body.append(body_buffer.data(), bytes);
                 }
                 remaining -= bytes;
-                read_body();
+                read_body(cache);
             }
         } else {
             if (reply.kind == AgentReply::Kind::object) {

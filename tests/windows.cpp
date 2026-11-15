@@ -100,6 +100,10 @@ void test_completion_errors() {
     if (!port.value) {
         throw windows_error("Create completion-test port");
     }
+    if (!SetFileCompletionNotificationModes(pipe.value, FILE_SKIP_SET_EVENT_ON_HANDLE |
+                                                            FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
+        throw windows_error("Configure completion-test notification modes");
+    }
     Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     if (!event.value) {
         throw windows_error("Create completion-test event");
@@ -156,6 +160,98 @@ void test_completion_errors() {
     }
     cleanup.release();
 }
+
+// Immediate success must not generate an IOCP packet. An explicit yield packet must still retain
+// the completed operation's byte count and success status, just like the HTTP.sys fallback path.
+void test_synchronous_completions() {
+    const auto name = L"\\\\.\\pipe\\winlin-synchronous-" + std::to_wstring(GetCurrentProcessId()) +
+                      L"-" + std::to_wstring(GetTickCount64());
+    Handle pipe(CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                                 PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr));
+    if (pipe.value == INVALID_HANDLE_VALUE) {
+        throw windows_error("Create synchronous-test pipe");
+    }
+    Handle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!event.value) {
+        throw windows_error("Create synchronous-test event");
+    }
+
+    // Establish the pipe before IOCP association so its connect cannot leave a stale packet.
+    OVERLAPPED connection{};
+    connection.hEvent = event.value;
+    const BOOL connected = ConnectNamedPipe(pipe.value, &connection);
+    require(!connected && GetLastError() == ERROR_IO_PENDING, "Pipe connection must be pending");
+    const auto drain = [&](OVERLAPPED* pending) {
+        if (!CancelIoEx(pipe.value, pending) && GetLastError() != ERROR_NOT_FOUND) {
+            log_warning(windows_error("Cancel synchronous-test connection").what());
+        }
+        DWORD transferred{};
+        if (!GetOverlappedResult(pipe.value, pending, &transferred, TRUE) &&
+            GetLastError() != ERROR_OPERATION_ABORTED) {
+            log_warning(windows_error("Drain synchronous-test connection").what());
+        }
+    };
+    std::unique_ptr<OVERLAPPED, decltype(drain)> cleanup(&connection, drain);
+    Handle client(CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
+    if (client.value == INVALID_HANDLE_VALUE) {
+        throw windows_error("Connect synchronous-test client");
+    }
+    require(WaitForSingleObject(event.value, 5000) == WAIT_OBJECT_0,
+            "Synchronous-test connection must complete");
+    DWORD transferred{};
+    if (!GetOverlappedResult(pipe.value, &connection, &transferred, FALSE)) {
+        throw windows_error("Complete synchronous-test connection");
+    }
+    cleanup.release();
+
+    Handle port(CreateIoCompletionPort(pipe.value, nullptr, 0, 1));
+    if (!port.value ||
+        !SetFileCompletionNotificationModes(pipe.value, FILE_SKIP_SET_EVENT_ON_HANDLE |
+                                                            FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
+        throw windows_error("Configure synchronous-test completion port");
+    }
+    const std::array<char, 4> sent{'t', 'e', 's', 't'};
+    if (!WriteFile(client.value, sent.data(), static_cast<DWORD>(sent.size()), &transferred,
+                   nullptr)) {
+        throw windows_error("Write synchronous-test bytes");
+    }
+    require(transferred == sent.size(), "Test client must write the complete body");
+
+    // All bytes are buffered before this read. Cancel and drain if the fixture unexpectedly
+    // leaves it pending, so exceptions cannot release stack storage still referenced by I/O.
+    if (!ResetEvent(event.value)) {
+        throw windows_error("Reset synchronous-test event");
+    }
+    std::array<char, 4> received{};
+    OVERLAPPED read{};
+    read.hEvent = event.value;
+    std::unique_ptr<OVERLAPPED, decltype(drain)> read_cleanup(&read, drain);
+    require(ReadFile(pipe.value, received.data(), static_cast<DWORD>(received.size()), nullptr,
+                     &read) != FALSE,
+            "A read of buffered pipe bytes must succeed synchronously");
+    if (!GetOverlappedResult(pipe.value, &read, &transferred, FALSE)) {
+        throw windows_error("Read synchronous-test completion result");
+    }
+    read_cleanup.release();
+    require(transferred == sent.size() && received == sent,
+            "Immediate completion must retain the exact body bytes and count");
+
+    std::array<OVERLAPPED_ENTRY, 8> entries;
+    ULONG count{};
+    require(!GetQueuedCompletionStatusEx(port.value, entries.data(),
+                                         static_cast<ULONG>(entries.size()), &count, 0, FALSE) &&
+                GetLastError() == WAIT_TIMEOUT,
+            "Immediate success must not produce a native IOCP packet");
+    if (!PostQueuedCompletionStatus(port.value, transferred, 0, &read) ||
+        !GetQueuedCompletionStatusEx(port.value, entries.data(), static_cast<ULONG>(entries.size()),
+                                     &count, 5000, FALSE)) {
+        throw windows_error("Yield synchronous-test completion to IOCP");
+    }
+    require(count == 1 && entries[0].lpOverlapped == &read &&
+                entries[0].dwNumberOfBytesTransferred == sent.size() &&
+                completion_error(pipe.value, &read, NO_ERROR) == NO_ERROR,
+            "An explicit yield packet must preserve native completion status and byte count");
+}
 }
 
 int main() {
@@ -163,6 +259,7 @@ int main() {
         test_reference_clock();
         test_request_headers();
         test_completion_errors();
+        test_synchronous_completions();
         const auto snapshot = usage();
         require(snapshot.at("voluntary_context_switches").is_null(),
                 "Unavailable counters are null");
