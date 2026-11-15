@@ -268,8 +268,14 @@ Response exchange(const Target& target, const std::string& method, const std::st
     Response response;
     response.head = parse_head(std::string_view(input).substr(0, boundary));
     if (!response.head.first.starts_with("HTTP/1.1 ") || response.head.first.size() < 12 ||
-        !response.head.fields.contains("content-length") || response.head.length > 65536) {
+        !response.head.fields.contains("content-length")) {
         throw std::runtime_error("Invalid control response");
+    }
+    // Local telemetry and stop replies include up to 1000 completed repetitions. Keep a
+    // separate response bound rather than applying the 64 KiB control-command body limit.
+    constexpr std::size_t max_control_response_size = 16 * 1024 * 1024;
+    if (response.head.length > max_control_response_size) {
+        throw std::runtime_error("Control response body exceeds 16 MiB limit");
     }
     response.status = number(std::string_view(response.head.first).substr(9, 3), 599);
     response.body = input.substr(boundary);
@@ -1369,8 +1375,9 @@ int run_local(Target target, const BenchmarkOptions& options,
             try {
                 command("/v1/benchmark/stop?run_id=" + run_id);
             } catch (const std::exception& cleanup) {
-                log_warning("Cannot stop local run; bounded lease will expire: " +
-                            std::string(cleanup.what()));
+                log_warning(
+                    "Could not confirm local run stopped; bounded lease expiry is the fallback: " +
+                    std::string(cleanup.what()));
             }
         }
         const auto signal_number = interruption_signal.load(std::memory_order_relaxed);

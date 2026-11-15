@@ -28,6 +28,9 @@ created. The menu's **Run server-local benchmark** entry exposes the same option
 Existing network commands still default to `--benchmark https`; `--tls off`
 continues to select their HTTP workload. Local benchmarks reject network-only
 options, including TLS, connections, client workers, and GET/PUT sizes.
+Telemetry and stop replies contain the full completed repetition history.
+The client accepts control response bodies up to 16 MiB, covering the supported
+1000 repetitions; HTTP headers remain limited to 16 KiB.
 
 ## Workload definitions
 

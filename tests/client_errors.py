@@ -49,23 +49,40 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Advertise local workloads or return completed and failed repetition snapshots."""
+        if self.server.oversized_response:
+            self.send_response(200)
+            self.send_header("Content-Length", str(16 * 1024 * 1024 + 1))
+            self.end_headers()
+            return
         if self.path == "/v1/capabilities":
             self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation",
                                                    "page-fault"]})
         else:
             self.server.poll_seen.set()
-            self.respond({
-                "status": ("running" if self.server.running else
-                           "failed" if self.server.fail_run else "completed"),
-                "failure": "fixture native failure" if self.server.fail_run else None,
-                "results": [] if self.server.running else [{
-                    "repetition": 1, "operations": 100, "operations_per_second": 1000,
+            self.respond(self.snapshot())
+
+    def snapshot(self):
+        """Include full repetition history so telemetry and stop exercise large response bodies."""
+        repetitions = self.server.settings[-1]["repetitions"] if self.server.long_run else 1
+        results = []
+        if not self.server.running:
+            for repetition in range(1, repetitions + 1):
+                result = {
+                    "repetition": repetition, "operations": 100, "operations_per_second": 1000,
                     "mean_operation_ns": 1000000, "reference_cycles_per_operation": 2000,
                     "mean_round_trip_ns": 123456, "mean_ring_lap_ns": 654321,
                     "observed_page_faults": {"total": 7},
                     "server_host": {"cpu_utilization_percent": 100}, "errors": 0,
-                }],
-            })
+                }
+                if self.server.long_run:
+                    result["fixture_telemetry"] = "x" * 2048
+                results.append(result)
+        return {
+            "status": ("running" if self.server.running else
+                       "failed" if self.server.fail_run else "completed"),
+            "failure": "fixture native failure" if self.server.fail_run else None,
+            "results": results,
+        }
 
     def do_POST(self):
         """Retain submitted parameters and verify the client releases its owned lease."""
@@ -80,7 +97,7 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
             })
         else:
             self.server.stops += 1
-            self.respond({"status": "stopped"})
+            self.respond(self.snapshot() if self.server.long_run else {"status": "stopped"})
 
 
 client = sys.argv[1]
@@ -160,6 +177,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
     server = ThreadingHTTPServer(("127.0.0.1", 0), LocalControllerHandler)
     server.settings, server.stops, server.fail_run = [], 0, False
     server.running = False
+    server.long_run = server.oversized_response = False
     server.poll_seen = threading.Event()
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
@@ -304,6 +322,32 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 1, result.stdout + result.stderr
+        # Both polling and stop return histories above 64 KiB, including the supported maximum.
+        server.long_run = True
+        for repetitions in (100, 1000):
+            arguments = [
+                client, "run", "--target", str(target), "--benchmark", "page-fault",
+                "--repetitions", str(repetitions),
+            ]
+            output = directory / "long-page-fault.json"
+            if repetitions == 100:
+                arguments.extend(["--output", str(output)])
+            stops_before = server.stops
+            result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert server.stops == stops_before + 1
+            assert not result.stderr, result.stderr
+            if repetitions == 100:
+                report = json.loads(output.read_text())
+                assert report["status"] == "completed" and len(report["results"]) == 100
+                assert output.stat().st_size > 65536
+        # A header advertising an excessive body must fail before any body is received.
+        server.oversized_response = True
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "page-fault"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 1 and "Control response body exceeds 16 MiB limit" in result.stderr
     finally:
         server.shutdown()
         server.server_close()
