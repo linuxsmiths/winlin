@@ -1160,6 +1160,8 @@ BenchmarkOptions local_configuration(const Args& args) {
     } else if (benchmark == "page-fault") {
         args.allow({"--benchmark", "--target", "--repetitions", "--output", "--server-cpu",
                     "--region-size"});
+    } else if (benchmark == "thread-create") {
+        args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output"});
     } else {
         args.allow({"--benchmark", "--target", "--duration", "--repetitions", "--output",
                     "--server-cpu", "--threads"});
@@ -1265,7 +1267,9 @@ int run_local(Target target, const BenchmarkOptions& options,
             std::cout << "Native query: " << started.at("native_syscall").get<std::string>()
                       << '\n';
         }
-        if (options.benchmark == "allocation") {
+        if (options.benchmark == "thread-create") {
+            std::cout << "std::thread | one unpinned creator | one child at a time\n";
+        } else if (options.benchmark == "allocation") {
             std::cout
                 << "Allocation size=" << options.allocation_size
                 << " | live blocks/worker=" << options.live_allocations
@@ -1284,13 +1288,19 @@ int run_local(Target target, const BenchmarkOptions& options,
             std::cout << "First touch only | region=" << options.region_size
                       << " bytes | setup/release excluded\n";
         }
-        std::cout << "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op";
+        std::cout << (options.benchmark == "thread-create"
+                          ? "Run    operations/s life mean(us)     Avg CPU(%)     Ref cycles/op"
+                          : "Run    operations/s   mean op(ns)     Avg CPU(%)     Ref cycles/op");
         if (options.benchmark == "context-switch") {
             std::cout << (options.threads == 2 ? "     mean RTT(ns)" : "     mean lap(ns)")
                       << "      Sched CS/s";
         }
         if (options.benchmark == "page-fault") {
             std::cout << "   Observed faults";
+        }
+        if (options.benchmark == "thread-create") {
+            std::cout << "  start mean(us)   start p50(us)   start p99(us)"
+                         "    life p50(us)    life p99(us)";
         }
         std::cout << '\n';
         const auto deadline = Clock::now() + std::chrono::duration<double>(
@@ -1308,10 +1318,13 @@ int run_local(Target target, const BenchmarkOptions& options,
             // Print only newly completed repetitions; polling cannot change their measurements.
             for (std::size_t index = report.at("results").size(); index < results.size(); ++index) {
                 const auto& result = results[index];
-                std::cout << std::fixed << std::setprecision(2) << std::setw(3)
-                          << result.at("repetition").get<unsigned>() << std::setw(16)
-                          << result.at("operations_per_second").get<double>() << std::setw(14)
-                          << result.at("mean_operation_ns").get<double>();
+                std::cout
+                    << std::fixed << std::setprecision(2) << std::setw(3)
+                    << result.at("repetition").get<unsigned>() << std::setw(16)
+                    << result.at("operations_per_second").get<double>() << std::setw(14)
+                    << (options.benchmark == "thread-create"
+                            ? result.at("thread_lifecycle_latency").at("mean_us").get<double>()
+                            : result.at("mean_operation_ns").get<double>());
                 for (const auto& metric : {result.at("server_host").at("cpu_utilization_percent"),
                                            result.at("reference_cycles_per_operation")}) {
                     std::cout << std::setw(16);
@@ -1342,6 +1355,15 @@ int run_local(Target target, const BenchmarkOptions& options,
                         std::cout << faults.get<std::int64_t>();
                     } else {
                         std::cout << "N/A";
+                    }
+                }
+                if (options.benchmark == "thread-create") {
+                    const auto& startup = result.at("thread_startup_latency");
+                    const auto& lifecycle = result.at("thread_lifecycle_latency");
+                    for (const auto& metric :
+                         {startup.at("mean_us"), startup.at("p50_us"), startup.at("p99_us"),
+                          lifecycle.at("p50_us"), lifecycle.at("p99_us")}) {
+                        std::cout << std::setw(16) << metric.get<double>();
                     }
                 }
                 std::cout << '\n';
@@ -1844,9 +1866,9 @@ void interactive(std::string_view executable) {
                 std::cout << '\n';
                 run(target, config, output);
             } else if (action == "4") {
-                const auto benchmark =
-                    prompt("Benchmark: context-switch / syscall / allocation / page-fault",
-                           "context-switch");
+                const auto benchmark = prompt(
+                    "Benchmark: context-switch / syscall / allocation / page-fault / thread-create",
+                    "context-switch");
                 const auto target_path = select_target();
                 Json settings{{"benchmark", benchmark}, {"workers", 1}};
                 if (benchmark == "context-switch") {
@@ -1858,7 +1880,7 @@ void interactive(std::string_view executable) {
                         number(prompt("Live allocations per worker", "1"), 65536);
                     settings["memory_touch"] = prompt("Memory touch: none / pages", "none");
                     settings["workers"] = number(prompt("Server workers", "1"), 256);
-                } else {
+                } else if (benchmark != "thread-create") {
                     if (benchmark == "page-fault") {
                         settings["region_size"] = object_size(prompt("Fresh region size", "64MiB"),
                                                               std::size_t{1024} * 1024 * 1024);
@@ -1952,10 +1974,12 @@ int main(int argc, char** argv) {
                    "           [--put-size 4KiB] [--get-percent 50] [--connections 256]\n"
                    "           [--workers N] [--duration 30] [--requests 0]\n"
                    "           [--repetitions 3] [--timeout 10] [--output FILE] [--cipher SUITE]\n"
-                   "winlin run --target FILE --benchmark context-switch|syscall|allocation\n"
+                   "winlin run --target FILE --benchmark "
+                   "context-switch|syscall|allocation|thread-create\n"
                    "           [--duration 30] [--repetitions 3] [--output FILE]\n"
                    "           context-switch/syscall: [--server-cpu N] (default: auto)\n"
                    "           context-switch: [--threads 2] (2-1024, same-CPU blocking ring)\n"
+                   "           thread-create: one unpinned creator, sequential create/exit/join\n"
                    "           syscall: [--operation minimal-query]\n"
                    "           allocation: [--allocation-size 4KiB] [--live-allocations 1]\n"
                    "                       [--memory-touch none|pages] [--server-workers 1]\n"

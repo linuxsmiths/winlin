@@ -76,6 +76,8 @@ void test_failures() {
                               Json{{"benchmark", "context-switch"}, {"threads", 1}},
                               Json{{"benchmark", "context-switch"}, {"threads", 1025}},
                               Json{{"benchmark", "syscall"}, {"threads", 8}},
+                              Json{{"benchmark", "thread-create"}, {"server_cpu", 0}},
+                              Json{{"benchmark", "thread-create"}, {"workers", 2}},
                               Json{{"benchmark", "allocation"},
                                    {"allocation_size", 67108864},
                                    {"live_allocations", 65536}},
@@ -112,6 +114,115 @@ void test_failures() {
     native = native_operations();
     LocalBenchmark cancelled(
         BenchmarkOptions::parse({{"benchmark", "context-switch"}, {"duration", 30}}), native);
+}
+
+// Sequential native children must be joined, and timed samples must match completed lifecycles.
+void test_thread_creation() {
+    auto native = native_operations();
+    const auto create = native.create_thread;
+    const auto host = native.host;
+    std::atomic<std::uint64_t> created{};
+    std::vector<std::uint64_t> boundaries;
+    native.resolve_cpu = [](int) -> unsigned {
+        throw std::runtime_error("Thread creation must not resolve affinity");
+    };
+    native.bind_cpu = [](unsigned) {
+        throw std::runtime_error("Thread creation must not change affinity");
+    };
+    native.create_thread = [&](Clock::time_point& entry) {
+        auto child = create(entry);
+        ++created;
+        return child;
+    };
+    native.host = [&] {
+        boundaries.push_back(created.load());
+        return host();
+    };
+    {
+        LocalBenchmark benchmark(
+            BenchmarkOptions::parse(
+                {{"benchmark", "thread-create"}, {"duration", 0.02}, {"repetitions", 2}}),
+            native);
+        const auto sample = finish(benchmark);
+        require(sample.at("status") == "completed", sample.dump().c_str());
+        require(boundaries.size() == 4 && sample.at("results").size() == 2,
+                "Both thread lifecycle stages need before/after samples");
+        for (unsigned index = 0; index < 2; ++index) {
+            const auto& result = sample.at("results").at(index);
+            const auto& startup = result.at("thread_startup_latency");
+            const auto& lifecycle = result.at("thread_lifecycle_latency");
+            const auto operations = result.at("operations").get<std::uint64_t>();
+            require(operations > 0 &&
+                        operations == boundaries[index * 2 + 1] - boundaries[index * 2],
+                    "Only children created and joined inside the measured stage may count");
+            require(startup.at("samples") == operations && lifecycle.at("samples") == operations,
+                    "Every completed lifecycle must contribute both timing samples");
+            require(
+                startup.at("mean_us").get<double>() > 0 &&
+                    lifecycle.at("mean_us").get<double>() >= startup.at("mean_us").get<double>() &&
+                    lifecycle.at("p99_us").get<double>() >= lifecycle.at("p50_us").get<double>(),
+                "Startup and lifecycle latency distributions must remain distinct and ordered");
+            require(!startup.contains("histogram") && !lifecycle.contains("histogram"),
+                    "Repeated telemetry needs summaries, not full histogram bucket dumps");
+        }
+    }
+
+    // Failed creation in a later stage must preserve prior results and surface the native error.
+    native = native_operations();
+    std::atomic<unsigned> sample_number{};
+    native.host = [&] {
+        ++sample_number;
+        return host();
+    };
+    native.create_thread = [&](Clock::time_point& entry) {
+        if (sample_number >= 3) {
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected child creation failure");
+        }
+        return create(entry);
+    };
+    {
+        LocalBenchmark failed(
+            BenchmarkOptions::parse(
+                {{"benchmark", "thread-create"}, {"duration", 0.02}, {"repetitions", 2}}),
+            native);
+        const auto sample = finish(failed);
+        require(sample.at("status") == "failed" && sample.at("results").size() == 1 &&
+                    sample.at("failure").get<std::string>().find(
+                        "injected child creation failure") != std::string::npos,
+                "Child creation failures must reach the coordinator and preserve completed stages");
+    }
+
+    // Cancellation cannot finish until an in-flight child exits and the creator joins it.
+    native = native_operations();
+    std::latch child_started(1), allow_exit(1), cancelling(1);
+    std::atomic<unsigned> launched{}, exited{};
+    std::atomic<bool> joined{};
+    native.create_thread = [&](Clock::time_point& entry) {
+        const bool first = ++launched == 1;
+        return std::thread([&, first] {
+            entry = Clock::now();
+            if (first) {
+                child_started.count_down();
+                allow_exit.wait();
+            }
+            ++exited;
+        });
+    };
+    auto cancelled = std::make_unique<LocalBenchmark>(
+        BenchmarkOptions::parse({{"benchmark", "thread-create"}}), native);
+    child_started.wait();
+    std::jthread cancellation([&] {
+        cancelling.count_down();
+        cancelled.reset();
+        joined = true;
+    });
+    cancelling.wait();
+    const bool returned_early = joined;
+    allow_exit.count_down();
+    cancellation.join();
+    require(!returned_early && joined && launched == exited,
+            "Cancellation must join every child before releasing the run");
 }
 
 // Larger rings must circulate across repetitions on the requested CPU and retain handoff units.
@@ -346,6 +457,7 @@ int main() {
         test_workloads();
         test_failures();
         test_context_switch_ring();
+        test_thread_creation();
         test_page_faults();
         std::cout << "Native local benchmark tests passed\n";
         return 0;

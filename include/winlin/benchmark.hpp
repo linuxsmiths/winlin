@@ -29,7 +29,8 @@ struct BenchmarkOptions {
         }
         const auto benchmark = value.value("benchmark", std::string("https"));
         if (benchmark != "https" && benchmark != "context-switch" && benchmark != "syscall" &&
-            benchmark != "allocation" && benchmark != "page-fault") {
+            benchmark != "allocation" && benchmark != "page-fault" &&
+            benchmark != "thread-create") {
             throw std::invalid_argument("Unknown benchmark: " + benchmark);
         }
         for (const auto& [key, ignored] : value.items()) {
@@ -39,7 +40,8 @@ struct BenchmarkOptions {
             const bool local =
                 benchmark != "https" &&
                 ((key == "duration" && benchmark != "page-fault") || key == "repetitions" ||
-                 (key == "server_cpu" && benchmark != "allocation") ||
+                 (key == "server_cpu" && benchmark != "allocation" &&
+                  benchmark != "thread-create") ||
                  (key == "operation" && benchmark == "syscall") ||
                  (key == "threads" && benchmark == "context-switch") ||
                  (benchmark == "allocation" &&
@@ -136,7 +138,7 @@ struct BenchmarkOptions {
                 result["allocation_size"] = allocation_size;
                 result["live_allocations"] = live_allocations;
                 result["memory_touch"] = memory_touch;
-            } else {
+            } else if (benchmark != "thread-create") {
                 if (benchmark == "context-switch") {
                     result["threads"] = threads;
                 }

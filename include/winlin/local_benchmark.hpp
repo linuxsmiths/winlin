@@ -21,6 +21,13 @@ struct LocalOperations {
     std::function<void*(std::size_t)> reserve_commit;
     std::function<void(void*, std::size_t)> release_region;
     std::function<Json()> page_faults;
+    // The child only stamps entry and returns. The creator owns entry until join completes;
+    // this shared C++ runtime API also permits deterministic creation-failure tests.
+    std::function<std::thread(Clock::time_point&)> create_thread = [](Clock::time_point& entry) {
+        return std::thread([&entry] {
+            entry = Clock::now();
+        });
+    };
     Json environment;
     std::string syscall_name;
     std::string memory_backend;
@@ -61,6 +68,11 @@ class LocalBenchmark final : public BenchmarkInstance {
         std::vector<std::jthread> workers;
         std::vector<std::uint64_t> operations(count);
         std::vector<double> worker_seconds(count);
+        std::unique_ptr<Histogram> startup_latency, lifecycle_latency;
+        if (options_.benchmark == "thread-create") {
+            startup_latency = std::make_unique<Histogram>();
+            lifecycle_latency = std::make_unique<Histogram>();
+        }
         std::mutex error_mutex;
         std::string error;
         std::atomic<bool> failed{};
@@ -87,9 +99,10 @@ class LocalBenchmark final : public BenchmarkInstance {
                     std::vector<void*> blocks;
                     void* region{};
                     try {
-                        if (options_.benchmark != "allocation") {
+                        if (options_.benchmark != "allocation" &&
+                            options_.benchmark != "thread-create") {
                             native_.bind_cpu(cpu_);
-                        } else {
+                        } else if (options_.benchmark == "allocation") {
                             blocks.resize(options_.live_allocations);
                         }
                         if (options_.benchmark == "page-fault") {
@@ -112,7 +125,30 @@ class LocalBenchmark final : public BenchmarkInstance {
                                         (options_.allocation_size * options_.live_allocations)));
                     const auto deadline = begin + std::chrono::duration<double>(duration);
                     try {
-                        if (options_.benchmark == "page-fault") {
+                        if (options_.benchmark == "thread-create") {
+                            // Join establishes visibility of the child's entry stamp without
+                            // another readiness signal. Only complete create/exit/join pairs
+                            // count; cancellation finishes the current child before stopping.
+                            while (!stop_ && !failed && Clock::now() < deadline) {
+                                Clock::time_point entry;
+                                const auto operation_begin = Clock::now();
+                                auto child = native_.create_thread(entry);
+                                child.join();
+                                const auto operation_end = Clock::now();
+                                if (entry < operation_begin || entry > operation_end) {
+                                    throw std::runtime_error("Invalid child entry timestamp");
+                                }
+                                startup_latency->record(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        entry - operation_begin)
+                                        .count());
+                                lifecycle_latency->record(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        operation_end - operation_begin)
+                                        .count());
+                                ++completed;
+                            }
+                        } else if (options_.benchmark == "page-fault") {
                             if (!failed) {
                                 // A volatile write faults in each ordinary base page exactly
                                 // once. Cancellation checks are batched; no per-page timer is used.
@@ -282,6 +318,16 @@ class LocalBenchmark final : public BenchmarkInstance {
                         {"errors", 0},
                         {"scheduler_context_switches", nullptr},
                         {"scheduler_context_switches_per_second", nullptr}};
+            if (options_.benchmark == "thread-create") {
+                // Report bounded histogram summaries, not per-operation samples or buckets,
+                // so long runs do not inflate the repeated control-channel history.
+                auto startup = startup_latency->json();
+                auto lifecycle = lifecycle_latency->json();
+                startup.erase("histogram");
+                lifecycle.erase("histogram");
+                result["thread_startup_latency"] = std::move(startup);
+                result["thread_lifecycle_latency"] = std::move(lifecycle);
+            }
             // Process context-switch counters are not exact pair-only counts: control activity
             // also contributes. Never substitute handoffs for unavailable scheduler counters.
             if (measure &&
@@ -378,7 +424,7 @@ public:
         if (!native_.page_size) {
             throw std::invalid_argument("Native page size is unavailable");
         }
-        if (options_.benchmark != "allocation") {
+        if (options_.benchmark != "allocation" && options_.benchmark != "thread-create") {
             cpu_ = native_.resolve_cpu(options_.server_cpu);
         }
         if (options_.benchmark == "context-switch") {
@@ -419,8 +465,17 @@ public:
             {"operation_unit", options_.benchmark == "context-switch" ? "directed handoff"
                                : options_.benchmark == "allocation"   ? "allocation/free pair"
                                : options_.benchmark == "page-fault"   ? "first-touch base page"
-                                                                      : "native kernel query"},
-            {"server_cpu", options_.benchmark == "allocation" ? Json(nullptr) : Json(cpu_)},
+                               : options_.benchmark == "thread-create"
+                                   ? "create/exit/join lifecycle"
+                                   : "native kernel query"},
+            {"server_cpu",
+             options_.benchmark == "allocation" || options_.benchmark == "thread-create"
+                 ? Json(nullptr)
+                 : Json(cpu_)},
+            {"thread_api",
+             options_.benchmark == "thread-create" ? Json("std::thread") : Json(nullptr)},
+            {"child_threads_at_once",
+             options_.benchmark == "thread-create" ? Json(1) : Json(nullptr)},
             {"native_syscall",
              options_.benchmark == "syscall" ? Json(native_.syscall_name) : Json(nullptr)},
             {"environment", native_.environment},
@@ -448,6 +503,10 @@ public:
               "Workers are recreated outside sampling for each stage; allocator thread caches may "
               "be cold.",
               "Allocation measures the reported build allocator, not OS overhead alone.",
+              "Thread creation uses one unpinned creator and one child at a time; runtime "
+              "stack/TLS caching remains enabled.",
+              "Thread startup and lifecycle timing include timestamp overhead; throughput and CPU "
+              "cost also include histogram bookkeeping.",
               "Minimal native queries have different kernel work on Linux and Windows."}}};
     }
 

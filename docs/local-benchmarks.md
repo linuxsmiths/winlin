@@ -12,6 +12,9 @@ winlin run --target linux.json --benchmark context-switch \
 winlin run --target windows.json --benchmark context-switch \
   --threads 1024 --server-cpu 2 --duration 30 --repetitions 3
 
+winlin run --target windows.json --benchmark thread-create \
+  --duration 10 --repetitions 3
+
 winlin run --target windows.json --benchmark syscall \
   --operation minimal-query --server-cpu 2 --duration 30 --repetitions 3
 
@@ -96,6 +99,34 @@ not a measurement of pure CPU privilege-transition cost. Timing and cancellation
 checks occur between batches of 256 queries. Loop, checked API call, and shared
 dispatch overhead remain included.
 
+**Thread-create:** one creator repeatedly constructs a `std::thread`, waits for
+it to exit using `join`, and only then starts another. The child's only body
+records its entry timestamp and returns. Neither creator nor child receives an
+explicit affinity setting; inherited process/CPU restrictions still apply.
+`--server-cpu`, `--threads`, and `--server-workers` are rejected.
+
+Startup latency spans the timestamp before construction to the child's entry
+stamp, including runtime startup and scheduling. Lifecycle latency spans that
+same initial timestamp to the return from `join`, including exit and cleanup.
+The console reports mean/p50/p99 startup and lifecycle times in microseconds,
+completed lifecycles/s, whole-server CPU, and reference cycles/lifecycle.
+The JSON also retains amortized `mean_operation_ns` for the entire creator loop,
+which includes bookkeeping and is distinct from the timed lifecycle mean.
+Bounded logarithmic histograms produce percentile upper bounds within 1.5625%;
+only summaries are sent, not individual samples or bucket dumps.
+
+Child creation, exit, and join are inside measurement; outer creator setup and
+teardown are outside it. Per-operation timestamps and histogram bookkeeping
+add instrumentation overhead. Timestamp cost is included in lifecycle timing;
+throughput and CPU cost also include recording the histogram samples.
+This compares C++ runtime plus OS lifecycle cost, not a bare kernel thread API.
+Runtime stack/TLS caching and the reported build allocator remain enabled, so
+the ordinary two-second warmup does not represent cold thread startup.
+Native deferred cleanup may continue after join; this measures the join-visible
+lifecycle, not complete global resource reclamation.
+Cancellation joins the current child before stopping; creation failures
+propagate to the coordinator and preserve earlier completed repetitions.
+
 **Allocation:** each worker allocates `live-allocations` blocks of the selected
 size and then frees the entire batch. One operation is a complete allocation/free
 pair. `--memory-touch none` adds no application writes to block contents;
@@ -116,12 +147,14 @@ An explicit CPU is validated; failure to pin any participant fails the run.
 Windows CPU indices are flattened across processor groups; Linux indices use
 native logical CPU numbering. The actual selected CPU is reported. Allocation
 workers are not pinned in this first version.
+Thread-create's creator and children are also not explicitly pinned.
 
 A fixed two-second warmup precedes repetitions, except for page-fault's single
 untimed region. Workers are created for each
 stage outside sampling, so per-thread allocator caches can be cold even after
-global warmup. Setup, joins, and partial-allocation cleanup are outside measurement
-boundaries; workers park while final CPU counters are captured.
+global warmup. Outer worker setup/joins and partial-allocation cleanup are outside
+measurement boundaries; workers park while final CPU counters are captured.
+Thread-create's child creation and joins are deliberately inside those boundaries.
 
 The console reports operations/s, **amortized mean** nanoseconds/operation,
 whole-server average CPU usage, and reference cycles/operation. The mean is not

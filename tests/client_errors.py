@@ -56,7 +56,7 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/capabilities":
             self.respond({"supported_benchmarks": ["context-switch", "syscall", "allocation",
-                                                   "page-fault"]})
+                                                   "page-fault", "thread-create"]})
         else:
             self.server.poll_seen.set()
             self.respond(self.snapshot())
@@ -76,6 +76,13 @@ class LocalControllerHandler(BaseHTTPRequestHandler):
                 }
                 if self.server.long_run:
                     result["fixture_telemetry"] = "x" * 2048
+                if self.server.settings[-1]["benchmark"] == "thread-create":
+                    result["thread_startup_latency"] = {
+                        "mean_us": 10, "p50_us": 8, "p99_us": 20,
+                    }
+                    result["thread_lifecycle_latency"] = {
+                        "mean_us": 30, "p50_us": 25, "p99_us": 50,
+                    }
                 results.append(result)
         return {
             "status": ("running" if self.server.running else
@@ -322,6 +329,38 @@ with tempfile.TemporaryDirectory(prefix="winlin-local-client-") as temporary:
                 capture_output=True, text=True, timeout=15,
             )
             assert result.returncode == 1, result.stdout + result.stderr
+        # Thread creation has no affinity or parallelism prompts, and prints both distributions.
+        output = directory / "thread-create.json"
+        result = subprocess.run(
+            [client, "run", "--target", str(target), "--benchmark", "thread-create",
+             "--duration", "0.02", "--repetitions", "1", "--output", str(output)],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "one unpinned creator" in result.stdout and "start p99(us)" in result.stdout
+        assert "life mean(us)" in result.stdout and "50.00" in result.stdout
+        assert "server_cpu" not in server.settings[-1]
+        report = json.loads(output.read_text())
+        assert report["results"][0]["thread_startup_latency"]["mean_us"] == 10
+        assert report["results"][0]["thread_lifecycle_latency"]["mean_us"] == 30
+        result = subprocess.run(
+            [client], input="4\nthread-create\n1\n0.02\n1\nno\n0\n",
+            capture_output=True, text=True, timeout=15,
+            env=dict(os.environ, XDG_STATE_HOME=str(state.parent)),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        displayed = re.search(r"Noninteractive command:\n([^\n]+)", result.stdout)
+        assert displayed and "--benchmark 'thread-create'" in displayed.group(1), result.stdout
+        assert "--server-cpu" not in displayed.group(1)
+        replay = subprocess.run(shlex.split(displayed.group(1)),
+                                capture_output=True, text=True, timeout=15)
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        for option in ("--server-cpu", "--server-workers", "--threads", "--tls"):
+            result = subprocess.run(
+                [client, "run", "--target", str(target), "--benchmark", "thread-create", option, "1"],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert result.returncode == 1 and "Unknown option" in result.stderr
         # Both polling and stop return histories above 64 KiB, including the supported maximum.
         server.long_run = True
         for repetitions in (100, 1000):
