@@ -265,13 +265,14 @@ TLS handshakes are excluded from request
 latencies and throughput. There is one outstanding request per connection:
 HTTP pipelining, HTTP/2, and paced/open-loop arrivals are not implemented.
 
-For TLS PUTs, the client prepares an immutable header-plus-body prefix once per
-benchmark, filling the first 16 KiB TLS submission when the object is large enough.
+For both HTTP and TLS PUTs, the client prepares an immutable header-plus-body prefix
+once per benchmark, filling the first 16 KiB submission when the object is large enough.
 Remaining body bytes use the original payload directly. Small objects fit with
 their header in one submission; zero-byte PUTs still send just their header.
-This adds at most one record-sized shared staging buffer, no per-request copy,
-and keeps retry bytes stable. Plain HTTP PUTs and GET requests are unchanged.
-TLS record batching does not guarantee a particular TCP packet size.
+This adds at most one write-sized shared staging buffer, no per-request copy,
+and keeps retry bytes stable. Both transports use the same prefix and body-offset
+logic, so plain HTTP is not penalized by separate header/body submissions.
+GET requests are unchanged. One submission does not guarantee one TCP packet.
 
 The client attempts each new request's writes immediately, including the next
 request after a response completes. It waits for write readiness only on transport

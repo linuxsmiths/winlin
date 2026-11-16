@@ -225,6 +225,26 @@ extern "C" ssize_t send(int fd, const void* buffer, std::size_t length, int flag
             }
         }
     }
+    // Inspect the native client submission before injecting backpressure or a short write.
+    // TCP receives cannot establish whether HTTP and TLS started with the same PUT batching.
+    static const char* put_size = std::getenv("WINLIN_TEST_HTTP_PUT_SIZE");
+    if (put_size && workload_socket(fd)) {
+        const std::string_view bytes(static_cast<const char*>(buffer), length);
+        if (bytes.starts_with("PUT ")) {
+            const auto boundary = bytes.find("\r\n\r\n");
+            const auto size = std::strtoul(put_size, nullptr, 10);
+            if (boundary == std::string_view::npos ||
+                length != std::min<std::size_t>(boundary + 4 + size, 16384)) {
+                std::fprintf(stderr,
+                             "Fatal winlin test shim error: HTTP PUT prefix is incomplete\n");
+                std::_Exit(127);
+            }
+            static std::atomic<bool> checked{};
+            if (!checked.exchange(true)) {
+                std::fprintf(stderr, "winlin-test: verified combined HTTP PUT prefix\n");
+            }
+        }
+    }
     static const bool optimistic = std::getenv("WINLIN_TEST_OPTIMISTIC_WRITES") != nullptr;
     if (!optimistic || !workload_socket(fd)) {
         return real_send(fd, buffer, length, flags);

@@ -391,10 +391,10 @@ struct Stats {
     }
 };
 
-// Own immutable request headers and the TLS PUT prefix shared by every benchmark connection.
-// Build once before workers start, and retain the bytes unchanged through every TLS retry.
+// Own immutable request headers and the PUT prefix shared by every benchmark connection.
+// Build once before workers start, and retain the bytes unchanged through partial/TLS writes.
 struct LoadHeaders {
-    std::string get, put, tls_put_start;
+    std::string get, put, put_start;
     std::size_t put_prefix_bytes{};
 
     // Build both methods from fixed trial settings and the active workload lease, not per I/O.
@@ -404,15 +404,15 @@ struct LoadHeaders {
                             "\r\nContent-Length: ";
         get = "GET /v1/object?size=" + std::to_string(config.get_size) + fields + "0\r\n\r\n";
         put = "PUT /v1/object" + fields + std::to_string(config.put_size) + "\r\n\r\n";
-        // Fill the first TLS record without copying the whole object or staging per request.
-        // HTTP and GET requests retain their existing submissions.
-        if (config.tls != "off" && config.method != "get") {
+        // Fill the first write identically for HTTP and TLS, without copying the whole object
+        // or staging per request. GET requests retain their header-only submissions.
+        if (config.method != "get") {
             if (put.size() >= 16384) {
-                throw std::invalid_argument("PUT header leaves no room in the first TLS record");
+                throw std::invalid_argument("PUT header leaves no room in the first 16 KiB write");
             }
             put_prefix_bytes = std::min(config.put_size, 16384 - put.size());
-            tls_put_start = put;
-            tls_put_start.append(payload.data(), put_prefix_bytes);
+            put_start = put;
+            put_start.append(payload.data(), put_prefix_bytes);
         }
     }
 };
@@ -441,7 +441,7 @@ struct LoadConnection {
     bool alive{true}, get{};
     // Cache the last successful epoll registration; one worker owns all updates.
     std::uint32_t registered_events{};
-    // Borrow the immutable header (plus the first body bytes for TLS PUTs) through retries.
+    // Borrow the immutable header (plus the first body bytes for PUTs) through retries.
     std::string_view header;
     // buffer: accumulate response headers directly, then reuse it to discard response body bytes
     std::array<char, max_header_size> buffer{};
@@ -476,11 +476,11 @@ struct LoadConnection {
         get = config.method == "get" ||
               (config.method == "mixed" &&
                ((index % 100) * config.get_percent) % 100 < config.get_percent);
-        const bool combined_put = !get && socket.ssl && !headers.tls_put_start.empty();
+        const bool combined_put = !get && !headers.put_start.empty();
         if (get) {
             header = headers.get;
         } else if (combined_put) {
-            header = headers.tls_put_start;
+            header = headers.put_start;
         } else {
             header = headers.put;
         }
@@ -541,7 +541,8 @@ struct LoadConnection {
                 }
                 offset += count;
                 if (offset == header.size()) {
-                    // The TLS prefix already sent these body bytes; resume without duplication.
+                    // The combined prefix already sent these body bytes; resume without
+                    // duplication.
                     offset = get ? 0 : put_prefix_bytes;
                     // header is fully sent, now we can either send the body (for PUT) or
                     // read the response (for GET).

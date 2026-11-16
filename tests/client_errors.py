@@ -1265,34 +1265,49 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             assert all(entry["issued"] == 8 and entry["completed"] == 8 and entry["errors"] == 0
                        for entry in optimistic["results"])
 
-            # Check the TLS write itself and exact body framing through retries, multiple
-            # connections/repetitions, and mixed requests. Include empty and multi-record PUTs.
-            for size in (0, 256, 16384, 65536):
-                secure.verify_put = True
-                secure.put_digest = None
-                secure.puts_verified = 0
-                output = directory / f"tls-put-prefix-{size}.json"
-                arguments = benchmark.copy()
-                for option, value in (("--connections", "2"), ("--workers", "2"),
-                                      ("--requests", "4")):
-                    arguments[arguments.index(option) + 1] = value
-                result = subprocess.run(
-                    [*arguments, "--method", "mixed", "--get-percent", "50",
-                     "--put-size", str(size), "--output", str(output)],
-                    capture_output=True, text=True, timeout=15,
-                    env=dict(os.environ, LD_PRELOAD=faults,
-                             WINLIN_TEST_DATA_PORT=str(secure.server_port),
-                             WINLIN_TEST_TLS_PUT_SIZE=str(size)),
-                )
-                secure.verify_put = False
-                assert result.returncode == 0, result.stdout + result.stderr
-                assert "verified combined TLS PUT prefix" in result.stderr, result.stderr
-                assert "preserved TLS retry buffer" in result.stderr, result.stderr
-                report = json.loads(output.read_text())
-                assert all(entry["put_completed"] == 2 and entry["get_completed"] == 2 and
-                           entry["sent_object_bytes"] == 2 * size and entry["errors"] == 0
-                           for entry in report["results"])
-                assert secure.puts_verified > 4
+            # Inspect HTTP/TLS submissions and exact body framing through blocked/partial writes,
+            # multiple connections/repetitions, and mixed requests. The PUT-only small-object case
+            # forces backpressure on its combined prefix, not on a preceding GET header.
+            for mode, endpoint in (("off", plain), ("on", secure)):
+                for size in (0, 256, 16384, 65536):
+                    endpoint.verify_put = True
+                    endpoint.put_digest = None
+                    endpoint.puts_verified = 0
+                    method = "put" if size == 256 else "mixed"
+                    expected_puts = 4 if method == "put" else 2
+                    output = directory / f"{mode}-put-prefix-{size}.json"
+                    arguments = benchmark.copy()
+                    for option, value in (("--connections", "2"), ("--workers", "2"),
+                                          ("--requests", "4")):
+                        arguments[arguments.index(option) + 1] = value
+                    environment = dict(os.environ, LD_PRELOAD=faults,
+                                       WINLIN_TEST_DATA_PORT=str(endpoint.server_port))
+                    if mode == "off":
+                        environment.update(WINLIN_TEST_HTTP_PUT_SIZE=str(size),
+                                           WINLIN_TEST_OPTIMISTIC_WRITES="1")
+                    else:
+                        environment["WINLIN_TEST_TLS_PUT_SIZE"] = str(size)
+                    result = subprocess.run(
+                        [*arguments, "--tls", mode, "--method", method, "--get-percent", "50",
+                         "--put-size", str(size), "--output", str(output)],
+                        capture_output=True, text=True, timeout=15, env=environment,
+                    )
+                    endpoint.verify_put = False
+                    assert result.returncode == 0, result.stdout + result.stderr
+                    transport = "HTTP" if mode == "off" else "TLS"
+                    assert f"verified combined {transport} PUT prefix" in result.stderr, result.stderr
+                    if mode == "off":
+                        for marker in ("injected blocked optimistic write",
+                                       "injected partial request write"):
+                            assert marker in result.stderr, result.stderr
+                    else:
+                        assert "preserved TLS retry buffer" in result.stderr, result.stderr
+                    report = json.loads(output.read_text())
+                    assert all(entry["put_completed"] == expected_puts and
+                               entry["get_completed"] == 4 - expected_puts and
+                               entry["sent_object_bytes"] == expected_puts * size and
+                               entry["errors"] == 0 for entry in report["results"])
+                    assert endpoint.puts_verified > 2 * expected_puts
 
             # Inject delay at the two distinct boundaries that previously admitted expired I/O.
             for variable, marker in (
