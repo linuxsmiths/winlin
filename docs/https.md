@@ -202,7 +202,7 @@ or resource-availability guarantee.
 The Linux server keeps `TCP_NODELAY` enabled and uses OpenSSL's native socket BIO.
 The response-scoped `TCP_CORK` and custom-BIO `MSG_MORE` experiments are disabled
 for the CPIO baseline comparison: GETs perform no cork/uncork socket-option calls.
-Copy-mode TLS GET header/body coalescing remains enabled. Environment metadata
+Copy-mode HTTP and userspace TLS GETs both coalesce headers and body. Environment metadata
 records `workload_tcp_nodelay: true`, `workload_tcp_cork: false`, and
 `workload_tls_msg_more: false`. Client and Windows behavior are unchanged.
 
@@ -310,21 +310,23 @@ run need not visit the entire pool or establish that every read missed CPU cache
 Telemetry records `get_response_source_access` and `get_response_source_pool_bytes`.
 
 **Comparing shared and copy now changes source-cache behavior as well as copying;
-it does not isolate the cost of memcpy.** Linux copy-mode TLS GETs additionally
+it does not isolate the cost of memcpy.** Linux copy-mode HTTP and userspace TLS GETs
 place the serialized header immediately before the body in reusable private
 storage. The selected object is copied directly to its final location once;
-only the small header is staged separately. This applies to userspace OpenSSL;
-kTLS always uses the separate file-backed path described below.
-Headers and data that fit within the 16 KiB plaintext write limit use one
+only the small header is staged separately. Both transports use the same staged
+buffer and write loop, so plain HTTP is not penalized by separate header/body
+submissions. kTLS always uses the separate file-backed path described below.
+Headers and data that fit within the 16 KiB write limit use one `send` or
 `SSL_write` rather than separate header/body writes. Larger responses continue
-through record-sized writes; this does not necessarily reduce their record count
-or guarantee one TCP packet.
-Shared GETs and plain HTTP retain separate submissions, and PUT/error handling
-is unchanged. Windows still uses the same HTTP.sys response API; its internal TLS
-record packing is not inferred from its application buffer layout.
-`get_response_contiguous_tls_buffer` reports application staging, not a claim
-about HTTP.sys internals. Thus shared/copy comparisons on Linux TLS also include
-this submission-path difference.
+through bounded writes; this does not guarantee one TCP packet or remove TLS
+record/encryption overhead.
+Shared GETs retain separate submissions, and PUT/error handling is unchanged.
+Windows still uses the same HTTP.sys response API; its internal TLS record packing
+is not inferred from its application buffer layout.
+`get_response_contiguous_buffer` reports application staging for either transport;
+the existing `get_response_contiguous_tls_buffer` is true only for staged TLS
+responses. Neither describes HTTP.sys internals. Thus shared/copy comparisons on
+Linux HTTP/TLS also include this submission-path difference.
 
 ### Cipher selection and kTLS
 

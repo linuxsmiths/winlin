@@ -59,7 +59,7 @@ AgentConfig workload_config(const BenchmarkOptions& options) {
     config.workers = options.workers;
     config.shared_get_data = options.get_response_data == "shared";
     config.file_get_data = options.get_response_data == "file";
-    config.contiguous_tls_get = config.tls && !config.shared_get_data && !config.file_get_data;
+    config.contiguous_get = !config.shared_get_data && !config.file_get_data;
     return config;
 }
 
@@ -167,7 +167,7 @@ struct Session {
     // Benchmark start: header -> control_body -> send_header -> send_body -> header -> ...
     // Other control: header -> send_header -> send_body -> header -> ...
     // Benchmark GET: header -> send_header -> send_body -> header -> ...
-    // Copy-mode TLS GET skips send_header: send_body writes the combined header/body buffer.
+    // Copy-mode HTTP/TLS GET skips send_header: send_body writes the combined header/body buffer.
     // Benchmark PUT: header -> body -> send_header -> send_body (empty) -> header -> ...
     enum class State {
         handshake,
@@ -260,9 +260,9 @@ struct Session {
         output.append(connection.ktls_rx ? "1" : "0");
         output.append("\r\n\r\n");
 
-        // Only copied TLS GETs own contiguous header/body storage. Plain HTTP and shared GETs
-        // retain separate submissions, so the optimization adds no per-response shared-body copy.
-        combined_response = object_response && server.config.contiguous_tls_get;
+        // Copied HTTP and TLS GETs use the same header/body staging and write path. Shared GETs
+        // remain separate so this does not introduce a private copy for that workload.
+        combined_response = object_response && server.config.contiguous_get;
         if (object_response && !server.config.file_get_data) {
             const auto prefix = combined_response ? std::string_view(output) : std::string_view{};
             get_data = get_payload.prepare(server.payload, body_size, server.config.shared_get_data,
@@ -371,7 +371,7 @@ struct Session {
                     }
                 }
             } else if (state == State::send_body) {
-                // A copied TLS GET includes its header in this transfer. Keep the full buffer,
+                // A copied HTTP/TLS GET includes its header in this transfer. Keep the full buffer,
                 // length, and offset stable across OpenSSL WANT_READ/WANT_WRITE retries. Larger
                 // responses still advance through StreamSocket's record-sized writes.
                 const auto prefix_size = combined_response ? output.size() : 0;

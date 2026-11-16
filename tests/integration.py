@@ -82,6 +82,8 @@ class Controller:
             wait_marker = ("uncorked TLS read" if self.tls_retry == "read" else "uncorked TLS write")
             assert f"winlin-test: checked {wait_marker} wait" in stderr, stderr
             assert "winlin-test: preserved TLS retry buffer" in stderr, stderr
+            if self.tls_retry == "write":
+                assert "winlin-test: coalesced HTTP copy response" in stderr, stderr
 
     def listening_ports(self):
         """Inspect this test-owned process's listeners, not other servers in its network namespace."""
@@ -184,11 +186,12 @@ def exercise_tls_get_records(lease, coalesced):
         raw.close()
 
 
-def exercise_tls_send_backpressure(lease):
+def exercise_get_send_backpressure(lease):
     """Keep a large combined response pending while a second request is already pipelined."""
     transport = socket.create_connection(("127.0.0.1", lease["port"]), timeout=10)
     transport.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 128 * 1024)
-    raw = tls_context().wrap_socket(transport, server_hostname="localhost")
+    raw = (tls_context().wrap_socket(transport, server_hostname="localhost")
+           if lease["transport"] == "https" else transport)
     try:
         sizes = (8 * 1024 * 1024, 4096)
         requests = b"".join(
@@ -501,12 +504,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                     "hot-prefix" if data_mode == "shared" else "rotating-objects")
                 assert measured["get_response_source_pool_bytes"] == (
                     64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
+                assert measured["get_response_contiguous_buffer"] == (data_mode == "copy")
                 assert measured["get_response_contiguous_tls_buffer"] == (
                     mode == "on" and data_mode == "copy")
                 if mode == "on":
                     exercise_tls_get_records(lease, data_mode == "copy")
-                    if data_mode == "copy":
-                        exercise_tls_send_backpressure(lease)
+                if data_mode == "copy":
+                    exercise_get_send_backpressure(lease)
                 data = Workload(lease)
                 try:
                     bodies = []
@@ -566,6 +570,8 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert repetition["server_after"]["get_response_data"] == data_mode
                 assert repetition["server_before"]["get_response_source_pool_bytes"] == (
                     64 * 1024 * 1024 if data_mode == "shared" else 1024 * 1024 * 1024)
+                assert repetition["server_before"]["get_response_contiguous_buffer"] == (
+                    data_mode == "copy")
                 assert repetition["server_before"]["get_response_contiguous_tls_buffer"] == (
                     mode == "on" and data_mode == "copy")
                 assert repetition["completed"] == repetition["issued"] == 100
@@ -628,6 +634,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
             assert report["server_run"]["get_response_sendfile"]
             assert telemetry["get_response_data"] == "file"
             assert telemetry["get_response_file_backend"] == "sealed-memfd"
+            assert not telemetry["get_response_contiguous_buffer"]
             assert not telemetry["get_response_contiguous_tls_buffer"]
             assert telemetry["get_sendfile_calls"] > 0
             assert telemetry["get_sendfile_bytes"] >= 10 * 65536
@@ -644,7 +651,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-controlled-test-") as temporary:
                 assert second.request("GET", "/v1/object?size=256") == (200, body[:256])
                 assert first.request("GET", "/v1/object?size=4096") == (200, body[:4096])
                 assert second.request("PUT", "/v1/object", b"x" * 256)[0] == 501
-                exercise_tls_send_backpressure(lease)
+                exercise_get_send_backpressure(lease)
                 exercise_abandoned_get(lease)
             finally:
                 first.connection.close()

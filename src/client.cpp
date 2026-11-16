@@ -1546,7 +1546,9 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
             "header/body staging may also differ by backend/version; see server telemetry "
             "when available. No per-request RNG is used. Buffers "
             "retain their largest size; first use/growth includes allocation and initialization "
-            "costs, so use warmup for steady-state comparisons.");
+            "costs, so use warmup for steady-state comparisons. Linux HTTP and userspace TLS "
+            "copy-mode GETs both stage headers with the body; inspect server telemetry for "
+            "the applied implementation.");
     } else if (config.get_response_data == "file") {
         notes.emplace_back(
             "kTLS GET uses SSL_sendfile from the hot prefix of a sealed, startup-populated "

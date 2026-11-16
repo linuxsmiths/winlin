@@ -205,6 +205,26 @@ extern "C" ssize_t send(int fd, const void* buffer, std::size_t length, int flag
         std::fprintf(stderr, "Fatal test shim error: MSG_MORE is enabled in baseline transport\n");
         std::_Exit(127);
     }
+    // The integration fixture's first 256-byte HTTP GET uses copy mode. Inspect the submitted
+    // buffer, not TCP receive boundaries, to prove headers and body reach send() together.
+    static std::atomic<bool> checked_http_copy{};
+    if (verify && !checked_http_copy.load()) {
+        const std::string_view bytes(static_cast<const char*>(buffer), length);
+        if (bytes.starts_with("HTTP/1.1 200 ") &&
+            bytes.find("\r\nContent-Type: application/octet-stream\r\n") !=
+                std::string_view::npos &&
+            bytes.find("\r\nContent-Length: 256\r\n") != std::string_view::npos) {
+            const auto header_end = bytes.find("\r\n\r\n");
+            if (header_end == std::string_view::npos || length != header_end + 4 + 256) {
+                std::fprintf(stderr,
+                             "Fatal test shim error: HTTP copy GET submitted headers alone\n");
+                std::_Exit(127);
+            }
+            if (!checked_http_copy.exchange(true)) {
+                std::fprintf(stderr, "winlin-test: coalesced HTTP copy response\n");
+            }
+        }
+    }
     static const bool optimistic = std::getenv("WINLIN_TEST_OPTIMISTIC_WRITES") != nullptr;
     if (!optimistic || !workload_socket(fd)) {
         return real_send(fd, buffer, length, flags);

@@ -29,8 +29,8 @@ struct AgentConfig {
     bool shared_get_data{true};
     bool file_get_data{};
     bool supports_ktls_sendfile{};
-    // Describe application-side TLS staging, not the native transport's internal record packing.
-    bool contiguous_tls_get{};
+    // Describe application-side header/body staging, not native packet or TLS record packing.
+    bool contiguous_get{};
     Json environment;
     std::vector<std::string> unavailable_metrics{
         "hardware_cycles", "instructions",     "cache_misses", "memory_bandwidth",
@@ -221,7 +221,8 @@ public:
                  : Json(config.shared_get_data || config.file_get_data ? "hot-prefix"
                                                                        : "rotating-objects")},
             {"get_response_source_pool_bytes", config.get_source_pool_size()},
-            {"get_response_contiguous_tls_buffer", config.contiguous_tls_get},
+            {"get_response_contiguous_buffer", config.contiguous_get},
+            {"get_response_contiguous_tls_buffer", config.tls && config.contiguous_get},
             {"accepted_connections",
              config.connection_metrics ? Json(connections.load()) : Json(nullptr)},
             {"active_connections", config.connection_metrics ? Json(active.load()) : Json(nullptr)},
