@@ -238,7 +238,150 @@ Host and interface telemetry include activity outside the measured request
 loop. Use otherwise idle machines and retain the sampling intervals. Unavailable
 measurements remain unavailable rather than becoming zero.
 
-### 4.4. Reproducibility and comparison controls
+### 4.4. How are CPIO (cycles/io) and CPO (cycles/operation) computed
+
+These metrics express the estimated server CPU cost of completing one unit of
+work. **CPIO** is used for network requests; **CPO** is used for server-local
+operations. Both use the same calculation:
+
+```text
+Estimated reference cycles = server busy CPU seconds x reference-clock frequency
+
+CPIO = estimated reference cycles / successful completed HTTP requests
+CPO  = estimated reference cycles / completed local operations
+```
+
+#### What counts as CPU time and completed work?
+
+We take whole-server CPU samples before and after each measured repetition and
+subtract them to obtain its busy CPU time. This time is summed across all logical
+CPUs, not just the Winlin process. For example, two logical CPUs fully occupied
+for ten seconds contribute twenty busy CPU-seconds. There is no additional
+multiplication by the machine's CPU count.
+
+On Linux, busy time comes from `/proc/stat`: user, nice, system, IRQ, and softirq
+time, excluding idle, I/O wait, and stolen VM time. On Windows, it comes from
+`GetSystemTimes`: kernel plus user time minus idle time, across all processor
+groups. Whole-server accounting includes work outside the application process,
+such as HTTP.sys/Schannel processing charged to System.
+
+For CPIO, one I/O is one successfully completed GET or PUT, regardless of its
+object size, packet count, or TLS record count. Failed requests are excluded from
+the denominator, but any CPU time they consumed remains in the numerator.
+
+For CPO, the operation depends on the local benchmark. Examples include one
+directed token handoff, one allocation/free pair, one native kernel query, or one
+thread create/exit/join lifecycle. A handoff round trip counts as two directed
+handoffs. The page-first-touch benchmark counts pages touched, not OS-reported
+page faults. Each report identifies its `operation_unit`; costs for different
+units are not interchangeable.
+
+#### How do we obtain the reference-clock frequency?
+
+On supported x86_64 servers, we use the invariant timestamp counter, or **TSC**.
+This counter advances at a fixed reference rate, rather than following the
+CPU core's changing turbo or power-saving frequency.
+
+Before measurement, the server reads the TSC and a monotonic clock, sleeps for
+approximately 50 milliseconds, and reads both again:
+
+```text
+TSC frequency = change in TSC ticks / actual elapsed seconds
+```
+
+For example, 125 million ticks over 0.05 seconds gives 2.5 billion ticks per
+second, or 2.5 GHz. We repeat the calibration, reject samples detected as moving
+between CPUs, and use the median frequency, requiring at least three samples
+within 1% of it. Calibration happens once, outside the measured workload.
+
+#### Worked example
+
+Suppose a ten-second repetition averages 200% server CPU, the calibrated TSC
+frequency is 2.5 GHz, and one million requests complete successfully:
+
+```text
+Busy CPU time = 10 seconds x 200 / 100 = 20 CPU-seconds
+CPIO          = 20 x 2,500,000,000 / 1,000,000
+              = 50,000 reference cycles per request
+```
+
+The console displays this as **50.00K**. The CPO calculation is identical, except
+that the denominator is the local benchmark's completed-operation count.
+The network table includes the server's reference frequency in its column
+heading, for example `Ref CPIO (TSC=2.5 GHz)`, rounded to one decimal place.
+Unavailable frequency is shown as `TSC=N/A`; detailed JSON retains frequency in Hz.
+
+#### Why are these reference cycles, not measured CPU core cycles?
+
+The TSC continues ticking while a CPU is idle or a thread is waiting. Simply
+subtracting TSC readings around a run would therefore measure elapsed reference
+time, not CPU work. Instead, we multiply OS-reported busy CPU time by the
+calibrated TSC rate.
+
+The result is an **estimate in fixed reference-clock units**, not a hardware
+counter measurement of actual core cycles, instructions, or benchmark-thread-only
+execution.
+
+#### Why is the TSC rate suitable even when CPU frequency changes?
+
+Here, the TSC rate is a **fixed conversion factor for CPU time**, not an attempt
+to follow the current core frequency. This is like expressing CPU time in
+nanoseconds: the unit's scale does not have to match the processor's clock.
+Multiplying busy CPU seconds by a stable reference rate gives a consistent unit
+for reporting CPU cost.
+
+For example, 50,000 reference cycles at a 2.5 GHz TSC rate represents 20
+microseconds of aggregate busy CPU time per I/O. It still represents that CPU
+time if a core is currently running at 3 GHz or 4 GHz; it does not claim that the
+core executed exactly 50,000 actual cycles.
+
+For runs with the same reference rate, a 10% reduction in reference CPIO means
+a 10% reduction in busy CPU time per successful I/O. **It does not mean that
+frequency and power policy no longer matter.** Turbo or throttling can change
+how much CPU time an operation needs, and that change will affect the result.
+This metric measures CPU-time efficiency in reference units, not an instruction
+count or a frequency-independent amount of computational work.
+
+Different servers can have different TSC rates, so record the reference frequency
+alongside the result. To remove a difference in reference-unit scale, divide each
+result by its own server's calibrated rate:
+
+```text
+Busy CPU seconds per I/O = reference CPIO / TSC frequency
+Busy CPU seconds per operation = reference CPO / TSC frequency
+```
+
+Lower values indicate less estimated CPU cost only when comparing equivalent
+workloads and accounting for the reference-clock scale. All OS-visible server
+activity, including unrelated applications and control/sampling overhead, can
+contribute; warmup is outside the measured repetitions. Use otherwise idle
+servers and sustained runs. Unavailable CPU accounting or an unsupported or
+unstable reference clock produces `null` in JSON and `N/A` in the console, not
+zero. A run with no completed work does not provide a valid per-operation cost.
+
+#### Do we also use the TSC to measure I/O latency?
+
+**Not directly.** I/O latency is measured on the Linux client using
+`std::chrono::steady_clock`, a monotonic clock. For each request, the client
+records a start timestamp before attempting to send the request and an end
+timestamp after consuming the complete response. Their difference is the
+request's elapsed latency.
+
+This includes request/response transport, server processing, client processing
+and scheduling delays, and PUT-body transmission where applicable. It is not
+the same as busy CPU time per I/O: a request can wait for the network while
+consuming little CPU. Connection establishment and TLS handshakes happen before
+the timed requests. Failed requests and timeouts are reported separately from
+successful-request latency.
+
+Durations are recorded in nanoseconds and reported in microseconds, with
+percentiles estimated from the latency histogram. We do not convert TSC ticks
+into request latency using the server's calibrated frequency, and the two
+machines' clocks do not need to be synchronized. The OS or standard library may
+use a TSC internally to implement the monotonic clock, but that is separate from
+Winlin's explicit TSC calibration for reference CPIO/CPO.
+
+### 4.5. Reproducibility and comparison controls
 
 Baseline comparisons require recorded hardware/topology, software revisions,
 effective TLS configuration, offloads, allocator, and workload settings.

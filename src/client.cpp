@@ -1642,7 +1642,21 @@ int run_benchmark(Target target, const RunConfig& config, const std::optional<fs
             std::cout << "kTLS GET | SSL_sendfile | immutable 64 MiB memfd | no response copy\n";
         }
         std::cout << "Run  requests/s     p50(us)     p90(us)     p99(us)   errors    Net Gbps"
-                     "   Client CPU(%)   Avg CPU(%)       Ref CPIO\n";
+                     "   Client CPU(%)   Avg CPU(%)       Ref CPIO (TSC=";
+        // Discovery carries the server's process-wide calibration, also used by its samples.
+        // Keep unavailable clocks explicit and leave full frequency precision in the JSON.
+        const auto reference_clock = telemetry.value("reference_clock", Json::object());
+        const auto frequency = reference_clock.is_object()
+                                   ? reference_clock.value("frequency_hz", Json(nullptr))
+                                   : Json(nullptr);
+        if (frequency.is_number() && std::isfinite(frequency.get<double>()) &&
+            frequency.get<double>() > 0) {
+            std::cout << std::fixed << std::setprecision(1) << frequency.get<double>() / 1e9
+                      << " GHz";
+        } else {
+            std::cout << "N/A";
+        }
+        std::cout << ")\n";
         trials(workload_ctx.get(), workload, config, payload, target, run_id, [&](Json result) {
             const auto index = result.at("repetition").get<unsigned>();
             errors = errors || result.at("errors").get<std::uint64_t>() != 0 ||

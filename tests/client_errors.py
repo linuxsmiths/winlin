@@ -607,7 +607,7 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                                          if self.server.host_cpu_available else None),
                     "sampled_at_monotonic_seconds": self.server.telemetry_samples * 0.25,
                     "reference_clock": {
-                        "frequency_hz": 20002 if self.server.reference_available else None,
+                        "frequency_hz": 2_300_000_000 if self.server.reference_available else None,
                         "source": "fixture invariant TSC",
                         "unavailable_reason": (None if self.server.reference_available
                                                else "fixture invariant TSC unavailable"),
@@ -643,6 +643,10 @@ class RegistrationHandler(BaseHTTPRequestHandler):
                 "telemetry": {
                     "process_cpu_scope": "application process only; excludes work charged to System",
                     "unavailable_metrics": ["voluntary_context_switches"],
+                    "reference_clock": {
+                        "frequency_hz": (2_300_000_000
+                                         if self.server.reference_available else None),
+                    },
                 },
             }
             if self.server.copy_working_set_bytes is not None:
@@ -961,7 +965,7 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
             r"(N/A|\d+\.\d{2})\s+(\d+\.\d{2})\s+(N/A|\d+\.\d{2})\s+"
             r"(N/A|\d+\.\d{2}K)\s*$", re.MULTILINE,
         )
-        assert "Ref CPIO" in result.stdout
+        assert "Ref CPIO (TSC=N/A)" in result.stdout
         assert "Avg CPU(%)" in result.stdout
         assert "p90(us)" in result.stdout
         assert "Net Gbps" in result.stdout
@@ -1164,11 +1168,13 @@ with tempfile.TemporaryDirectory(prefix="winlin-client-registration-") as tempor
         assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(output.read_text())
         rows = table_row.findall(result.stdout)
-        assert [(row[0], row[-1]) for row in rows] == [("1", "5.00K"), ("2", "5.00K")]
+        assert [(row[0], row[-1]) for row in rows] == [
+            ("1", "575000.00K"), ("2", "575000.00K")]
+        assert result.stdout.count("Ref CPIO (TSC=2.3 GHz)") == 1
         assert [row[-2] for row in rows] == ["200.00", "200.00"]
         assert "CPIO unavailable" not in result.stderr, result.stderr
         assert "{" not in result.stdout, result.stdout
-        assert all(repetition["server_reference_cycles_per_io"] == 5000.5
+        assert all(repetition["server_reference_cycles_per_io"] == 575_000_000
                    for repetition in report["results"])
         assert all(repetition["server_process"]["cpu_cycles"] is None
                    for repetition in report["results"])

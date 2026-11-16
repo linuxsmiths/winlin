@@ -393,6 +393,9 @@ server-interface network throughput (`Net Gbps`), average client-process CPU
 (`Client CPU(%)`), average whole-server CPU utilization (`Avg CPU(%)`), and estimated
 reference cycles per I/O (`Ref CPIO`), displayed in thousands with a `K` suffix
 (for example, 24,288 cycles becomes `24.29K`). JSON retains unscaled cycles.
+The heading includes the calibrated server TSC frequency in GHz, rounded to one
+decimal place: for example, `Ref CPIO (TSC=2.3 GHz)`. If the frequency is
+unavailable, it reads `Ref CPIO (TSC=N/A)`. JSON retains the full frequency in Hz.
 Server CPU utilization is averaged over each
 repetition's server-side telemetry interval; process CPU uses timestamps captured
 next to its CPU counter reads. Each `client_process` and `server_process` records
