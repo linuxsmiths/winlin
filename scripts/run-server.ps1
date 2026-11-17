@@ -1,0 +1,93 @@
+[CmdletBinding()]
+param(
+    [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\build'),
+    [ValidateSet('Debug', 'Release', 'RelWithDebInfo', 'MinSizeRel')][string]$Configuration = 'Release',
+    [string]$StateDirectory = (Join-Path $PSScriptRoot '..\.winlin-local'),
+    [string]$ServerExe = '',
+    [string]$BindAddress = '127.0.0.1',
+    [ValidateRange(1, 65535)][int]$Port = 38080,
+    [ValidateRange(1, 65535)][int]$HttpPort = 38444,
+    [ValidateRange(1, 65535)][int]$HttpsPort = 38445,
+    [string]$StopFile,
+    [switch]$Help
+)
+
+$ErrorActionPreference = 'Stop'
+if ($Help) {
+    @'
+Usage: .\scripts\run-server.ps1 [-BuildDirectory PATH] [-Configuration Release]
+    [-StateDirectory PATH] [-ServerExe PATH] [-BindAddress IP] [-Port N]
+    [-HttpPort N] [-HttpsPort N]
+    [-StopFile PATH]
+
+Defaults: build\Release\winlin-server.exe, HTTP control 127.0.0.1:38080,
+HTTP workload port 38444 and HTTPS workload port 38445.
+Default directories are relative to the repository; supplied
+relative paths use the caller's working directory. -ServerExe overrides binary
+discovery. Clients select per-run workload TLS/cipher/workers remotely.
+Control always runs one worker; workload listeners start only on client request.
+TLS and cipher apply only to workloads.
+
+Provision the matching HTTP.sys endpoint with scripts\setup-server.ps1 first.
+Run as the same account that owns its URL reservation.
+This launcher never builds, provisions certificates, or changes
+firewall/Schannel policies. See docs\windows.md for setup.
+'@
+    return
+}
+
+try {
+    . (Join-Path $PSScriptRoot 'windows-common.ps1')
+    Assert-WinlinWindows
+
+    foreach ($name in @('BuildDirectory', 'StateDirectory', 'ServerExe', 'BindAddress')) {
+        if ($PSBoundParameters.ContainsKey($name) -and -not [string]$PSBoundParameters[$name]) {
+            throw "$name must not be empty."
+        }
+    }
+
+    if (-not $ServerExe) {
+        $ServerExe = Join-Path (Join-Path $BuildDirectory $Configuration) 'winlin-server.exe'
+    }
+    # Resolve relative overrides against PowerShell's location, including after Set-Location.
+    $ServerExe = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ServerExe)
+    if (-not (Test-Path -LiteralPath $ServerExe -PathType Leaf)) {
+        throw "Server executable not found: $ServerExe. Run scripts\build.ps1 server first."
+    }
+
+    $serverArguments = @('--bind', $BindAddress, '--port', "$Port",
+        '--http-port', "$HttpPort", '--https-port', "$HttpsPort")
+    # Do not duplicate native default policy here; forward optional settings only when supplied.
+    $optionalOptions = [ordered]@{
+        StopFile = '--stop-file'
+    }
+    foreach ($name in $optionalOptions.Keys) {
+        if ($PSBoundParameters.ContainsKey($name)) {
+            $value = [string]$PSBoundParameters[$name]
+            if (-not $value) {
+                throw "$name must not be empty."
+            }
+            $serverArguments += @($optionalOptions[$name], $value)
+        }
+    }
+
+    # Native stderr is diagnostic output, not proof of process failure. In particular, recoverable
+    # HTTP errors must not terminate the launcher under Windows PowerShell or PowerShell 7.
+    $PSNativeCommandUseErrorActionPreference = $false
+    $ErrorActionPreference = 'Continue'
+    $LASTEXITCODE = 0
+    & $ServerExe @serverArguments
+    $nativeSucceeded = $?
+    $status = $LASTEXITCODE
+    if (-not $nativeSucceeded -and $status -eq 0) {
+        $status = 1
+    }
+    if ($status -ne 0) {
+        [Console]::Error.WriteLine("winlin server launcher: FATAL: server exited with code $status.")
+    }
+    exit $status
+}
+catch {
+    [Console]::Error.WriteLine("winlin server launcher: FATAL: $($_.Exception.Message)")
+    exit 1
+}

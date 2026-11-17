@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: ./scripts/prep.sh
+      - name: Build
+        run: ./scripts/build.sh all --jobs 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Windows toolchain
+        shell: powershell
+        run: .\scripts\prep.ps1 -Check -IntegrationTests
+      - name: Build native HTTP.sys server
+        shell: powershell
+        run: .\scripts\build.ps1 server -IntegrationTests
+      - name: Test Windows PowerShell launch from PowerShell 7
+        shell: pwsh
+        run: ctest --test-dir build -C Release -R '^powershell$' --output-on-failure
+      - name: Test native HTTP.sys server and shared contract
+        shell: powershell
+        run: ctest --test-dir build -C Release --output-on-failure
